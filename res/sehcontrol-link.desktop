@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=Sehcontrol
+NoDisplay=true
+MimeType=x-scheme-handler/sehcontrol;
+TryExec=sehcontrol
+Exec=sehcontrol %u
+Icon=sehcontrol
+Terminal=false
+Type=Application
+StartupNotify=false
+StartupWMClass=sehcontrol

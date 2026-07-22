@@ -1,6 +1,6 @@
 
 <p align="center">
-  <img src="../res/logo-header.svg" alt="RustDesk - Uzak masaüstü uygulamanız"><br>
+  <img src="../res/logo-header.svg" alt="Sehcontrol - Uzak masaüstü uygulamanız"><br>
   <a href="#free-public-servers">Sunucular</a> •
   <a href="#raw-steps-to-build">Derleme</a> •
   <a href="#how-to-build-with-docker">Docker ile Derleme</a> •
@@ -13,17 +13,17 @@
 
 > [!Dikkat]
 > **Yanlış Kullanım Uyarısı:** <br>
-> RustDesk geliştiricileri, bu yazılımın etik olmayan veya yasa dışı kullanımını onaylamaz veya desteklemez. Yetkisiz erişim, kontrol veya gizlilik ihlali gibi kötüye kullanımlar kesinlikle yönergelerimize aykırıdır. Yazarlar, uygulamanın herhangi bir yanlış kullanımından sorumlu değildir.
+> Sehcontrol geliştiricileri, bu yazılımın etik olmayan veya yasa dışı kullanımını onaylamaz veya desteklemez. Yetkisiz erişim, kontrol veya gizlilik ihlali gibi kötüye kullanımlar kesinlikle yönergelerimize aykırıdır. Yazarlar, uygulamanın herhangi bir yanlış kullanımından sorumlu değildir.
 
 Bizimle sohbet edin: [Discord](https://discord.gg/nDceKgxnkV) | [Twitter](https://twitter.com/rustdesk) | [Reddit](https://www.reddit.com/r/rustdesk) | [YouTube](https://www.youtube.com/@rustdesk)
 
-[![RustDesk Server Pro](https://img.shields.io/badge/RustDesk%20Server%20Pro-Geli%C5%9Fmi%C5%9F%20%C3%96zellikler-blue)](https://rustdesk.com/pricing.html)
+[![Sehcontrol Server Pro](https://img.shields.io/badge/RustDesk%20Server%20Pro-Geli%C5%9Fmi%C5%9F%20%C3%96zellikler-blue)](https://rustdesk.com/pricing.html)
 
 Rust dilinde yazılmış, başka bir uzak masaüstü yazılımı daha. Hiçbir yapılandırma gerekmeksizin, hemen kullanıma hazır. Güvenlik konusunda hiçbir endişe duymadan, verileriniz üzerinde tam kontrole sahip olun. Kendi rendezvous/relay sunucumuzu kullanabilirsiniz, [kendi sunucunuzu kurabilirsiniz](https://rustdesk.com/server) veya [kendi rendezvous/relay sunucunuzu yazabilirsiniz](https://github.com/rustdesk/rustdesk-server-demo).
 
 ![image](https://user-images.githubusercontent.com/71636191/171661982-430285f0-2e12-4b1d-9957-4a58e375304d.png)
 
-RustDesk, herkesin katkısına açıktır. Başlamak için [CONTRIBUTING.md](CONTRIBUTING-TR.md) belgesine göz atın.
+Sehcontrol, herkesin katkısına açıktır. Başlamak için [CONTRIBUTING.md](CONTRIBUTING-TR.md) belgesine göz atın.
 
 [**SSS**](https://github.com/rustdesk/rustdesk/wiki/FAQ)
 
@@ -117,7 +117,7 @@ cd
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
 git clone https://github.com/rustdesk/rustdesk
-cd rustdesk
+cd sehcontrol
 mkdir -p target/debug
 wget https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.lnx/x64/libsciter-gtk.so
 mv libsciter-gtk.so target/debug
@@ -130,29 +130,29 @@ VCPKG_ROOT=$HOME/vcpkg cargo run
 
 ```sh
 git clone https://github.com/rustdesk/rustdesk
-cd rustdesk
-docker build -t "rustdesk-builder" .
+cd sehcontrol
+docker build -t "sehcontrol-builder" .
 ```
 
 Ardından, uygulamayı her derlemeniz gerektiğinde aşağıdaki komutu çalıştırın:
 
 ```sh
-docker run --rm -it -v $PWD:/home/user/rustdesk -v rustdesk-git-cache:/home/user/.cargo/git -v rustdesk-registry-cache:/home/user/.cargo/registry -e PUID="$(id -u)" -e PGID="$(id -g)" rustdesk-builder
+docker run --rm -it -v $PWD:/home/user/sehcontrol -v sehcontrol-git-cache:/home/user/.cargo/git -v sehcontrol-registry-cache:/home/user/.cargo/registry -e PUID="$(id -u)" -e PGID="$(id -g)" sehcontrol-builder
 ```
 
 Bilin ki ilk derlemeniz gereksinimlerin önbelleği yüklenmesinden ötürü uzun sürebilir, sonraki derlemeleriniz daha hızlı olacaktır. Ayrıca, derleme komutuna isteğe bağlı argümanlar belirtmeniz gerekiyorsa, bunu komutun sonunda ki `<OPTIONAL-ARGS>` yerine yazabilirsiniz. Örneğin, optimize edilmiş bir sürümü derlemek isterseniz, yukarıdaki komutu çalıştırdıktan sonra `--release` ekleyebilirsiniz. Oluşan çalıştırılabilir dosya sisteminizdeki hedef klasöründe bulunacak ve şu komutla çalıştırılabilir olacaktır:
 
 ```sh
-target/debug/rustdesk
+target/debug/sehcontrol
 ```
 
 Veya, yayım çalıştırılabilir dosyası için:
 
 ```sh
-target/release/rustdesk
+target/release/sehcontrol
 ```
 
-Lütfen bu komutları RustDesk reposunun root klasöründe çalıştırdığınızdan emin olun, aksi takdirde uygulama gereken kaynakları bulamayabilir. Ayrıca, `install` veya `run` gibi diğer cargo altkomutları şu anda bu yöntem aracılığıyla desteklenmemektedir, çünkü bunlar programı konteyner içinde kurar veya çalıştırır, ana makinede değil.
+Lütfen bu komutları Sehcontrol reposunun root klasöründe çalıştırdığınızdan emin olun, aksi takdirde uygulama gereken kaynakları bulamayabilir. Ayrıca, `install` veya `run` gibi diğer cargo altkomutları şu anda bu yöntem aracılığıyla desteklenmemektedir, çünkü bunlar programı konteyner içinde kurar veya çalıştırır, ana makinede değil.
  
 ## Dosya Yapısı
 

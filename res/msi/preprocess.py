@@ -48,7 +48,7 @@ def make_parser():
         "-d",
         "--dist-dir",
         type=str,
-        default="../../rustdesk",
+        default="../../sehcontrol",
         help="The dist directory to install.",
     )
     parser.add_argument(
@@ -73,7 +73,7 @@ def make_parser():
         help='Connection type, e.g. "incoming", "outgoing". Default is empty, means incoming-outgoing',
     )
     parser.add_argument(
-        "--app-name", type=str, default="RustDesk", help="The app name."
+        "--app-name", type=str, default="Sehcontrol", help="The app name."
     )
     parser.add_argument(
         "-v", "--version", type=str, default="", help="The app version."
@@ -141,7 +141,7 @@ def insert_components_between_tags(lines, index_start, app_name, dist_dir):
 
 def gen_auto_component(app_name, dist_dir):
     return gen_content_between_tags(
-        "Package/Components/RustDesk.wxs",
+        "Package/Components/Sehcontrol.wxs",
         "<!--$AutoComonentStart$-->",
         "<!--$AutoComponentEnd$-->",
         lambda lines, index_start: insert_components_between_tags(
@@ -185,7 +185,7 @@ def replace_app_name_in_langs(app_name):
         with open(file_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
         for i, line in enumerate(lines):
-            lines[i] = line.replace("RustDesk", app_name)
+            lines[i] = line.replace("Sehcontrol", app_name)
         with open(file_path, "w", encoding="utf-8") as f:
             f.writelines(lines)
 
@@ -196,7 +196,7 @@ def replace_app_name_in_custom_actions(app_name):
             lines = f.readlines()
         for i, line in enumerate(lines):
             line = re.sub(r"\bRustDesk\b", app_name, line)
-            line = line.replace(f"{app_name} v4 Printer Driver", "RustDesk v4 Printer Driver")
+            line = line.replace(f"{app_name} v4 Printer Driver", "Sehcontrol v4 Printer Driver")
             lines[i] = line
         with open(file_path, "w", encoding="utf-8") as f:
             f.writelines(lines)
@@ -490,13 +490,13 @@ def init_global_vars(dist_dir, app_name, args):
 
 
 def update_license_file(app_name):
-    if app_name == "RustDesk":
+    if app_name == "Sehcontrol":
         return
     license_file = Path(sys.argv[0]).parent.joinpath("Package/License.rtf")
     with open(license_file, "r", encoding="utf-8") as f:
         license_content = f.read()
-    license_content = license_content.replace("website rustdesk.com and other ", "")
-    license_content = license_content.replace("RustDesk", app_name)
+    license_content = license_content.replace("website sehcontrol.com and other ", "")
+    license_content = license_content.replace("Sehcontrol", app_name)
     license_content = re.sub("Purslane Ltd", app_name, license_content, flags=re.IGNORECASE)
     with open(license_file, "w", encoding="utf-8") as f:
         f.write(license_content)
@@ -536,7 +536,7 @@ if __name__ == "__main__":
     if not gen_pre_vars(args, dist_dir):
         sys.exit(-1)
 
-    if app_name != "RustDesk":
+    if app_name != "Sehcontrol":
         replace_component_guids_in_wxs()
 
     if not gen_upgrade_info():

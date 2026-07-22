@@ -414,7 +414,7 @@ pub mod amyuni_idd {
     // The count of virtual displays plugged in.
     // This count is not accurate, because:
     // 1. The virtual display driver may also be controlled by other processes.
-    // 2. RustDesk may crash and restart, but the virtual displays are kept.
+    // 2. Sehcontrol may crash and restart, but the virtual displays are kept.
     //
     // to-do: Maybe a better way is to add an option asking the user if plug out all virtual displays on disconnect.
     static VIRTUAL_DISPLAY_COUNT: atomic::AtomicUsize = atomic::AtomicUsize::new(0);
@@ -661,19 +661,19 @@ pub mod amyuni_idd {
     // `index` the display index to plug out. -1 means plug out all.
     // `force_all` is used to forcibly plug out all virtual displays.
     // `force_one` is used to forcibly plug out one virtual display managed by other processes
-    //             if there're no virtual displays managed by RustDesk.
+    //             if there're no virtual displays managed by Sehcontrol.
     pub fn plug_out_monitor(index: i32, force_all: bool, force_one: bool) -> ResultType<()> {
         let plug_out_all = index == super::IDD_PLUG_OUT_ALL_INDEX;
         // If `plug_out_all and force_all` is true, forcibly plug out all virtual displays.
         // Though the driver may be controlled by other processes,
         // we still forcibly plug out all virtual displays.
         //
-        // 1. RustDesk plug in 2 virtual displays. (RustDesk)
+        // 1. Sehcontrol plug in 2 virtual displays. (Sehcontrol)
         // 2. Other process plug out all virtual displays. (User manually)
         // 3. Other process plug in 1 virtual display. (User manually)
-        // 4. RustDesk plug out all virtual displays in this call. (RustDesk disconnect)
+        // 4. Sehcontrol plug out all virtual displays in this call. (Sehcontrol disconnect)
         //
-        // This is not a normal scenario, RustDesk will plug out virtual display unexpectedly.
+        // This is not a normal scenario, Sehcontrol will plug out virtual display unexpectedly.
         let mut plug_in_count = VIRTUAL_DISPLAY_COUNT.load(atomic::Ordering::Relaxed);
         let amyuni_count = get_monitor_count();
         if !plug_out_all {

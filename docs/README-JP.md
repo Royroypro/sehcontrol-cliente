@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="../res/logo-header.svg" alt="RustDesk - あなたのためのリモートデスクトップ"><br>
+  <img src="../res/logo-header.svg" alt="Sehcontrol - あなたのためのリモートデスクトップ"><br>
   <a href="#free-public-servers">Servers</a> •
   <a href="#raw-steps-to-build">Build</a> •
   <a href="#how-to-build-with-docker">Docker</a> •
@@ -11,7 +11,7 @@
 
 私たちと話す: [Discord](https://discord.gg/nDceKgxnkV) | [Twitter](https://twitter.com/rustdesk) | [Reddit](https://www.reddit.com/r/rustdesk) | [YouTube](https://www.youtube.com/@rustdesk)
 
-[![RustDesk Server Pro](https://img.shields.io/badge/RustDesk%20Server%20Pro-%E9%AB%98%E5%BA%A6%E3%81%AA%E6%A9%9F%E8%83%BD-blue)](https://rustdesk.com/pricing.html)
+[![Sehcontrol Server Pro](https://img.shields.io/badge/RustDesk%20Server%20Pro-%E9%AB%98%E5%BA%A6%E3%81%AA%E6%A9%9F%E8%83%BD-blue)](https://rustdesk.com/pricing.html)
 
 Rustで書かれた、設定不要ですぐに使えるリモートデスクトップソフトウェアです。自分のデータを完全にコントロールでき、セキュリティの心配もありません。私たちのランデブー/リレーサーバを使うことも、[自分でサーバーをセットアップする](https://rustdesk.com/server) ことも、 [自分でランデブー/リレーサーバを作成する](https://github.com/rustdesk/rustdesk-server-demo)こともできます。
 
@@ -113,7 +113,7 @@ cd
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
 git clone https://github.com/rustdesk/rustdesk
-cd rustdesk
+cd sehcontrol
 mkdir -p target/debug
 wget https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.lnx/x64/libsciter-gtk.so
 mv libsciter-gtk.so target/debug
@@ -126,14 +126,14 @@ VCPKG_ROOT=$HOME/vcpkg cargo run
 
 ```sh
 git clone https://github.com/rustdesk/rustdesk
-cd rustdesk
-docker build -t "rustdesk-builder" .
+cd sehcontrol
+docker build -t "sehcontrol-builder" .
 ```
 
 以下のコマンドを実行します:
 
 ```sh
-docker run --rm -it -v $PWD:/home/user/rustdesk -v rustdesk-git-cache:/home/user/.cargo/git -v rustdesk-registry-cache:/home/user/.cargo/registry -e PUID="$(id -u)" -e PGID="$(id -g)" rustdesk-builder
+docker run --rm -it -v $PWD:/home/user/sehcontrol -v sehcontrol-git-cache:/home/user/.cargo/git -v sehcontrol-registry-cache:/home/user/.cargo/registry -e PUID="$(id -u)" -e PGID="$(id -g)" sehcontrol-builder
 ```
 このコマンドはRustDeskをビルドする度に実行する必要があります。  
 
@@ -142,13 +142,13 @@ docker run --rm -it -v $PWD:/home/user/rustdesk -v rustdesk-git-cache:/home/user
 
 デバッグビルドを起動する場合:
 ```sh
-target/debug/rustdesk
+target/debug/sehcontrol
 ```
 
 リリースビルドを起動する場合:
 
 ```sh
-target/release/rustdesk
+target/release/sehcontrol
 ```
 
 コマンドをRustDeskリポジトリのルートから実行していることを確認してください。また、`install` や `run` などの他のcargoサブコマンドは、ホストではなくコンテナ内でプログラムをインストール、実行するため、現在の方法ではサポートされていません。

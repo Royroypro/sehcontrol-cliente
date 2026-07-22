@@ -1835,7 +1835,7 @@ pub fn bootstrap() -> bool {
     }
     #[cfg(not(debug_assertions))]
     {
-        // This function will cause `'sciter.dll' was not found neither in PATH nor near the current executable.` when debugging RustDesk.
+        // This function will cause `'sciter.dll' was not found neither in PATH nor near the current executable.` when debugging Sehcontrol.
         // Only call set_safe_load_dll() on Windows 10 or greater
         if is_win_10_or_greater() {
             set_safe_load_dll()
@@ -2803,7 +2803,7 @@ reg add {subkey} /f /v EstimatedSize /t REG_DWORD /d {size}
     // md \"{path}\"
     //
     // We need `taskkill` because:
-    // 1. There may be some other processes like `rustdesk --connect` are running.
+    // 1. There may be some other processes like `sehcontrol --connect` are running.
     // 2. Sometimes, the main window and the tray icon are showing
     // while I cannot find them by `tasklist` or the methods above.
     // There's should be 4 processes running: service, server, tray and main window.
@@ -3013,7 +3013,7 @@ pub fn message_box(text: &str) {
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect::<Vec<u16>>();
-    let caption = "RustDesk Output"
+    let caption = "Sehcontrol Output"
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect::<Vec<u16>>();
@@ -3144,9 +3144,9 @@ pub fn is_x64() -> bool {
 }
 
 pub fn try_kill_rustdesk_main_window_process() -> ResultType<()> {
-    // Kill rustdesk.exe without extra arg, should only be called by --server
+    // Kill sehcontrol.exe without extra arg, should only be called by --server
     // We can find the exact process which occupies the ipc, see more from https://github.com/winsiderss/systeminformer
-    log::info!("try kill rustdesk main window process");
+    log::info!("try kill sehcontrol main window process");
     use hbb_common::sysinfo::System;
     let mut sys = System::new();
     sys.refresh_processes();
@@ -3192,7 +3192,7 @@ pub fn try_kill_rustdesk_main_window_process() -> ResultType<()> {
         log::info!("kill process success: {:?}, pid = {:?}", p.cmd(), p.pid());
         return Ok(());
     }
-    bail!("failed to find rustdesk main window process");
+    bail!("failed to find sehcontrol main window process");
 }
 
 fn nt_terminate_process(process_id: DWORD) -> ResultType<()> {
@@ -3567,10 +3567,10 @@ fn get_pids_with_args_from_wmic_output<S2: AsRef<str>>(
     // CommandLine=
     // ProcessId=34668
     //
-    // CommandLine="C:\Program Files\RustDesk\RustDesk.exe" --tray
+    // CommandLine="C:\Program Files\Sehcontrol\Sehcontrol.exe" --tray
     // ProcessId=13728
     //
-    // CommandLine="C:\Program Files\RustDesk\RustDesk.exe"
+    // CommandLine="C:\Program Files\Sehcontrol\Sehcontrol.exe"
     // ProcessId=10136
     let mut pids = Vec::new();
     let mut proc_found = false;

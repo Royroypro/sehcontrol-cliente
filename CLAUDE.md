@@ -44,7 +44,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
   - `libs/clipboard/` - Cross-platform clipboard implementation
 
 ### Key Components
-- **Remote Desktop Protocol**: Custom protocol implemented in `src/rendezvous_mediator.rs` for communicating with rustdesk-server
+- **Remote Desktop Protocol**: Custom protocol implemented in `src/rendezvous_mediator.rs` for communicating with sehcontrol-server
 - **Screen Capture**: Platform-specific screen capture in `libs/scrap/`
 - **Input Handling**: Cross-platform input simulation in `libs/enigo/`
 - **Audio/Video Services**: Real-time audio/video streaming in `src/server/`

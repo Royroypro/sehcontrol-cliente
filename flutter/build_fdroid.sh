@@ -1,9 +1,9 @@
 #!/bin/bash
 
 #
-# Script to build F-Droid release of RustDesk
+# Script to build F-Droid release of Sehcontrol
 #
-# Copyright (C) 2024, The RustDesk Authors
+# Copyright (C) 2024, The Sehcontrol Authors
 #               2024, Vasyl Gello <vasek.gello@gmail.com>
 #
 
@@ -136,7 +136,7 @@ prebuild)
 		.env.CARGO_NDK_VERSION \
 		.github/workflows/flutter-build.yml)"
 
-	# Flutter used to compile main Rustdesk library
+	# Flutter used to compile main Sehcontrol library
 
 	FLUTTER_VERSION="$(yq -r \
 		.env.ANDROID_FLUTTER_VERSION \
@@ -307,12 +307,12 @@ prebuild)
 		fi
 	fi
 
-	# Patch the RustDesk sources
+	# Patch the Sehcontrol sources
 
 	git apply res/fdroid/patches/*.patch
 
 	# If Flutter version used to generate bridge files differs from Flutter
-	# version used to compile Rustdesk library, generate bridge using the
+	# version used to compile Sehcontrol library, generate bridge using the
 	# `FLUTTER_BRIDGE_VERSION` an restore the pubspec later
 
 	if [ "${FLUTTER_VERSION}" != "${FLUTTER_BRIDGE_VERSION}" ]; then
@@ -357,7 +357,7 @@ prebuild)
 		git reset
 	fi
 
-	# Install Flutter version for RustDesk library build
+	# Install Flutter version for Sehcontrol library build
 
 	prepare_flutter "${FLUTTER_VERSION}" "${HOME}/flutter"
 
@@ -397,7 +397,7 @@ build)
 	# '.github/workflows/flutter-build.yml'
 	#
 
-	# Flutter used to compile main Rustdesk library
+	# Flutter used to compile main Sehcontrol library
 
 	FLUTTER_VERSION="$(yq -r \
 		.env.ANDROID_FLUTTER_VERSION \
@@ -447,7 +447,7 @@ build)
 
 	bash flutter/build_android_deps.sh "${ANDROID_ABI}"
 
-	# Build rustdesk lib
+	# Build sehcontrol lib
 
 	cargo ndk \
 		--platform 21 \
@@ -459,8 +459,8 @@ build)
 
 	mkdir -p "flutter/android/app/src/main/jniLibs/${ANDROID_ABI}"
 
-	cp "target/${RUST_TARGET}/release/liblibrustdesk.so" \
-		"flutter/android/app/src/main/jniLibs/${ANDROID_ABI}/librustdesk.so"
+	cp "target/${RUST_TARGET}/release/libsehcontrol.so" \
+		"flutter/android/app/src/main/jniLibs/${ANDROID_ABI}/sehcontrol.so"
 
 	cp "${ANDROID_NDK_HOME}/toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib/${NDK_TARGET}/libc++_shared.so" \
 		"flutter/android/app/src/main/jniLibs/${ANDROID_ABI}/"

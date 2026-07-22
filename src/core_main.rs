@@ -645,7 +645,7 @@ pub fn core_main() -> Option<Vec<String>> {
             }
             return None;
         } else if args[0] == "-gtk-sudo" {
-            // rustdesk service kill `rustdesk --` processes
+            // sehcontrol service kill `sehcontrol --` processes
             #[cfg(target_os = "linux")]
             if args.len() > 2 {
                 crate::platform::gtk_sudo::exec();

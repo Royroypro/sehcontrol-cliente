@@ -386,60 +386,84 @@ impl Client {
         bool,
     )> {
         let mut start = Instant::now();
-        let mut socket = connect_tcp(&*rendezvous_server, CONNECT_TIMEOUT).await;
-        debug_assert!(!servers.contains(&rendezvous_server));
-        let rtt = start.elapsed();
-        log::debug!("TCP connection establishment time used: {:?}", rtt);
-        if socket.is_err() && !servers.is_empty() {
-            log::info!("try the other servers: {:?}", servers);
-            for server in servers {
-                let server = check_port(server, RENDEZVOUS_PORT);
-                socket = connect_tcp(&*server, CONNECT_TIMEOUT).await;
-                if socket.is_ok() {
-                    rendezvous_server = server;
-                    break;
-                }
-            }
-            crate::refresh_rendezvous_server();
-        } else if !contained {
-            crate::refresh_rendezvous_server();
-        }
-        log::info!("rendezvous server: {}", rendezvous_server);
-        let mut socket = socket?;
-        let my_addr = socket.local_addr();
-        let mut signed_id_pk = Vec::new();
-        let mut relay_server = "".to_owned();
-        let mut peer_addr = Config::get_any_listen_addr(true);
-        let mut peer_nat_type = NatType::UNKNOWN_NAT;
-        let my_nat_type = crate::get_nat_type(100).await;
-        let mut is_local = false;
-        let mut feedback = 0;
-        use hbb_common::protobuf::Enum;
-        let nat_type = if interface.is_force_relay() {
-            NatType::SYMMETRIC
-        } else {
-            NatType::from_i32(my_nat_type).unwrap_or(NatType::UNKNOWN_NAT)
-        };
 
-        if !key.is_empty() && !token.is_empty() {
-            // mainly for the security of token
-            secure_tcp(&mut socket, &key)
-                .await
-                .map_err(|e| anyhow!("Failed to secure tcp: {}", e))?;
-        } else if let Some(udp) = udp.1.as_ref() {
-            let tm = Instant::now();
-            loop {
-                let port = *udp.lock().unwrap();
-                if port > 0 {
-                    break;
-                }
-                // await for 0.5 RTT
-                if tm.elapsed() > rtt / 2 {
-                    break;
-                }
-                hbb_common::sleep(0.001).await;
-            }
+// Limpieza defensiva: quita espacios/vacíos antes de usar servers
+let mut servers: Vec<String> = servers
+    .into_iter()
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty())
+    .collect();
+
+// Conecta primero al primario
+let mut socket = connect_tcp(&*rendezvous_server, CONNECT_TIMEOUT).await;
+
+// Asegura que servers NO contenga el primario (por seguridad)
+servers.retain(|s| s != &rendezvous_server);
+debug_assert!(!servers.contains(&rendezvous_server));
+
+let rtt = start.elapsed();
+log::debug!("TCP connection establishment time used: {:?}", rtt);
+
+// Solo si falla el primario, intenta fallbacks
+if socket.is_err() && !servers.is_empty() {
+    log::info!("try the other servers: {:?}", servers);
+
+    for server in servers {
+        let server = check_port(server, RENDEZVOUS_PORT);
+
+        // Si CONNECT_TIMEOUT es numérico (ej. u64 ms), puedes acelerar failover así:
+        // let fallback_timeout = (CONNECT_TIMEOUT / 2).max(1);
+
+        socket = connect_tcp(&*server, CONNECT_TIMEOUT).await;
+        if socket.is_ok() {
+            rendezvous_server = server;
+            break;
         }
+    }
+
+    crate::refresh_rendezvous_server();
+} else if !contained {
+    crate::refresh_rendezvous_server();
+}
+
+log::info!("rendezvous server: {}", rendezvous_server);
+
+let mut socket = socket?;
+let my_addr = socket.local_addr();
+let mut signed_id_pk = Vec::new();
+let mut relay_server = "".to_owned();
+let mut peer_addr = Config::get_any_listen_addr(true);
+let mut peer_nat_type = NatType::UNKNOWN_NAT;
+let my_nat_type = crate::get_nat_type(100).await;
+let mut is_local = false;
+let mut feedback = 0;
+use hbb_common::protobuf::Enum;
+
+let nat_type = if interface.is_force_relay() {
+    NatType::SYMMETRIC
+} else {
+    NatType::from_i32(my_nat_type).unwrap_or(NatType::UNKNOWN_NAT)
+};
+
+if !key.is_empty() && !token.is_empty() {
+    // mainly for the security of token
+    secure_tcp(&mut socket, &key)
+        .await
+        .map_err(|e| anyhow!("Failed to secure tcp: {}", e))?;
+} else if let Some(udp) = udp.1.as_ref() {
+    let tm = Instant::now();
+    loop {
+        let port = *udp.lock().unwrap();
+        if port > 0 {
+            break;
+        }
+        // await for 0.5 RTT
+        if tm.elapsed() > rtt / 2 {
+            break;
+        }
+        hbb_common::sleep(0.001).await;
+    }
+}
         // Stop UDP NAT test task if still running
         stop_udp_tx.map(|tx| tx.send(()));
         let mut msg_out = RendezvousMessage::new();

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="../res/logo-header.svg" alt="RustDesk - Your remote desktop"><br>
+  <img src="../res/logo-header.svg" alt="Sehcontrol - Your remote desktop"><br>
   <a href="#Δωρεάν-δημόσιοι-διακομιστές">Διακομιστές</a> •
   <a href="#Γενικά-βήματα-ώστε-να-κάνετε-build">Build</a> •
   <a href="#Πως-να-κάνετε-build-στο-Docker">Docker</a> •
@@ -11,13 +11,13 @@
 
 Επικοινωνήστε μαζί μας μέσω: [Discord](https://discord.gg/nDceKgxnkV) | [Twitter](https://twitter.com/rustdesk) | [Reddit](https://www.reddit.com/r/rustdesk) | [YouTube](https://www.youtube.com/@rustdesk)
 
-[![RustDesk Server Pro](https://img.shields.io/badge/RustDesk%20Server%20Pro-%CE%A0%CF%81%CE%BF%CE%B7%CE%B3%CE%BC%CE%AD%CE%BD%CE%B5%CF%82%20%CE%94%CF%85%CE%BD%CE%B1%CF%84%CF%8C%CF%84%CE%B7%CF%84%CE%B5%CF%82-blue)](https://rustdesk.com/pricing.html)
+[![Sehcontrol Server Pro](https://img.shields.io/badge/RustDesk%20Server%20Pro-%CE%A0%CF%81%CE%BF%CE%B7%CE%B3%CE%BC%CE%AD%CE%BD%CE%B5%CF%82%20%CE%94%CF%85%CE%BD%CE%B1%CF%84%CF%8C%CF%84%CE%B7%CF%84%CE%B5%CF%82-blue)](https://rustdesk.com/pricing.html)
 
 Ένα λογισμικό απομακρυσμένης επιφάνειας εργασίας, γραμμένο σε γλώσσα Rust. Δεν χρειάζεται κάποια παραμετροποίηση, λειτουργεί αμέσως μετά την εγκατάσταση. Έχετε τον πλήρη έλεγχο των δεδομένων σας, χωρίς να ανησυχείτε για την ασφάλειά τους. Μπορείτε να χρησιμοποιήσετε τους προκαθορισμένους διακομιστές rendezvous/αναμετάδοσης, [να εγκαταστήσετε τον δικό σας διακομιστή](https://rustdesk.com/server), ή [να αναπτύξετε ένα δικό σας διακομιστή rendezvous/αναμετάδοσης](https://github.com/rustdesk/rustdesk-server-demo).
 
 ![image](https://user-images.githubusercontent.com/71636191/171661982-430285f0-2e12-4b1d-9957-4a58e375304d.png)
 
-Το RustDesk ενθαρρύνει τη συνεισφορά όλων. Διαβάστε το [`docs/CONTRIBUTING.md`](CONTRIBUTING.md) για βοήθεια στο πως να ξεκινήσετε.
+Το Sehcontrol ενθαρρύνει τη συνεισφορά όλων. Διαβάστε το [`docs/CONTRIBUTING.md`](CONTRIBUTING.md) για βοήθεια στο πως να ξεκινήσετε.
 
 [**Συχνές ερωτήσεις**](https://github.com/rustdesk/rustdesk/wiki/FAQ)
 
@@ -110,7 +110,7 @@ cd
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
 git clone https://github.com/rustdesk/rustdesk
-cd rustdesk
+cd sehcontrol
 mkdir -p target/debug
 wget https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.lnx/x64/libsciter-gtk.so
 mv libsciter-gtk.so target/debug
@@ -123,29 +123,29 @@ VCPKG_ROOT=$HOME/vcpkg cargo run
 
 ```sh
 git clone https://github.com/rustdesk/rustdesk
-cd rustdesk
-docker build -t "rustdesk-builder" .
+cd sehcontrol
+docker build -t "sehcontrol-builder" .
 ```
 
 Στη συνέχεια, κάθε φορά που επιθυμείτε να κάνετε build την εφαρμογή, εκτελέστε την ακόλουθη εντολή:
 
 ```sh
-docker run --rm -it -v $PWD:/home/user/rustdesk -v rustdesk-git-cache:/home/user/.cargo/git -v rustdesk-registry-cache:/home/user/.cargo/registry -e PUID="$(id -u)" -e PGID="$(id -g)" rustdesk-builder
+docker run --rm -it -v $PWD:/home/user/sehcontrol -v sehcontrol-git-cache:/home/user/.cargo/git -v sehcontrol-registry-cache:/home/user/.cargo/registry -e PUID="$(id -u)" -e PGID="$(id -g)" sehcontrol-builder
 ```
 
 Σημειώστε ότι το πρώτο build μπορεί να διαρκέσει περισσότερο, ώστε να αποθηκευτούν στην προσωρινή μνήμη οι εξαρτήσεις, τα επόμενα build θα είναι ταχύτερα. Επιπλέον, εάν πρέπει να καθορίσετε διαφορετικές παραμέτρους στην εντολή build, μπορείτε να το κάνετε στο τέλος της εντολής με την χρήση `<OPTIONAL-ARGS>`. Για παράδειγμα, εάν επιθυμείτε να δημιουργήσετε μια βελτιστοποιημένη έκδοση της εφαρμογής, θα εκτελέσετε την παραπάνω εντολή ακολουθούμενη από το `--release`. Το εκτελέσιμο αρχείο θα είναι διαθέσιμο στον προκαθορισμένο φάκελο στο σύστημά σας και μπορεί να εκτελεστεί με:
 
 ```sh
-target/debug/rustdesk
+target/debug/sehcontrol
 ```
 
 Ή στην περίπτωση μιας βελτιστοποιημένης έκδοσης της εφαρμογής εκτελέστε:
 
 ```sh
-target/release/rustdesk
+target/release/sehcontrol
 ```
 
-Βεβαιωθείτε ότι εκτελείτε αυτές τις εντολές από την αρχική διαδρομή του αποθετηρίου του RustDesk, διαφορετικά η εφαρμογή ενδέχεται να μην είναι σε θέση να βρεί τους απαιτούμενους πόρους. Σημειώστε επίσης ότι άλλες υποεντολές, όπως το `install` ή το `run` δεν υποστηρίζονται επί του παρόντος μέσω αυτής της μεθόδου καθώς θα εγκαταστήσουν ή θα εκτελέσουν το πρόγραμμα εντός του container αντί του κεντρικού υπολογιστή.
+Βεβαιωθείτε ότι εκτελείτε αυτές τις εντολές από την αρχική διαδρομή του αποθετηρίου του Sehcontrol, διαφορετικά η εφαρμογή ενδέχεται να μην είναι σε θέση να βρεί τους απαιτούμενους πόρους. Σημειώστε επίσης ότι άλλες υποεντολές, όπως το `install` ή το `run` δεν υποστηρίζονται επί του παρόντος μέσω αυτής της μεθόδου καθώς θα εγκαταστήσουν ή θα εκτελέσουν το πρόγραμμα εντός του container αντί του κεντρικού υπολογιστή.
 
 ## Δομή φακέλων
 

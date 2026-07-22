@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="../res/logo-header.svg" alt="RustDesk - Your remote desktop"><br>
+  <img src="../res/logo-header.svg" alt="Sehcontrol - Your remote desktop"><br>
   <a href="#free-public-servers">Servers</a> •
   <a href="#raw-steps-to-build">Build</a> •
   <a href="#how-to-build-with-docker">Docker</a> •
@@ -11,7 +11,7 @@
 
 [Discord](https://discord.gg/nDceKgxnkV) | [Twitter](https://twitter.com/rustdesk) | [Reddit](https://www.reddit.com/r/rustdesk) | [YouTube](https://www.youtube.com/@rustdesk) :تواصل معنا عبر
 
-[![RustDesk Server Pro](https://img.shields.io/badge/RustDesk%20Server%20Pro-%D8%A7%D9%84%D9%85%D9%8A%D8%B2%D8%A7%D8%AA%20%D8%A7%D9%84%D9%85%D8%AA%D9%82%D8%AF%D9%85%D8%A9-blue)](https://rustdesk.com/pricing.html)
+[![Sehcontrol Server Pro](https://img.shields.io/badge/RustDesk%20Server%20Pro-%D8%A7%D9%84%D9%85%D9%8A%D8%B2%D8%A7%D8%AA%20%D8%A7%D9%84%D9%85%D8%AA%D9%82%D8%AF%D9%85%D8%A9-blue)](https://rustdesk.com/pricing.html)
 
 .Rustبرنامج آخر لسطح المكتب عن بعد، مكتوب بـ
 يعمل خارج الصندوق، لا حاجة إلى إعدادات. لديك سيطرة كاملة على بياناتك، دون مخاوف بشأن الأمن. يمكنك استخدام خادم
@@ -21,7 +21,7 @@
 
 ![image](https://user-images.githubusercontent.com/71636191/171661982-430285f0-2e12-4b1d-9957-4a58e375304d.png)
 
-لمساعدتك على ذلك [`docs/CONTRIBUTING.md`](CONTRIBUTING.md) يرحب بمساهمة الجميع. اطلع على  RustDesk.
+لمساعدتك على ذلك [`docs/CONTRIBUTING.md`](CONTRIBUTING.md) يرحب بمساهمة الجميع. اطلع على  Sehcontrol.
 
 [**؟ RustDesk كيفية يعمل**](https://github.com/rustdesk/rustdesk/wiki/How-does-RustDesk-work%3F)
 
@@ -104,7 +104,7 @@ cd
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
 git clone https://github.com/rustdesk/rustdesk
-cd rustdesk
+cd sehcontrol
 mkdir -p target/debug
 wget https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.lnx/x64/libsciter-gtk.so
 mv libsciter-gtk.so target/debug
@@ -117,14 +117,14 @@ VCPKG_ROOT=$HOME/vcpkg cargo run
 
 ```sh
 git clone https://github.com/rustdesk/rustdesk
-cd rustdesk
-docker build -t "rustdesk-builder" .
+cd sehcontrol
+docker build -t "sehcontrol-builder" .
 ```
 
 ثم، في كل مرة تحتاج إلى بناء التطبيق، قم بتشغيل الأمر التالي:
 
 ```sh
-docker run --rm -it -v $PWD:/home/user/rustdesk -v rustdesk-git-cache:/home/user/.cargo/git -v rustdesk-registry-cache:/home/user/.cargo/registry -e PUID="$(id -u)" -e PGID="$(id -g)" rustdesk-builder
+docker run --rm -it -v $PWD:/home/user/sehcontrol -v sehcontrol-git-cache:/home/user/.cargo/git -v sehcontrol-registry-cache:/home/user/.cargo/registry -e PUID="$(id -u)" -e PGID="$(id -g)" sehcontrol-builder
 ```
 
 لاحظ أن البناء الأول قد يستغرق وقتًا أطول قبل تخزين التبعيات، وسيكون البناء اللاحق أسرع. بالإضافة إلى ذلك، إذا كنت بحاجة إلى تحديد وسائط مختلفة لأمر البناء، فيمكنك القيام بذلك في نهاية الأمر بوضع
@@ -134,16 +134,16 @@ docker run --rm -it -v $PWD:/home/user/rustdesk -v rustdesk-git-cache:/home/user
 :سيكون الملف القابل للتنفيذ الناتج متاحًا في مجلد تارغت، ويمكن تشغيله باستخدام
 
 ```sh
-target/debug/rustdesk
+target/debug/sehcontrol
 ```
 
 :أو في حال قمت ببناء إصدار محسن
 
 ```sh
-target/release/rustdesk
+target/release/sehcontrol
 ```
 
-RustDesk يرجى التأكد من أنك تنفذ هذه الأوامر من جذر مستودع
+Sehcontrol يرجى التأكد من أنك تنفذ هذه الأوامر من جذر مستودع
 وإلا فقد لا يتمكن التطبيق من العثور على الموارد المطلوبة. لاحظ أيضًا أن الأوامر الفرعية الأخرى مثل
 `install` أو `run`
 لا يتم دعمها حاليًا عبر هذه الطريقة لأنها ستقوم بتثبيت أو تشغيل البرنامج داخل الكونتاينر بدلاً من الهوست.

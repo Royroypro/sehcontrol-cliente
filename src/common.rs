@@ -682,31 +682,48 @@ async fn test_nat_type_() -> ResultType<bool> {
     }
     Ok(ok)
 }
-
 pub async fn get_rendezvous_server(ms_timeout: u64) -> (String, Vec<String>, bool) {
     #[cfg(any(target_os = "android", target_os = "ios"))]
     let (mut a, mut b) = get_rendezvous_server_(ms_timeout);
+
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let (mut a, mut b) = get_rendezvous_server_(ms_timeout).await;
+
     #[cfg(windows)]
     if let Ok(lic) = crate::platform::get_license_from_exe_name() {
         if !lic.host.is_empty() {
             a = lic.host;
         }
     }
-    let mut b: Vec<String> = b
+
+    // 1) Asegura puerto en `a`
+    a = socket_client::check_port(a, config::RENDEZVOUS_PORT);
+
+    // 2) Asegura puerto en toda la lista `b` y crea `b_checked`
+    let mut b_checked: Vec<String> = b
         .drain(..)
         .map(|x| socket_client::check_port(x, config::RENDEZVOUS_PORT))
         .collect();
-    let c = if b.contains(&a) {
-        b = b.drain(..).filter(|x| x != &a).collect();
-        true
-    } else {
-        a = b.pop().unwrap_or(a);
-        false
-    };
-    (a, b, c)
+
+    // 3) Marca si 'a' estaba en la lista original (ya normalizada)
+    let contained = b_checked.iter().any(|x| x == &a);
+
+    // 4) Limpia b: quita 'a' y duplicados, preservando orden
+    let mut out = Vec::new();
+    for s in b_checked.drain(..) {
+        if s == a {
+            continue;
+        }
+        if out.contains(&s) {
+            continue;
+        }
+        out.push(s);
+    }
+
+    (a, out, contained)
 }
+
+
 
 #[inline]
 #[cfg(any(target_os = "android", target_os = "ios"))]
@@ -1007,7 +1024,7 @@ pub fn get_app_name() -> String {
 
 #[inline]
 pub fn is_rustdesk() -> bool {
-    hbb_common::config::APP_NAME.read().unwrap().eq("RustDesk")
+    hbb_common::config::APP_NAME.read().unwrap().eq("Sehcontrol")
 }
 
 #[inline]
@@ -1090,7 +1107,7 @@ fn get_api_server_(api: String, custom: String) -> String {
 
 #[inline]
 pub fn is_public(url: &str) -> bool {
-    url.contains("rustdesk.com/") || url.ends_with("rustdesk.com")
+    url.contains("sehcontrol.com/") || url.ends_with("sehcontrol.com")
 }
 
 pub fn get_udp_punch_enabled() -> bool {
@@ -1638,7 +1655,7 @@ pub fn check_process(arg: &str, mut same_uid: bool) -> bool {
         if same_uid && p.user_id() != my_uid {
             continue;
         }
-        // on mac, p.cmd() get "/Applications/RustDesk.app/Contents/MacOS/RustDesk", "XPC_SERVICE_NAME=com.carriez.RustDesk_server"
+        // on mac, p.cmd() get "/Applications/Sehcontrol.app/Contents/MacOS/Sehcontrol", "XPC_SERVICE_NAME=com.carriez.RustDesk_server"
         let parg = if p.cmd().len() <= 1 { "" } else { &p.cmd()[1] };
         if arg.is_empty() {
             if !parg.starts_with("--") {
@@ -1988,7 +2005,7 @@ pub fn get_builtin_option(key: &str) -> String {
 
 #[inline]
 pub fn is_custom_client() -> bool {
-    get_app_name() != "RustDesk"
+    get_app_name() != "Sehcontrol"
 }
 
 pub fn verify_login(_raw: &str, _id: &str) -> bool {
@@ -2469,14 +2486,14 @@ mod tests {
 
     #[test]
     fn test_is_public() {
-        // Test URLs containing "rustdesk.com/"
+        // Test URLs containing "sehcontrol.com/"
         assert!(is_public("https://rustdesk.com/"));
         assert!(is_public("https://www.rustdesk.com/"));
         assert!(is_public("https://api.rustdesk.com/v1"));
         assert!(is_public("https://rustdesk.com/path"));
 
-        // Test URLs ending with "rustdesk.com"
-        assert!(is_public("rustdesk.com"));
+        // Test URLs ending with "sehcontrol.com"
+        assert!(is_public("sehcontrol.com"));
         assert!(is_public("https://rustdesk.com"));
         assert!(is_public("http://www.rustdesk.com"));
         assert!(is_public("https://api.rustdesk.com"));
@@ -2487,7 +2504,7 @@ mod tests {
         assert!(!is_public("http://192.168.1.1"));
         assert!(!is_public("localhost"));
         assert!(!is_public("https://rustdesk.computer.com"));
-        assert!(!is_public("rustdesk.comhello.com"));
+        assert!(!is_public("sehcontrol.comhello.com"));
     }
 
     #[test]

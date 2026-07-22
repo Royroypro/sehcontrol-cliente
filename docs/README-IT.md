@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="../res/logo-header.svg" alt="RustDesk - il tuo desktop remoto"><br>
+  <img src="../res/logo-header.svg" alt="Sehcontrol - il tuo desktop remoto"><br>
   <a href="#server-pubblici-gratuiti">Server</a> •
   <a href="#passaggi-per-la-compilazione">Compilazione</a> •
   <a href="#come-compilare-con-docker">Docker</a> •
@@ -11,7 +11,7 @@
 
 Chatta con noi su: [Discord](https://discord.gg/nDceKgxnkV) | [Twitter](https://twitter.com/rustdesk) | [Reddit](https://www.reddit.com/r/rustdesk) | [YouTube](https://www.youtube.com/@rustdesk)
 
-[![RustDesk Server Pro](https://img.shields.io/badge/RustDesk%20Server%20Pro-Funzionalit%C3%A0%20Avanzate-blue)](https://rustdesk.com/pricing.html)
+[![Sehcontrol Server Pro](https://img.shields.io/badge/RustDesk%20Server%20Pro-Funzionalit%C3%A0%20Avanzate-blue)](https://rustdesk.com/pricing.html)
 
 [![Bounties aperti](https://img.shields.io/endpoint?url=https%3A%2F%2Fconsole.algora.io%2Fapi%2Fshields%2Frustdesk%2Fbounties%3Fstatus%3Dopen)](https://console.algora.io/org/rustdesk/bounties?status=open)
 
@@ -19,7 +19,7 @@ Ancora un altro software per il controllo remoto del desktop, scritto in Rust. F
 
 ![image](https://user-images.githubusercontent.com/71636191/171661982-430285f0-2e12-4b1d-9957-4a58e375304d.png)
 
-RustDesk accoglie il contributo di tutti. Per ulteriori informazioni su come iniziare a contribuire, vedi [CONTRIBUTING.md](CONTRIBUTING-IT.md).
+Sehcontrol accoglie il contributo di tutti. Per ulteriori informazioni su come iniziare a contribuire, vedi [CONTRIBUTING.md](CONTRIBUTING-IT.md).
 
 [**FAQ**](https://github.com/rustdesk/rustdesk/wiki/FAQ)
 
@@ -113,7 +113,7 @@ cd
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
 git clone https://github.com/rustdesk/rustdesk
-cd rustdesk
+cd sehcontrol
 mkdir -p target/debug
 wget https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.lnx/x64/libsciter-gtk.so
 mv libsciter-gtk.so target/debug
@@ -126,29 +126,29 @@ Clona il repository e compila i container docker:
 
 ```sh
 git clone https://github.com/rustdesk/rustdesk
-cd rustdesk
-docker build -t "rustdesk-builder" .
+cd sehcontrol
+docker build -t "sehcontrol-builder" .
 ```
 
 Quindi, ogni volta che devi compilare l'applicazione, esegui il seguente comando:
 
 ```sh
-docker run --rm -it -v $PWD:/home/user/rustdesk -v rustdesk-git-cache:/home/user/.cargo/git -v rustdesk-registry-cache:/home/user/.cargo/registry -e PUID="$(id -u)" -e PGID="$(id -g)" rustdesk-builder
+docker run --rm -it -v $PWD:/home/user/sehcontrol -v sehcontrol-git-cache:/home/user/.cargo/git -v sehcontrol-registry-cache:/home/user/.cargo/registry -e PUID="$(id -u)" -e PGID="$(id -g)" sehcontrol-builder
 ```
 
 Tieni presente che la prima build potrebbe richiedere più tempo prima che le dipendenze vengano memorizzate nella cache, le build successive saranno più veloci. Inoltre, se hai bisogno di specificare argomenti diversi per il comando build, puoi farlo alla fine del comando nella posizione `<OPTIONAL-ARGS>`. Ad esempio, se vuoi creare una versione di rilascio ottimizzata, esegui il comando precedentemente indicato seguito da `--release`. L'eseguibile generato sarà creato nella cartella destinazione del sistema e può essere eseguito con:
 
 ```sh
-target/debug/rustdesk
+target/debug/sehcontrol
 ```
 
 Oppure, se stai avviando un eseguibile di rilascio:
 
 ```sh
-target/release/rustdesk
+target/release/sehcontrol
 ```
 
-Assicurati di eseguire questi comandi dalla radice del repository RustDesk, altrimenti l'applicazione potrebbe non essere in grado di trovare le risorse richieste. Nota inoltre che altri sottocomandi cargo come `install` o `run` non sono attualmente supportati tramite questo metodo poiché installerebbero o eseguirebbero il programma all'interno del container anziché nell'host.
+Assicurati di eseguire questi comandi dalla radice del repository Sehcontrol, altrimenti l'applicazione potrebbe non essere in grado di trovare le risorse richieste. Nota inoltre che altri sottocomandi cargo come `install` o `run` non sono attualmente supportati tramite questo metodo poiché installerebbero o eseguirebbero il programma all'interno del container anziché nell'host.
 
 ## Struttura dei file
 
@@ -166,7 +166,7 @@ Assicurati di eseguire questi comandi dalla radice del repository RustDesk, altr
 
 > [!Attenzione]
 > **Dichiarazione di non responsabilità per uso improprio:** <br>
-> Gli sviluppatori di RustDesk non approvano né supportano alcun uso non etico o illegale di questo software. L'uso improprio, come l'accesso non autorizzato, il controllo o l'invasione della privacy, è strettamente contro le nostre linee guida. Gli autori non sono responsabili per qualsiasi uso improprio dell'applicazione.
+> Gli sviluppatori di Sehcontrol non approvano né supportano alcun uso non etico o illegale di questo software. L'uso improprio, come l'accesso non autorizzato, il controllo o l'invasione della privacy, è strettamente contro le nostre linee guida. Gli autori non sono responsabili per qualsiasi uso improprio dell'applicazione.
 
 ## Schermate
 

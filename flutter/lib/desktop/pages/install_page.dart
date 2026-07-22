@@ -165,7 +165,7 @@ class _InstallPageBodyState extends State<_InstallPageBody>
                   .marginOnly(bottom: 7),
               Option(desktopicon, label: 'Create desktop icon')
                   .marginOnly(bottom: 7),
-              Option(printer, label: 'Install {$appName} Printer'),
+              //Option(printer, label: 'Install {$appName} Printer'),
               Container(
                   padding: EdgeInsets.all(12),
                   decoration: BoxDecoration(

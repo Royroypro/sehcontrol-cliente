@@ -58,7 +58,7 @@ static PLUGIN_SOURCE_LOCAL: &str = "local";
 fn get_plugin_source_list() -> Vec<PluginSource> {
     // Only one source for now.
     // vec![PluginSource {
-    //     name: "rustdesk".to_string(),
+    //     name: "sehcontrol".to_string(),
     //     url: "https://raw.githubusercontent.com/fufesou/rustdesk-plugins/main".to_string(),
     //     description: "".to_string(),
     // }]
@@ -198,7 +198,7 @@ fn elevate_install(
     if !same_plugin_exists {
         args.push(&plugin_url);
     }
-    crate::platform::elevate(args, "RustDesk wants to install then plugin")
+    crate::platform::elevate(args, "Sehcontrol wants to install then plugin")
 }
 
 #[inline]
@@ -218,7 +218,7 @@ fn elevate_uninstall(plugin_id: &str) -> ResultType<bool> {
 fn elevate_uninstall(plugin_id: &str) -> ResultType<bool> {
     crate::platform::elevate(
         vec!["--plugin-uninstall", plugin_id],
-        "RustDesk wants to uninstall the plugin",
+        "Sehcontrol wants to uninstall the plugin",
     )
 }
 

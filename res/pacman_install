@@ -5,43 +5,43 @@
 # arg 1:  the new package version
 post_install() {
 	# do something here
-	cp /usr/share/rustdesk/files/rustdesk.service /etc/systemd/system/rustdesk.service
-	cp /usr/share/rustdesk/files/rustdesk.desktop /usr/share/applications/
-	cp /usr/share/rustdesk/files/rustdesk-link.desktop /usr/share/applications/
+	cp /usr/share/sehcontrol/files/sehcontrol.service /etc/systemd/system/sehcontrol.service
+	cp /usr/share/sehcontrol/files/sehcontrol.desktop /usr/share/applications/
+	cp /usr/share/sehcontrol/files/sehcontrol-link.desktop /usr/share/applications/
 	systemctl daemon-reload
-	systemctl enable rustdesk
-	systemctl start rustdesk
+	systemctl enable sehcontrol
+	systemctl start sehcontrol
 	update-desktop-database
 }
 
 # arg 1:  the new package version
 # arg 2:  the old package version
 pre_upgrade() {
-    systemctl stop rustdesk || true
+    systemctl stop sehcontrol || true
 }
 
 # arg 1:  the new package version
 # arg 2:  the old package version
 post_upgrade() {
-	cp /usr/share/rustdesk/files/rustdesk.service /etc/systemd/system/rustdesk.service
-	cp /usr/share/rustdesk/files/rustdesk.desktop /usr/share/applications/
-	cp /usr/share/rustdesk/files/rustdesk-link.desktop /usr/share/applications/
+	cp /usr/share/sehcontrol/files/sehcontrol.service /etc/systemd/system/sehcontrol.service
+	cp /usr/share/sehcontrol/files/sehcontrol.desktop /usr/share/applications/
+	cp /usr/share/sehcontrol/files/sehcontrol-link.desktop /usr/share/applications/
 	systemctl daemon-reload
-	systemctl enable rustdesk
-	systemctl start rustdesk
+	systemctl enable sehcontrol
+	systemctl start sehcontrol
 	update-desktop-database
 }
 
 # arg 1:  the old package version
 pre_remove() {
-	systemctl stop rustdesk || true
-	systemctl disable rustdesk || true
-	rm /etc/systemd/system/rustdesk.service || true
+	systemctl stop sehcontrol || true
+	systemctl disable sehcontrol || true
+	rm /etc/systemd/system/sehcontrol.service || true
 }
 
 # arg 1:  the old package version
 post_remove() {
-	rm /usr/share/applications/rustdesk.desktop || true
-	rm /usr/share/applications/rustdesk-link.desktop || true
+	rm /usr/share/applications/sehcontrol.desktop || true
+	rm /usr/share/applications/sehcontrol-link.desktop || true
 	update-desktop-database
 }

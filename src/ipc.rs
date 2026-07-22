@@ -545,7 +545,7 @@ async fn handle(data: Data, stream: &mut Connection) {
                 }
                 #[cfg(any(target_os = "macos", target_os = "linux"))]
                 if crate::is_main() {
-                    // below part is for main windows can be reopen during rustdesk installation and installing service from UI
+                    // below part is for main windows can be reopen during sehcontrol installation and installing service from UI
                     // this make new ipc server (domain socket) can be created.
                     std::fs::remove_file(&Config::ipc_path("")).ok();
                     #[cfg(target_os = "linux")]
@@ -1242,7 +1242,11 @@ pub fn get_id() -> String {
 
 pub async fn get_rendezvous_server(ms_timeout: u64) -> (String, Vec<String>) {
     if let Ok(Some(v)) = get_config_async("rendezvous_server", ms_timeout).await {
-        let mut urls = v.split(",");
+        let mut urls = v
+            .split(',')
+            .map(|x| x.trim())
+            .filter(|x| !x.is_empty());
+
         let a = urls.next().unwrap_or_default().to_owned();
         let b: Vec<String> = urls.map(|x| x.to_owned()).collect();
         (a, b)
@@ -1253,6 +1257,7 @@ pub async fn get_rendezvous_server(ms_timeout: u64) -> (String, Vec<String>) {
         )
     }
 }
+
 
 async fn get_options_(ms_timeout: u64) -> ResultType<HashMap<String, String>> {
     let mut c = connect(ms_timeout, "").await?;

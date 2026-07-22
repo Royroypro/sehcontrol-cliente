@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="../res/logo-header.svg" alt="RustDesk - Twój zdalny pulpit"><br>
+  <img src="../res/logo-header.svg" alt="Sehcontrol - Twój zdalny pulpit"><br>
   <a href="#darmowe-serwery-publiczne">Serwery</a> •
   <a href="#podstawowe-kroki-do-kompilacji">Kompilacja</a> •
   <a href="#jak-kompilować-za-pomocą-dockera">Docker</a> •
@@ -11,13 +11,13 @@
 
 Porozmawiaj z nami na: [Discord](https://discord.gg/nDceKgxnkV) | [Twitter](https://twitter.com/rustdesk) | [Reddit](https://www.reddit.com/r/rustdesk) | [YouTube](https://www.youtube.com/@rustdesk)
 
-[![RustDesk Server Pro](https://img.shields.io/badge/RustDesk%20Server%20Pro-Zaawansowane%20Funkcje-blue)](https://rustdesk.com/pricing.html)
+[![Sehcontrol Server Pro](https://img.shields.io/badge/RustDesk%20Server%20Pro-Zaawansowane%20Funkcje-blue)](https://rustdesk.com/pricing.html)
 
 Kolejny program do zdalnego pulpitu, napisany w Rust. Działa od samego początku, nie wymaga konfiguracji. Masz pełną kontrolę nad swoimi danymi, bez obaw o bezpieczeństwo. Możesz skorzystać z naszego darmowego serwera publicznego, [skonfigurować własny](https://rustdesk.com/server), lub [napisać własny serwer](https://github.com/rustdesk/rustdesk-server-demo).
 
 ![image](https://user-images.githubusercontent.com/71636191/171661982-430285f0-2e12-4b1d-9957-4a58e375304d.png) 
 
-RustDesk zaprasza do współpracy każdego. Zobacz [`docs/CONTRIBUTING-PL.md`](CONTRIBUTING-PL.md) pomoc w uruchomieniu programu.
+Sehcontrol zaprasza do współpracy każdego. Zobacz [`docs/CONTRIBUTING-PL.md`](CONTRIBUTING-PL.md) pomoc w uruchomieniu programu.
 
 [**PYTANIA I ODPOWIEDZI (FAQ)**](https://github.com/rustdesk/rustdesk/wiki/FAQ)
 
@@ -105,7 +105,7 @@ cd
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
 git clone https://github.com/rustdesk/rustdesk
-cd rustdesk
+cd sehcontrol
 mkdir -p target/debug
 wget https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.lnx/x64/libsciter-gtk.so
 mv libsciter-gtk.so target/debug
@@ -118,29 +118,29 @@ Rozpocznij od sklonowania repozytorium i stworzenia kontenera docker:
 
 ```sh
 git clone https://github.com/rustdesk/rustdesk
-cd rustdesk
-docker build -t "rustdesk-builder" .
+cd sehcontrol
+docker build -t "sehcontrol-builder" .
 ```
 
 Następnie, za każdym razem, gdy potrzebujesz skompilować aplikację, uruchom następujące polecenie:
 
 ```sh
-docker run --rm -it -v $PWD:/home/user/rustdesk -v rustdesk-git-cache:/home/user/.cargo/git -v rustdesk-registry-cache:/home/user/.cargo/registry -e PUID="$(id -u)" -e PGID="$(id -g)" rustdesk-builder
+docker run --rm -it -v $PWD:/home/user/sehcontrol -v sehcontrol-git-cache:/home/user/.cargo/git -v sehcontrol-registry-cache:/home/user/.cargo/registry -e PUID="$(id -u)" -e PGID="$(id -g)" sehcontrol-builder
 ```
 
 Zauważ, że pierwsza kompilacja może potrwać dłużej zanim zależności zostaną zbuforowane, kolejne będą szybsze. Dodatkowo, jeśli potrzebujesz określić inne argumenty dla polecenia budowania, możesz to zrobić na końcu komendy w miejscu `<OPTIONAL-ARGS>`. Na przykład, jeśli chciałbyś zbudować zoptymalizowaną wersję wydania, uruchomiłbyś powyższą komendę a następnie `--release`. Powstały plik wykonywalny będzie dostępny w folderze docelowym w twoim systemie i może być uruchomiony z:
 
 ```sh
-target/debug/rustdesk
+target/debug/sehcontrol
 ```
 
 Lub jeśli uruchamiasz plik wykonywalny wersji:
 
 ```sh
-target/release/rustdesk
+target/release/sehcontrol
 ```
 
-Upewnij się, że uruchamiasz te polecenia z katalogu głównego repozytorium RustDesk, w przeciwnym razie aplikacja może nie być w stanie znaleźć wymaganych zasobów. Należy również pamiętać, że inne podpolecenia ładowania, takie jak `install` lub `run` nie są obecnie obsługiwane za pomocą tej metody, ponieważ instalowałyby lub uruchamiały program wewnątrz kontenera zamiast na hoście.
+Upewnij się, że uruchamiasz te polecenia z katalogu głównego repozytorium Sehcontrol, w przeciwnym razie aplikacja może nie być w stanie znaleźć wymaganych zasobów. Należy również pamiętać, że inne podpolecenia ładowania, takie jak `install` lub `run` nie są obecnie obsługiwane za pomocą tej metody, ponieważ instalowałyby lub uruchamiały program wewnątrz kontenera zamiast na hoście.
 
 ## Struktura plików
 

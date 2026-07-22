@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="../res/logo-header.svg" alt="RustDesk - Your remote desktop"><br>
+  <img src="../res/logo-header.svg" alt="Sehcontrol - Your remote desktop"><br>
   <a href="#senpagaj-publikaj-serviloj">Serviloj</a> •
   <a href="#paŝoj-por-kompili">Kompili</a> •
   <a href="#kiel-kompili-kun-docker">Docker</a> •
@@ -11,11 +11,11 @@
 
 Babili kun ni: [Discord](https://discord.gg/nDceKgxnkV) | [Twitter](https://twitter.com/rustdesk) | [Reddit](https://www.reddit.com/r/rustdesk) | [YouTube](https://www.youtube.com/@rustdesk)
 
-[![RustDesk Server Pro](https://img.shields.io/badge/RustDesk%20Server%20Pro-Altnivela%20Funkcioj-blue)](https://rustdesk.com/pricing.html)
+[![Sehcontrol Server Pro](https://img.shields.io/badge/RustDesk%20Server%20Pro-Altnivela%20Funkcioj-blue)](https://rustdesk.com/pricing.html)
 
 Denove alia fora labortabla programo, skribita en Rust. Ĝi funkcias elskatole, ne bezonas konfiguraĵon. Vi havas la tutan kontrolon sur viaj datumoj, sen zorgo pri sekureco. Vi povas uzi nian servilon rendezvous/relajsan, [agordi vian propran](https://rustdesk.com/server), aŭ [skribi vian propran servilon rendezvous/relajsan](https://github.com/rustdesk/rustdesk-server-demo).
 
-RustDesk bonvenigas kontribuon de ĉiuj. Vidu [`docs/CONTRIBUTING.md`](CONTRIBUTING.md) por helpo komenci.
+Sehcontrol bonvenigas kontribuon de ĉiuj. Vidu [`docs/CONTRIBUTING.md`](CONTRIBUTING.md) por helpo komenci.
 
 [**BINARA ELŜUTO**](https://github.com/rustdesk/rustdesk/releases)
 
@@ -89,7 +89,7 @@ cd
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 source $HOME/.cargo/env
 git clone https://github.com/rustdesk/rustdesk
-cd rustdesk
+cd sehcontrol
 mkdir -p target/debug
 wget https://raw.githubusercontent.com/c-smile/sciter-sdk/master/bin.lnx/x64/libsciter-gtk.so
 mv libsciter-gtk.so target/debug
@@ -102,29 +102,29 @@ Komencu klonante la deponejon kaj kompilu la konteneron Docker:
 
 ```sh
 git clone https://github.com/rustdesk/rustdesk
-cd rustdesk
-docker build -t "rustdesk-builder" .
+cd sehcontrol
+docker build -t "sehcontrol-builder" .
 ```
 
 Tiam, ĉiuj fojoj, kiuj vi bezonas kompili la programon, plenumu tiun komandon:
 
 ```sh
-docker run --rm -it -v $PWD:/home/user/rustdesk -v rustdesk-git-cache:/home/user/.cargo/git -v rustdesk-registry-cache:/home/user/.cargo/registry -e PUID="$(id -u)" -e PGID="$(id -g)" rustdesk-builder
+docker run --rm -it -v $PWD:/home/user/sehcontrol -v sehcontrol-git-cache:/home/user/.cargo/git -v sehcontrol-registry-cache:/home/user/.cargo/registry -e PUID="$(id -u)" -e PGID="$(id -g)" sehcontrol-builder
 ```
 
 Notu, ke la unua kompilado povas daŭri longe, antaŭ ke la dependantaĵoj estu kaŝitaj, sekvaj kompiladoj estos pli rapidaj. Aldone, se vi bezonas specifi diferentajn argumentojn por la kompilkomando, vi povas fari ĝin en la fine de la komando, en la posicio `<OPTIONAL-ARGS>`. Ekzemple, se vi volas kompili version de eldono optimigita, vi plenumus la komandon supre, kun `--release`. La plenumebla dosiero disponeblos en la cela dosierujo sur via sistemo, kaj povos esti plenumita kun:
 
 ```sh
-target/debug/rustdesk
+target/debug/sehcontrol
 ```
 
 Aŭ, se vi plenumas eldonan plenumeblan dosieron:
 
 ```sh
-target/release/rustdesk
+target/release/sehcontrol
 ```
 
-Bonvolu certigi, ke vi plenumas tiujn komandojn el la radiko de la deponejo RustDesk, alie la programo povus esti nekapabla de trovi la devigajn resursojn. Ankaŭ notu, ke la aliaj subkomandoj de cargo kiel `install` aŭ `run` momente ne estas subtenitaj per tiu metodo, ĉar instalus aŭ plenumus la programon en la kontenero anstataŭ de la gastiganto.
+Bonvolu certigi, ke vi plenumas tiujn komandojn el la radiko de la deponejo Sehcontrol, alie la programo povus esti nekapabla de trovi la devigajn resursojn. Ankaŭ notu, ke la aliaj subkomandoj de cargo kiel `install` aŭ `run` momente ne estas subtenitaj per tiu metodo, ĉar instalus aŭ plenumus la programon en la kontenero anstataŭ de la gastiganto.
 
 ## Dosierstrukturo
 

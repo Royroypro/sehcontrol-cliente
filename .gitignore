@@ -20,8 +20,9 @@ sciter.dll
 **pdb
 src/bridge_generated.rs
 src/bridge_generated.io.rs
+src/bridge_generated.h
 *deb
-rustdesk
+sehcontrol
 *.cache
 # appimage
 appimage/AppDir
@@ -55,3 +56,10 @@ vcpkg_installed
 flutter/lib/generated_plugin_registrant.dart
 libsciter.dylib
 flutter/web/
+# local-only tooling, artifacts, secrets (not part of the RustDesk tree)
+/seh-agent/
+/plan_desarrollo/
+/backend-source/
+*.dll
+*.zip
+flutter/devtools_options.yaml

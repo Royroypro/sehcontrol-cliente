@@ -11,6 +11,7 @@ import 'package:flutter_hbb/common/widgets/setting_widgets.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_home_page.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';
+import 'package:flutter_hbb/desktop/pages/support_sidebar.dart';
 import 'package:flutter_hbb/desktop/widgets/remote_toolbar.dart';
 import 'package:flutter_hbb/mobile/widgets/dialog.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
@@ -285,7 +286,16 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
             child: Column(
               children: [
                 _header(context),
-                Flexible(child: _listView(tabs: _settingTabs())),
+
+                // Menú de ajustes (General, Seguridad, etc.)
+                Expanded(
+                  child: _listView(
+                    tabs: _settingTabs(),
+                  ),
+                ),
+
+                // Soporte técnico fijo debajo del menú
+                const SupportSidebarBlock(),
               ],
             ),
           ),
@@ -2302,7 +2312,7 @@ class _AboutState extends State<_About> {
       final scrollController = ScrollController();
       return SingleChildScrollView(
         controller: scrollController,
-        child: _Card(title: translate('About RustDesk'), children: [
+        child: _Card(title: translate('About Sehcontrol'), children: [
           Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
@@ -2321,7 +2331,8 @@ class _AboutState extends State<_About> {
                         .marginSymmetric(vertical: 4.0)),
               InkWell(
                   onTap: () {
-                    launchUrlString('https://rustdesk.com/privacy.html');
+                    launchUrlString(
+                        'https://sehcontrol.sehuacho.com/privacy.html');
                   },
                   child: Text(
                     translate('Privacy Statement'),
@@ -2329,7 +2340,7 @@ class _AboutState extends State<_About> {
                   ).marginSymmetric(vertical: 4.0)),
               InkWell(
                   onTap: () {
-                    launchUrlString('https://rustdesk.com');
+                    launchUrlString('https://sehcontrol.sehuacho.com');
                   },
                   child: Text(
                     translate('Website'),

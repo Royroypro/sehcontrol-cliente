@@ -99,10 +99,11 @@ fn load_plugin_in_app_path(dll_name: &str) -> Result<Library, LibError> {
     }
 }
 
-/// FFI for rustdesk core's main entry.
+/// FFI for sehcontrol core's main entry.
 /// Return true if the app should continue running with UI(possibly Flutter), false if the app should exit.
-#[cfg(not(windows))]
+
 #[no_mangle]
+
 pub extern "C" fn rustdesk_core_main() -> bool {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     if crate::core_main::core_main().is_some() {
@@ -115,6 +116,7 @@ pub extern "C" fn rustdesk_core_main() -> bool {
     false
 }
 
+
 #[cfg(target_os = "macos")]
 #[no_mangle]
 pub extern "C" fn handle_applicationShouldOpenUntitledFile() {
@@ -123,8 +125,12 @@ pub extern "C" fn handle_applicationShouldOpenUntitledFile() {
 
 #[cfg(windows)]
 #[no_mangle]
-pub extern "C" fn rustdesk_core_main_args(args_len: *mut c_int) -> *mut *mut c_char {
+#[no_mangle]
+pub extern "C" fn rustdesk_core_main_args(
+    args_len: *mut c_int
+) -> *mut *mut c_char {
     unsafe { std::ptr::write(args_len, 0) };
+
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     {
         if let Some(args) = crate::core_main::core_main() {
@@ -132,9 +138,11 @@ pub extern "C" fn rustdesk_core_main_args(args_len: *mut c_int) -> *mut *mut c_c
         }
         return std::ptr::null_mut() as _;
     }
+
     #[cfg(any(target_os = "android", target_os = "ios"))]
     return std::ptr::null_mut() as _;
 }
+
 
 // https://gist.github.com/iskakaushik/1c5b8aa75c77479c33c4320913eebef6
 #[cfg(windows)]

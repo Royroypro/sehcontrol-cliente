@@ -1,4 +1,4 @@
-Name:       rustdesk
+Name:       sehcontrol
 Version:    1.1.9
 Release:    0
 Summary:    RPM package
@@ -21,26 +21,26 @@ The best open-source remote desktop client software, written in Rust.
 
 %install
 mkdir -p %{buildroot}/usr/bin/
-mkdir -p %{buildroot}/usr/share/rustdesk/
-mkdir -p %{buildroot}/usr/share/rustdesk/files/
+mkdir -p %{buildroot}/usr/share/sehcontrol/
+mkdir -p %{buildroot}/usr/share/sehcontrol/files/
 mkdir -p %{buildroot}/usr/share/icons/hicolor/256x256/apps/
 mkdir -p %{buildroot}/usr/share/icons/hicolor/scalable/apps/
-install -m 755 $HBB/target/release/rustdesk %{buildroot}/usr/bin/rustdesk
-install $HBB/libsciter-gtk.so %{buildroot}/usr/share/rustdesk/libsciter-gtk.so
-install $HBB/res/rustdesk.service %{buildroot}/usr/share/rustdesk/files/
-install $HBB/res/128x128@2x.png %{buildroot}/usr/share/icons/hicolor/256x256/apps/rustdesk.png
-install $HBB/res/scalable.svg %{buildroot}/usr/share/icons/hicolor/scalable/apps/rustdesk.svg
-install $HBB/res/rustdesk.desktop %{buildroot}/usr/share/rustdesk/files/
-install $HBB/res/rustdesk-link.desktop %{buildroot}/usr/share/rustdesk/files/
+install -m 755 $HBB/target/release/sehcontrol %{buildroot}/usr/bin/sehcontrol
+install $HBB/libsciter-gtk.so %{buildroot}/usr/share/sehcontrol/libsciter-gtk.so
+install $HBB/res/sehcontrol.service %{buildroot}/usr/share/sehcontrol/files/
+install $HBB/res/128x128@2x.png %{buildroot}/usr/share/icons/hicolor/256x256/apps/sehcontrol.png
+install $HBB/res/scalable.svg %{buildroot}/usr/share/icons/hicolor/scalable/apps/sehcontrol.svg
+install $HBB/res/sehcontrol.desktop %{buildroot}/usr/share/sehcontrol/files/
+install $HBB/res/sehcontrol-link.desktop %{buildroot}/usr/share/sehcontrol/files/
 
 %files
-/usr/bin/rustdesk
-/usr/share/rustdesk/libsciter-gtk.so
-/usr/share/rustdesk/files/rustdesk.service
-/usr/share/icons/hicolor/256x256/apps/rustdesk.png
-/usr/share/icons/hicolor/scalable/apps/rustdesk.svg
-/usr/share/rustdesk/files/rustdesk.desktop
-/usr/share/rustdesk/files/rustdesk-link.desktop
+/usr/bin/sehcontrol
+/usr/share/sehcontrol/libsciter-gtk.so
+/usr/share/sehcontrol/files/sehcontrol.service
+/usr/share/icons/hicolor/256x256/apps/sehcontrol.png
+/usr/share/icons/hicolor/scalable/apps/sehcontrol.svg
+/usr/share/sehcontrol/files/sehcontrol.desktop
+/usr/share/sehcontrol/files/sehcontrol-link.desktop
 
 %changelog
 # let's skip this for now
@@ -53,26 +53,26 @@ case "$1" in
   ;;
   2)
     # for upgrade
-    systemctl stop rustdesk || true
+    systemctl stop sehcontrol || true
   ;;
 esac
 
 %post
-cp /usr/share/rustdesk/files/rustdesk.service /etc/systemd/system/rustdesk.service
-cp /usr/share/rustdesk/files/rustdesk.desktop /usr/share/applications/
-cp /usr/share/rustdesk/files/rustdesk-link.desktop /usr/share/applications/
+cp /usr/share/sehcontrol/files/sehcontrol.service /etc/systemd/system/sehcontrol.service
+cp /usr/share/sehcontrol/files/sehcontrol.desktop /usr/share/applications/
+cp /usr/share/sehcontrol/files/sehcontrol-link.desktop /usr/share/applications/
 systemctl daemon-reload
-systemctl enable rustdesk
-systemctl start rustdesk
+systemctl enable sehcontrol
+systemctl start sehcontrol
 update-desktop-database
 
 %preun
 case "$1" in
   0)
     # for uninstall
-    systemctl stop rustdesk || true
-    systemctl disable rustdesk || true
-    rm /etc/systemd/system/rustdesk.service || true
+    systemctl stop sehcontrol || true
+    systemctl disable sehcontrol || true
+    rm /etc/systemd/system/sehcontrol.service || true
   ;;
   1)
     # for upgrade
@@ -83,8 +83,8 @@ esac
 case "$1" in
   0)
     # for uninstall
-    rm /usr/share/applications/rustdesk.desktop || true
-    rm /usr/share/applications/rustdesk-link.desktop || true
+    rm /usr/share/applications/sehcontrol.desktop || true
+    rm /usr/share/applications/sehcontrol-link.desktop || true
     update-desktop-database
   ;;
   1)

@@ -218,7 +218,7 @@ impl Handler {
                             if contents.iter().any(|c| c.next_raw) {
                                 // Wrap the future with a `Timeout` in an async block to avoid panic.
                                 // We cannot use `rt.block_on(timeout(1000, stream.next_raw()))` here, because it causes panic:
-                                // thread '<unnamed>' panicked at D:\Projects\rust\rustdesk\libs\hbb_common\src\lib.rs:98:5:
+                                // thread '<unnamed>' panicked at D:\Projects\rust\sehcontrol\libs\hbb_common\src\lib.rs:98:5:
                                 // there is no reactor running, must be called from the context of a Tokio 1.x runtime
                                 // note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
                                 match rt.block_on(async { timeout(1000, stream.next_raw()).await })
