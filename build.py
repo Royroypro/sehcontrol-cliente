@@ -440,7 +440,7 @@ def build_flutter_arch_manjaro(version, features):
 def build_flutter_windows(version, features, skip_portable_pack):
     if not skip_cargo:
         system2(f'cargo build --locked --features {features} --lib --release')
-        if not os.path.exists("target/release/libsehcontrol.dll"):
+        if not os.path.exists("target/release/sehcontrol.dll"):
             print("cargo build failed, please check rust source code.")
             exit(-1)
     os.chdir('flutter')
@@ -453,7 +453,7 @@ def build_flutter_windows(version, features, skip_portable_pack):
     os.chdir('libs/portable')
     system2('python -m pip install -r requirements.txt')
     system2(
-        f'python3 ./generate.py -f ../../{flutter_build_dir_2} -o . -e ../../{flutter_build_dir_2}/sehcontrol.exe')
+        f'python ./generate.py -f ../../{flutter_build_dir_2} -o . -e ../../{flutter_build_dir_2}/sehcontrol.exe')
     os.chdir('../..')
     if os.path.exists('./rustdesk_portable.exe'):
         os.replace('./target/release/sehcontrol-portable-packer.exe',
@@ -481,7 +481,7 @@ def main():
     features = ','.join(get_features(args))
     flutter = args.flutter
     if not flutter:
-        system2('python3 res/inline-sciter.py')
+        system2('python res/inline-sciter.py')
     print(args.skip_cargo)
     if args.skip_cargo:
         skip_cargo = True
@@ -518,7 +518,7 @@ def main():
         os.chdir('libs/portable')
         system2('python -m pip install -r requirements.txt')
         system2(
-            f'python3 ./generate.py -f ../../{res_dir} -o . -e ../../{res_dir}/sehcontrol-{version}-win7-install.exe')
+            f'python ./generate.py -f ../../{res_dir} -o . -e ../../{res_dir}/sehcontrol-{version}-win7-install.exe')
         system2(f'mv ../../{res_dir}/sehcontrol-{version}-win7-install.exe ../..')
     elif os.path.isfile('/usr/bin/pacman'):
         # pacman -S -needed base-devel
