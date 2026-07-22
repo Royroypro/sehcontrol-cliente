@@ -20,6 +20,14 @@ class UserModel {
   final RxString avatar = ''.obs;
   final RxBool isAdmin = false.obs;
   final RxString networkError = ''.obs;
+
+  // Membership/license gating (Sehcontrol membership panel integration).
+  // Cosmetic only: the real enforcement lives server-side in hbbs.
+  final RxBool membershipBlocked = false.obs;
+  final RxString membershipMessage = ''.obs;
+  final RxnInt membershipDaysLeft = RxnInt();
+  Timer? _membershipTimer;
+
   bool get isLogin => userName.isNotEmpty;
   String get displayNameOrUserName =>
       displayName.value.trim().isEmpty ? userName.value : displayName.value;
@@ -90,11 +98,49 @@ class UserModel {
 
       final user = UserPayload.fromJson(data);
       _parseAndUpdateUser(user);
+      startMembershipPolling();
     } catch (e) {
       debugPrint('Failed to refreshCurrentUser: $e');
     } finally {
       refreshingUser = false;
       await updateOtherModels();
+    }
+  }
+
+  /// Starts (or restarts) periodic polling of `/api/membership/status`.
+  /// No-op if the client has no `api_server` configured, matching the
+  /// "no membership panel deployed" behavior of the rest of this feature.
+  void startMembershipPolling() {
+    _membershipTimer?.cancel();
+    _membershipTimer =
+        periodic_immediate(const Duration(minutes: 5), checkMembershipStatus);
+  }
+
+  void stopMembershipPolling() {
+    _membershipTimer?.cancel();
+    _membershipTimer = null;
+    membershipBlocked.value = false;
+    membershipMessage.value = '';
+    membershipDaysLeft.value = null;
+  }
+
+  /// throw nothing: failures (no server, offline, non-200, bad json) are
+  /// swallowed so a flaky/absent membership panel never disrupts the app.
+  Future<void> checkMembershipStatus() async {
+    if (!isLogin) return;
+    try {
+      final url = await bind.mainGetApiServer();
+      if (url.trim().isEmpty) return;
+      final resp = await http.get(Uri.parse('$url/api/membership/status'),
+          headers: getHttpHeaders());
+      if (resp.statusCode != 200) return;
+      final data = jsonDecode(decode_http_response(resp));
+      membershipBlocked.value = data['blocked'] == true;
+      membershipMessage.value = (data['message'] ?? '').toString();
+      final daysLeft = data['days_left'];
+      membershipDaysLeft.value = daysLeft is int ? daysLeft : null;
+    } catch (e) {
+      debugPrint('Failed to checkMembershipStatus: $e');
     }
   }
 
@@ -130,6 +176,7 @@ class UserModel {
     userName.value = '';
     displayName.value = '';
     avatar.value = '';
+    stopMembershipPolling();
   }
 
   _parseAndUpdateUser(UserPayload user) {
@@ -214,9 +261,27 @@ class UserModel {
         loginResponse.access_token != null;
     if (isLogInDone && loginResponse.user != null) {
       _parseAndUpdateUser(loginResponse.user!);
+      startMembershipPolling();
     }
 
     return loginResponse;
+  }
+
+  /// Whether the configured api_server requires a logged-in user before the
+  /// app can be used at all. Returns false (never force) on any failure:
+  /// no api_server configured, network error, or malformed response.
+  static Future<bool> fetchForceLogin() async {
+    try {
+      final url = await bind.mainGetApiServer();
+      if (url.trim().isEmpty) return false;
+      final resp = await http.get(Uri.parse('$url/api/client-policy'));
+      if (resp.statusCode != 200) return false;
+      final data = jsonDecode(decode_http_response(resp));
+      return data['force_login'] == true;
+    } catch (e) {
+      debugPrint('Failed to fetchForceLogin: $e');
+      return false;
+    }
   }
 
   static Future<List<dynamic>> queryOidcLoginOptions() async {

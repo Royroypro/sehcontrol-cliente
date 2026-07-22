@@ -50,6 +50,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   var watchIsCanRecordAudio = false;
   Timer? _updateTimer;
   bool isCardClosed = false;
+  Worker? _membershipBlockedWorker;
+  bool _membershipBlockedDialogShown = false;
 
   final RxBool _editHover = false.obs;
   final RxBool _block = false.obs;
@@ -81,6 +83,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     final isOutgoingOnly = bind.isOutgoingOnly();
     final children = <Widget>[
       if (!isOutgoingOnly) buildPresetPasswordWarning(),
+      buildMembershipBanner(),
       if (bind.isCustomClient())
         Align(
           alignment: Alignment.center,
@@ -861,6 +864,16 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       }
     });
     _uniLinksSubscription = listenUniLinks();
+    _membershipBlockedWorker = ever(gFFI.userModel.membershipBlocked, (blocked) {
+      if (blocked == true) {
+        if (!_membershipBlockedDialogShown) {
+          _membershipBlockedDialogShown = true;
+          showMembershipBlockedDialog(gFFI.userModel.membershipMessage.value);
+        }
+      } else {
+        _membershipBlockedDialogShown = false;
+      }
+    });
 
     if (bind.isIncomingOnly()) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -889,6 +902,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     _uniLinksSubscription?.cancel();
     Get.delete<RxBool>(tag: 'stop-service');
     _updateTimer?.cancel();
+    _membershipBlockedWorker?.dispose();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }

@@ -2588,6 +2588,10 @@ connect(BuildContext context, String id,
     String? connToken,
     bool? isSharedPassword}) async {
   if (id == '') return;
+  if (gFFI.userModel.membershipBlocked.value) {
+    showMembershipBlockedDialog(gFFI.userModel.membershipMessage.value);
+    return;
+  }
   if (!isDesktop || desktopType == DesktopType.main) {
     try {
       if (Get.isRegistered<IDTextEditingController>()) {
@@ -3889,6 +3893,51 @@ Widget buildPresetPasswordWarningMobile() {
   } else {
     return SizedBox.shrink();
   }
+}
+
+/// Non-blocking warning banner shown when the membership panel reports the
+/// current plan expiring soon. Cosmetic only — see
+/// [showMembershipBlockedDialog] for the actual blocking case.
+Widget buildMembershipBanner() {
+  return Obx(() {
+    final daysLeft = gFFI.userModel.membershipDaysLeft.value;
+    final blocked = gFFI.userModel.membershipBlocked.value;
+    if (blocked || daysLeft == null || daysLeft > 7) {
+      return SizedBox.shrink();
+    }
+    final message = gFFI.userModel.membershipMessage.value;
+    return Container(
+      color: Colors.orange,
+      child: Text(
+        message.isNotEmpty ? message : translate('membership_expiring_tip'),
+        style: TextStyle(color: Colors.white),
+      ).paddingAll(8),
+    );
+  });
+}
+
+bool _membershipBlockedDialogOpen = false;
+
+/// Blocking, informational-only dialog shown when the membership panel
+/// reports the account suspended/expired. There is nothing the user can do
+/// from here besides acknowledge it — unblocking happens on the admin panel.
+/// The real connection block is enforced by hbbs regardless of this dialog.
+/// Guards against stacking multiple copies: harmless to call this from
+/// several places (a background poll noticing the block, a connect attempt
+/// while already blocked, etc.) since only one will ever be visible.
+void showMembershipBlockedDialog(String message) {
+  if (_membershipBlockedDialogOpen) return;
+  _membershipBlockedDialogOpen = true;
+  final btnOk = dialogButton('Got it', onPressed: () {
+    _membershipBlockedDialogOpen = false;
+    gFFI.dialogManager.dismissAll();
+  });
+  msgBoxCommon(
+      gFFI.dialogManager,
+      'Account restricted',
+      Text(message.isNotEmpty ? message : translate('membership_blocked_tip')),
+      [btnOk],
+      hasCancel: false);
 }
 
 Widget buildPresetPasswordWarning() {

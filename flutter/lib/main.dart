@@ -24,11 +24,13 @@ import 'package:provider/provider.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'common.dart';
+import 'common/widgets/login.dart';
 import 'consts.dart';
 import 'mobile/pages/home_page.dart';
 import 'mobile/pages/server_page.dart';
 import 'mobile/widgets/deploy_dialog.dart';
 import 'models/platform_model.dart';
+import 'models/user_model.dart';
 
 import 'package:flutter_hbb/plugin/handlers.dart'
     if (dart.library.html) 'package:flutter_hbb/web/plugin/handlers.dart';
@@ -170,6 +172,10 @@ void runMainApp(bool startService) async {
       windowManager.focus();
       // Move registration of active main window here to prevent from async visible check.
       rustDeskWinManager.registerActiveWindow(kWindowMainId);
+      // Only prompt for a forced login once the main window is actually
+      // visible; a uni-link launch that keeps it hidden shouldn't trap the
+      // user behind an invisible modal.
+      unawaited(_enforceLoginIfRequired());
     }
     windowManager.setOpacity(1);
     windowManager.setTitle(getWindowName());
@@ -187,7 +193,25 @@ void runMobileApp() async {
   await Future.wait([gFFI.abModel.loadCache(), gFFI.groupModel.loadCache()]);
   gFFI.userModel.refreshCurrentUser();
   runApp(App());
+  // Wait for the first frame so dialogManager has a mounted Overlay before
+  // we try to show a modal login dialog.
+  WidgetsBinding.instance
+      .addPostFrameCallback((_) => unawaited(_enforceLoginIfRequired()));
   await initUniLinks();
+}
+
+/// Blocks (via a modal login dialog, reopened until it succeeds) if the
+/// configured api_server's `/api/client-policy` requires a logged-in user.
+/// No-op with no api_server configured, or if the policy check itself
+/// fails — matches today's behavior (login optional) for deployments
+/// without a membership panel. Must run after the widget tree is mounted;
+/// `OverlayDialogManager.show` errors out if called before `runApp`.
+Future<void> _enforceLoginIfRequired() async {
+  if (gFFI.userModel.isLogin) return;
+  if (!await UserModel.fetchForceLogin()) return;
+  while (!gFFI.userModel.isLogin) {
+    await loginDialog();
+  }
 }
 
 void runMultiWindow(
