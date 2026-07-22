@@ -1,5 +1,5 @@
 use crate::config::Config;
-use sodiumoxide::base64;
+use sodiumoxide::{base64, crypto::secretbox};
 use std::sync::{Arc, RwLock};
 
 lazy_static::lazy_static! {
@@ -71,7 +71,7 @@ pub fn permanent_enabled() -> bool {
 
 pub fn has_valid_password() -> bool {
     temporary_enabled() && !temporary_password().is_empty()
-        || permanent_enabled() && !Config::get_permanent_password().is_empty()
+        || permanent_enabled() && Config::has_permanent_password()
 }
 
 pub fn approve_mode() -> ApproveMode {
@@ -92,9 +92,30 @@ pub fn hide_cm() -> bool {
 }
 
 const VERSION_LEN: usize = 2;
+const FORMAT_V1: u8 = 1;
+
+// Check if data is already encrypted by verifying:
+// 1) version prefix "00"
+// 2) valid base64 payload
+// 3) decoded payload length >= secretbox::MACBYTES
+//
+// We intentionally avoid trying to decrypt here because key mismatch would cause
+// false negatives.
+// The decoded payload may be either legacy ciphertext or FORMAT_V1 || nonce || ciphertext.
+// Reference: secretbox::seal returns ciphertext length = plaintext length + MACBYTES
+// https://github.com/sodiumoxide/sodiumoxide/blob/3057acb1a030ad86ed8892a223d64036ab5e8523/src/crypto/secretbox/xsalsa20poly1305.rs#L67
+fn is_encrypted(v: &[u8]) -> bool {
+    if v.len() <= VERSION_LEN || !v.starts_with(b"00") {
+        return false;
+    }
+    match base64::decode(&v[VERSION_LEN..], base64::Variant::Original) {
+        Ok(decoded) => decoded.len() >= sodiumoxide::crypto::secretbox::MACBYTES,
+        Err(_) => false,
+    }
+}
 
 pub fn encrypt_str_or_original(s: &str, version: &str, max_len: usize) -> String {
-    if decrypt_str_or_original(s, version).1 {
+    if is_encrypted(s.as_bytes()) {
         log::error!("Duplicate encryption!");
         return s.to_owned();
     }
@@ -127,11 +148,17 @@ pub fn decrypt_str_or_original(s: &str, current_version: &str) -> (String, bool,
         }
     }
 
-    (s.to_owned(), false, !s.is_empty())
+    // For values that already look encrypted (version prefix + base64), avoid
+    // repeated store on each load when decryption fails.
+    (
+        s.to_owned(),
+        false,
+        !s.is_empty() && !is_encrypted(s.as_bytes()),
+    )
 }
 
 pub fn encrypt_vec_or_original(v: &[u8], version: &str, max_len: usize) -> Vec<u8> {
-    if decrypt_vec_or_original(v, version).1 {
+    if is_encrypted(v) {
         log::error!("Duplicate encryption!");
         return v.to_owned();
     }
@@ -161,7 +188,9 @@ pub fn decrypt_vec_or_original(v: &[u8], current_version: &str) -> (Vec<u8>, boo
         }
     }
 
-    (v.to_owned(), false, !v.is_empty())
+    // For values that already look encrypted (version prefix + base64), avoid
+    // repeated store on each load when decryption fails.
+    (v.to_owned(), false, !v.is_empty() && !is_encrypted(v))
 }
 
 fn encrypt(v: &[u8]) -> Result<String, ()> {
@@ -184,16 +213,52 @@ pub fn symmetric_crypt(data: &[u8], encrypt: bool) -> Result<Vec<u8>, ()> {
     use sodiumoxide::crypto::secretbox;
     use std::convert::TryInto;
 
-    let mut keybuf = crate::get_uuid();
+    let uuid = crate::get_uuid();
+    let mut keybuf = uuid.clone();
     keybuf.resize(secretbox::KEYBYTES, 0);
     let key = secretbox::Key(keybuf.try_into().map_err(|_| ())?);
-    let nonce = secretbox::Nonce([0; secretbox::NONCEBYTES]);
 
     if encrypt {
-        Ok(secretbox::seal(data, &nonce, &key))
+        let nonce = secretbox::gen_nonce();
+        let encrypted = secretbox::seal(data, &nonce, &key);
+        let mut output = Vec::with_capacity(1 + nonce.0.len() + encrypted.len());
+        output.push(FORMAT_V1);
+        output.extend(nonce.0);
+        output.extend(encrypted);
+        Ok(output)
     } else {
-        secretbox::open(data, &nonce, &key)
+        let res = open_secretbox_payload(data, &key);
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        if res.is_err() {
+            // Fallback: try pk if uuid decryption failed (in case encryption used pk due to machine_uid failure)
+            if let Some(key_pair) = Config::get_existing_key_pair() {
+                let pk = key_pair.1;
+                if pk != uuid {
+                    let mut keybuf = pk;
+                    keybuf.resize(secretbox::KEYBYTES, 0);
+                    let pk_key = secretbox::Key(keybuf.try_into().map_err(|_| ())?);
+                    return open_secretbox_payload(data, &pk_key);
+                }
+            }
+        }
+        res
     }
+}
+
+fn open_secretbox_payload(data: &[u8], key: &secretbox::Key) -> Result<Vec<u8>, ()> {
+    if data.first() == Some(&FORMAT_V1)
+        && data.len() >= 1 + secretbox::NONCEBYTES + secretbox::MACBYTES
+    {
+        let mut nonce = [0u8; secretbox::NONCEBYTES];
+        nonce.copy_from_slice(&data[1..1 + secretbox::NONCEBYTES]);
+        let nonce = secretbox::Nonce(nonce);
+        if let Ok(decrypted) = secretbox::open(&data[1 + secretbox::NONCEBYTES..], &nonce, key) {
+            return Ok(decrypted);
+        }
+    }
+
+    let legacy_nonce = secretbox::Nonce([0; secretbox::NONCEBYTES]);
+    secretbox::open(data, &legacy_nonce, key)
 }
 
 mod test {
@@ -268,6 +333,33 @@ mod test {
         let data: Vec<u8> = "1ü1111".as_bytes().to_vec();
         assert_eq!(decrypt_vec_or_original(&data, version).0, data);
 
+        // Base64-shaped "00" prefixed values shorter than MACBYTES are treated
+        // as original/plain values and should be stored.
+        let data = "00YWJjZA==";
+        let (decrypted, succ, store) = decrypt_str_or_original(data, version);
+        assert_eq!(decrypted, data);
+        assert!(!succ);
+        assert!(store);
+        let data = b"00YWJjZA==".to_vec();
+        let (decrypted, succ, store) = decrypt_vec_or_original(&data, version);
+        assert_eq!(decrypted, data);
+        assert!(!succ);
+        assert!(store);
+
+        // When decoded length reaches MACBYTES, it is treated as encrypted-like
+        // and should not trigger repeated store.
+        let exact_mac = vec![0u8; sodiumoxide::crypto::secretbox::MACBYTES];
+        let exact_mac_b64 =
+            sodiumoxide::base64::encode(&exact_mac, sodiumoxide::base64::Variant::Original);
+        let data = format!("00{exact_mac_b64}");
+        let (_, succ, store) = decrypt_str_or_original(&data, version);
+        assert!(!succ);
+        assert!(!store);
+        let data = data.into_bytes();
+        let (_, succ, store) = decrypt_vec_or_original(&data, version);
+        assert!(!succ);
+        assert!(!store);
+
         println!("test speed");
         let test_speed = |len: usize, name: &str| {
             let mut data: Vec<u8> = vec![];
@@ -300,5 +392,260 @@ mod test {
         test_speed(1024 * 1024, "1M");
         test_speed(10 * 1024 * 1024, "10M");
         test_speed(100 * 1024 * 1024, "100M");
+    }
+
+    #[test]
+    fn test_is_encrypted() {
+        use super::*;
+        use sodiumoxide::base64::{encode, Variant};
+        use sodiumoxide::crypto::secretbox;
+
+        // Empty data should not be considered encrypted
+        assert!(!is_encrypted(b""));
+        assert!(!is_encrypted(b"0"));
+        assert!(!is_encrypted(b"00"));
+
+        // Data without "00" prefix should not be considered encrypted
+        assert!(!is_encrypted(b"01abcd"));
+        assert!(!is_encrypted(b"99abcd"));
+        assert!(!is_encrypted(b"hello world"));
+
+        // Data with "00" prefix but invalid base64 should not be considered encrypted
+        assert!(!is_encrypted(b"00!!!invalid base64!!!"));
+        assert!(!is_encrypted(b"00@#$%"));
+
+        // Data with "00" prefix and valid base64 but shorter than MACBYTES is not encrypted
+        assert!(!is_encrypted(b"00YWJjZA==")); // "abcd" in base64
+        assert!(!is_encrypted(b"00SGVsbG8gV29ybGQ=")); // "Hello World" in base64
+
+        // Data with "00" prefix and valid base64 with decoded len == MACBYTES is considered encrypted
+        let exact_mac = vec![0u8; secretbox::MACBYTES];
+        let exact_mac_b64 = encode(&exact_mac, Variant::Original);
+        let exact_mac_candidate = format!("00{exact_mac_b64}");
+        assert!(is_encrypted(exact_mac_candidate.as_bytes()));
+
+        // Real encrypted data should be detected
+        let version = "00";
+        let max_len = 128;
+        let encrypted_str = encrypt_str_or_original("1", version, max_len);
+        assert!(is_encrypted(encrypted_str.as_bytes()));
+        let encrypted_vec = encrypt_vec_or_original(b"1", version, max_len);
+        assert!(is_encrypted(&encrypted_vec));
+
+        // Original unencrypted data should not be detected as encrypted
+        assert!(!is_encrypted(b"1"));
+        assert!(!is_encrypted("1".as_bytes()));
+    }
+
+    #[test]
+    fn test_encrypted_payload_min_len_macbytes() {
+        use super::*;
+        use sodiumoxide::base64::{decode, Variant};
+        use sodiumoxide::crypto::secretbox;
+
+        let version = "00";
+        let max_len = 128;
+
+        let encrypted_str = encrypt_str_or_original("1", version, max_len);
+        let decoded = decode(&encrypted_str.as_bytes()[VERSION_LEN..], Variant::Original).unwrap();
+        assert!(
+            decoded.len() >= secretbox::MACBYTES,
+            "decoded encrypted payload must be at least MACBYTES"
+        );
+
+        let encrypted_vec = encrypt_vec_or_original(b"1", version, max_len);
+        let decoded = decode(&encrypted_vec[VERSION_LEN..], Variant::Original).unwrap();
+        assert!(
+            decoded.len() >= secretbox::MACBYTES,
+            "decoded encrypted payload must be at least MACBYTES"
+        );
+    }
+
+    #[test]
+    fn test_encryption_uses_random_nonce() {
+        use super::*;
+
+        let data = b"test password 123";
+        let encrypted1 = symmetric_crypt(data, true).unwrap();
+        let encrypted2 = symmetric_crypt(data, true).unwrap();
+
+        assert_eq!(encrypted1.first(), Some(&FORMAT_V1));
+        assert_eq!(encrypted2.first(), Some(&FORMAT_V1));
+        assert_eq!(
+            encrypted1.len(),
+            1 + secretbox::NONCEBYTES + data.len() + secretbox::MACBYTES
+        );
+        assert_ne!(encrypted1, encrypted2);
+        assert_eq!(symmetric_crypt(&encrypted1, false).unwrap(), data);
+        assert_eq!(symmetric_crypt(&encrypted2, false).unwrap(), data);
+    }
+
+    #[test]
+    fn test_decrypt_legacy_zero_nonce_payload() {
+        use super::*;
+        use std::convert::TryInto;
+
+        let data = b"test password 123";
+        let uuid = crate::get_uuid();
+        let mut keybuf = uuid.clone();
+        keybuf.resize(secretbox::KEYBYTES, 0);
+        let key = secretbox::Key(keybuf.try_into().unwrap());
+        let nonce = secretbox::Nonce([0; secretbox::NONCEBYTES]);
+        let encrypted = secretbox::seal(data, &nonce, &key);
+
+        assert_eq!(symmetric_crypt(&encrypted, false).unwrap(), data);
+    }
+
+    #[test]
+    fn test_decrypt_legacy_payload_starting_with_v1_marker() {
+        use super::*;
+        use std::convert::TryInto;
+
+        let mut keybuf = crate::get_uuid();
+        keybuf.resize(secretbox::KEYBYTES, 0);
+        let key = secretbox::Key(keybuf.try_into().unwrap());
+        let nonce = secretbox::Nonce([0; secretbox::NONCEBYTES]);
+
+        for i in 0..=u16::MAX {
+            let data = format!("legacy collision payload {i:05}");
+            let encrypted = secretbox::seal(data.as_bytes(), &nonce, &key);
+            if encrypted.first() == Some(&FORMAT_V1) {
+                assert_eq!(symmetric_crypt(&encrypted, false).unwrap(), data.as_bytes());
+                return;
+            }
+        }
+
+        panic!("failed to find legacy payload starting with FORMAT_V1");
+    }
+
+    #[test]
+    fn test_invalid_short_v1_payload_returns_error() {
+        use super::*;
+
+        let encrypted = vec![FORMAT_V1];
+
+        assert!(symmetric_crypt(&encrypted, false).is_err());
+    }
+
+    #[test]
+    fn test_decrypt_legacy_string_does_not_request_store() {
+        use super::*;
+        use sodiumoxide::base64::{encode, Variant};
+        use std::convert::TryInto;
+
+        let data = "test password 123";
+        let uuid = crate::get_uuid();
+        let mut keybuf = uuid.clone();
+        keybuf.resize(secretbox::KEYBYTES, 0);
+        let key = secretbox::Key(keybuf.try_into().unwrap());
+        let nonce = secretbox::Nonce([0; secretbox::NONCEBYTES]);
+        let encrypted = secretbox::seal(data.as_bytes(), &nonce, &key);
+        let encrypted = "00".to_owned() + &encode(encrypted, Variant::Original);
+
+        let (decrypted, success, store) = decrypt_str_or_original(&encrypted, "00");
+
+        assert_eq!(decrypted, data);
+        assert!(success);
+        assert!(!store);
+    }
+
+    #[test]
+    fn test_decrypt_legacy_vec_does_not_request_store() {
+        use super::*;
+        use sodiumoxide::base64::{encode, Variant};
+        use std::convert::TryInto;
+
+        let data = b"test password 123";
+        let uuid = crate::get_uuid();
+        let mut keybuf = uuid.clone();
+        keybuf.resize(secretbox::KEYBYTES, 0);
+        let key = secretbox::Key(keybuf.try_into().unwrap());
+        let nonce = secretbox::Nonce([0; secretbox::NONCEBYTES]);
+        let encrypted = secretbox::seal(data, &nonce, &key);
+        let encrypted = ("00".to_owned() + &encode(encrypted, Variant::Original)).into_bytes();
+
+        let (decrypted, success, store) = decrypt_vec_or_original(&encrypted, "00");
+
+        assert_eq!(decrypted, data);
+        assert!(success);
+        assert!(!store);
+    }
+
+    // Test decryption fallback when data was encrypted with key_pair but decryption tries machine_uid first
+    #[test]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn test_decrypt_with_pk_fallback() {
+        use sodiumoxide::crypto::secretbox;
+        use std::convert::TryInto;
+
+        let uuid = crate::get_uuid();
+        let pk = crate::config::Config::get_key_pair().1;
+
+        // Ensure uuid != pk, otherwise fallback branch won't be tested
+        if uuid == pk {
+            eprintln!("skip: uuid == pk, fallback branch won't be tested");
+            return;
+        }
+
+        let data = b"test password 123";
+        let nonce = secretbox::Nonce([0; secretbox::NONCEBYTES]);
+
+        // Encrypt with pk (simulating machine_uid failure during encryption)
+        let mut pk_keybuf = pk;
+        pk_keybuf.resize(secretbox::KEYBYTES, 0);
+        let pk_key = secretbox::Key(pk_keybuf.try_into().unwrap());
+        let encrypted = secretbox::seal(data, &nonce, &pk_key);
+
+        // Decrypt using symmetric_crypt (should fallback to pk since uuid differs)
+        let decrypted = super::symmetric_crypt(&encrypted, false);
+        assert!(
+            decrypted.is_ok(),
+            "Decryption with pk fallback should succeed"
+        );
+        assert_eq!(decrypted.unwrap(), data);
+    }
+
+    #[test]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    fn test_decrypt_v1_with_pk_fallback() {
+        use super::*;
+        use sodiumoxide::base64::{encode, Variant};
+        use sodiumoxide::crypto::secretbox;
+        use std::convert::TryInto;
+
+        let uuid = crate::get_uuid();
+        let pk = crate::config::Config::get_key_pair().1;
+
+        if uuid == pk {
+            eprintln!("skip: uuid == pk, fallback branch won't be tested");
+            return;
+        }
+
+        let data = b"test password 123";
+        let nonce = secretbox::gen_nonce();
+
+        let mut pk_keybuf = pk;
+        pk_keybuf.resize(secretbox::KEYBYTES, 0);
+        let pk_key = secretbox::Key(pk_keybuf.try_into().unwrap());
+        let ciphertext = secretbox::seal(data, &nonce, &pk_key);
+
+        let mut encrypted = Vec::with_capacity(1 + secretbox::NONCEBYTES + ciphertext.len());
+        encrypted.push(FORMAT_V1);
+        encrypted.extend(nonce.0);
+        encrypted.extend(ciphertext);
+
+        assert_eq!(super::symmetric_crypt(&encrypted, false).unwrap(), data);
+
+        let encrypted_str = "00".to_owned() + &encode(&encrypted, Variant::Original);
+        let (decrypted, success, store) = decrypt_str_or_original(&encrypted_str, "00");
+        assert_eq!(decrypted.as_bytes(), data);
+        assert!(success);
+        assert!(!store);
+
+        let encrypted_vec = encrypted_str.into_bytes();
+        let (decrypted, success, store) = decrypt_vec_or_original(&encrypted_vec, "00");
+        assert_eq!(decrypted, data);
+        assert!(success);
+        assert!(!store);
     }
 }
