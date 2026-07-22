@@ -142,12 +142,22 @@ class FileModel {
   }
 
   Future<void> postOverrideFileConfirm(Map<String, dynamic> evt) async {
+    final id = int.tryParse(evt['id']?.toString() ?? '');
+    if (id == null || !jobController.hasTransferConflictJob(id)) {
+      debugPrint("Ignore stale override confirm event: $evt");
+      return;
+    }
     evtLoop.pushEvent(
         _FileDialogEvent(WeakReference(this), FileDialogType.overwrite, evt));
   }
 
   Future<void> overrideFileConfirm(Map<String, dynamic> evt,
       {bool? overrideConfirm, bool skip = false}) async {
+    final id = int.tryParse(evt['id']?.toString() ?? '') ?? 0;
+    if (id == 0 || !jobController.hasTransferConflictJob(id)) {
+      debugPrint("Ignore override confirm for inactive job: $evt");
+      return;
+    }
     // If `skip == true`, it means to skip this file without showing dialog.
     // Because `resp` may be null after the user operation or the last remembered operation,
     // and we should distinguish them.
@@ -156,15 +166,12 @@ class FileModel {
             ? await showFileConfirmDialog(translate("Overwrite"),
                 "${evt['read_path']}", true, evt['is_identical'] == "true")
             : null);
-    final id = int.tryParse(evt['id']) ?? 0;
+    if (!jobController.hasTransferConflictJob(id)) {
+      debugPrint("Ignore override confirm result for inactive job: $evt");
+      return;
+    }
     if (false == resp) {
-      final jobIndex = jobController.getJob(id);
-      if (jobIndex != -1) {
-        await jobController.cancelJob(id);
-        final job = jobController.jobTable[jobIndex];
-        job.state = JobState.done;
-        jobController.jobTable.refresh();
-      }
+      await jobController.cancelTransferConflictBatch(id);
     } else {
       var need_override = false;
       if (resp == null) {
@@ -176,6 +183,7 @@ class FileModel {
       }
       // Update the loop config.
       if (fileConfirmCheckboxRemember) {
+        jobController.rememberTransferConflictBatch(id, resp);
         evtLoop.setSkip(!need_override);
       }
       await bind.sessionSetConfirmOverrideFile(
@@ -285,6 +293,8 @@ class FileModel {
       final isWindows = otherSideData.options.isWindows;
       final showHidden = otherSideData.options.showHidden;
       final jobID = jobController.addTransferJob(entry, false);
+      jobController.registerTransferConflictBatch([jobID],
+          batchId: int.tryParse(obj['batchId']?.toString() ?? ''));
       webSendLocalFiles(
         handleIndex: handleIndex,
         actId: jobID,
@@ -391,14 +401,30 @@ class FileController {
 
     await Future.delayed(Duration(milliseconds: 100));
 
-    final dir = (await bind.sessionGetPeerOption(
+    final savedDir = (await bind.sessionGetPeerOption(
         sessionId: sessionId, name: isLocal ? "local_dir" : "remote_dir"));
-    openDirectory(dir.isEmpty ? options.value.home : dir);
+    Future<bool> tryOpenReadyDirs() async {
+      final dirs = <String>{
+        if (directory.value.path.isNotEmpty) directory.value.path,
+        if (savedDir.isNotEmpty) savedDir,
+        options.value.home,
+      };
+      for (final dir in dirs) {
+        if (await _openDirectoryPath(dir, isBack: true)) {
+          return true;
+        }
+      }
+      return false;
+    }
+
+    var opened = await tryOpenReadyDirs();
 
     await Future.delayed(Duration(seconds: 1));
 
-    if (directory.value.path.isEmpty) {
-      openDirectory(options.value.home);
+    if (!opened) {
+      // The peer may become ready during the reconnect delay, so retry the
+      // same candidates instead of only retrying the default home directory.
+      await tryOpenReadyDirs();
     }
   }
 
@@ -429,19 +455,23 @@ class FileController {
     });
   }
 
-  Future<void> refresh() async {
-    await openDirectory(directory.value.path);
+  Future<bool> refresh() async {
+    // "." can be both a refresh command and a real remote directory path.
+    // Refresh must bypass openDirectory's command dispatch to avoid recursion.
+    return await _openDirectoryPath(directory.value.path, isBack: true);
   }
 
-  Future<void> openDirectory(String path, {bool isBack = false}) async {
-    if (path == ".") {
-      refresh();
-      return;
+  Future<bool> openDirectory(String path, {bool isBack = false}) async {
+    if (!isBack && path == ".") {
+      return await refresh();
     }
-    if (path == "..") {
-      goToParentDirectory();
-      return;
+    if (!isBack && path == "..") {
+      return await _goToParentDirectory(isBack: isBack);
     }
+    return await _openDirectoryPath(path, isBack: isBack);
+  }
+
+  Future<bool> _openDirectoryPath(String path, {bool isBack = false}) async {
     if (!isBack) {
       pushHistory();
     }
@@ -458,8 +488,10 @@ class FileController {
       final fd = await fileFetcher.fetchDirectory(path, isLocal, showHidden);
       fd.format(isWindows, sort: sortBy.value);
       directory.value = fd;
+      return true;
     } catch (e) {
       debugPrint("Failed to openDirectory $path: $e");
+      return false;
     }
   }
 
@@ -487,19 +519,22 @@ class FileController {
       goBack();
       return;
     }
-    openDirectory(path, isBack: true);
+    unawaited(_openDirectoryPath(path, isBack: true).then<void>((_) {}));
   }
 
   void goToParentDirectory() {
+    unawaited(_goToParentDirectory().then<void>((_) {}));
+  }
+
+  Future<bool> _goToParentDirectory({bool isBack = false}) async {
     final isWindows = options.value.isWindows;
     final dirPath = directory.value.path;
     var parent = PathUtil.dirname(dirPath, isWindows);
     // specially for C:\, D:\, goto '/'
     if (parent == dirPath && isWindows) {
-      openDirectory('/');
-      return;
+      return await _openDirectoryPath('/', isBack: isBack);
     }
-    openDirectory(parent);
+    return await _openDirectoryPath(parent, isBack: isBack);
   }
 
   // TODO deprecated this
@@ -545,8 +580,15 @@ class FileController {
     final toPath = otherSideData.directory.path;
     final isWindows = otherSideData.options.isWindows;
     final showHidden = otherSideData.options.showHidden;
+    final transferJobs = <(Entry, int)>[];
+    final transferJobIds = <int>[];
     for (var from in items.items) {
       final jobID = jobController.addTransferJob(from, isRemoteToLocal);
+      transferJobs.add((from, jobID));
+      transferJobIds.add(jobID);
+    }
+    jobController.registerTransferConflictBatch(transferJobIds);
+    for (final (from, jobID) in transferJobs) {
       bind.sessionSendFiles(
           sessionId: sessionId,
           actId: jobID,
@@ -892,6 +934,10 @@ class JobController {
   static final JobID jobID = JobID();
   final jobTable = List<JobProgress>.empty(growable: true).obs;
   final jobResultListener = JobResultListener<Map<String, dynamic>>();
+  int _nextTransferConflictBatchId = 1;
+  final Map<int, int> _transferConflictJobToBatch = {};
+  int? _transferConflictRememberBatchId;
+  bool? _transferConflictRememberOverrideConfirm;
   final GetSessionID getSessionID;
   final GetDialogManager getDialogManager;
   SessionID get sessionId => getSessionID();
@@ -902,6 +948,57 @@ class JobController {
 
   int getJob(int id) {
     return jobTable.indexWhere((element) => element.id == id);
+  }
+
+  void registerTransferConflictBatch(Iterable<int> jobIds, {int? batchId}) {
+    final ids = jobIds.toList(growable: false);
+    if (ids.isEmpty) {
+      return;
+    }
+    batchId ??= _nextTransferConflictBatchId++;
+    if (batchId >= _nextTransferConflictBatchId) {
+      _nextTransferConflictBatchId = batchId + 1;
+    }
+    for (final jobId in ids) {
+      _transferConflictJobToBatch[jobId] = batchId;
+    }
+  }
+
+  int? transferConflictBatchId(int jobId) {
+    return _transferConflictJobToBatch[jobId];
+  }
+
+  bool hasTransferConflictJob(int jobId) {
+    return transferConflictBatchId(jobId) != null;
+  }
+
+  bool isTransferConflictRememberBatch(int? batchId) {
+    return batchId != null && batchId == _transferConflictRememberBatchId;
+  }
+
+  bool? transferConflictRememberOverrideConfirm(int? batchId) {
+    if (!isTransferConflictRememberBatch(batchId)) {
+      return null;
+    }
+    return _transferConflictRememberOverrideConfirm;
+  }
+
+  void rememberTransferConflictBatch(int jobId, bool? overrideConfirm) {
+    _transferConflictRememberBatchId = _transferConflictJobToBatch[jobId];
+    _transferConflictRememberOverrideConfirm = overrideConfirm;
+  }
+
+  void unregisterTransferConflictJob(int jobId) {
+    final batchId = _transferConflictJobToBatch.remove(jobId);
+    if (batchId == null) {
+      return;
+    }
+    if (!_transferConflictJobToBatch.containsValue(batchId)) {
+      if (_transferConflictRememberBatchId == batchId) {
+        _transferConflictRememberBatchId = null;
+        _transferConflictRememberOverrideConfirm = null;
+      }
+    }
   }
 
   // return jobID
@@ -975,7 +1072,10 @@ class JobController {
       id = int.parse(evt['id']);
     } catch (_) {}
     final jobIndex = getJob(id);
-    if (jobIndex == -1) return true;
+    if (jobIndex == -1) {
+      unregisterTransferConflictJob(id);
+      return true;
+    }
     final job = jobTable[jobIndex];
     job.recvJobRes = true;
     if (job.type == JobType.deleteFile) {
@@ -1001,6 +1101,9 @@ class JobController {
       job.state = JobState.done;
     }
     jobTable.refresh();
+    if (job.state == JobState.done || job.state == JobState.error) {
+      unregisterTransferConflictJob(id);
+    }
     if (job.type == JobType.deleteDir) {
       return job.state == JobState.done;
     } else {
@@ -1010,9 +1113,15 @@ class JobController {
 
   void jobError(Map<String, dynamic> evt) {
     final err = evt['err'].toString();
-    int jobIndex = getJob(int.parse(evt['id']));
+    final id = int.tryParse(evt['id']?.toString() ?? '');
+    if (id == null) {
+      debugPrint("Ignore job error with invalid id: $evt");
+      return;
+    }
+    int jobIndex = getJob(id);
     if (jobIndex != -1) {
       final job = jobTable[jobIndex];
+      if (job.state == JobState.done && job.err == "cancel") return;
       job.state = JobState.error;
       job.err = err;
       job.recvJobRes = true;
@@ -1035,6 +1144,11 @@ class JobController {
         }
       }
       jobTable.refresh();
+      if (job.state == JobState.done || job.state == JobState.error) {
+        unregisterTransferConflictJob(job.id);
+      }
+    } else {
+      unregisterTransferConflictJob(id);
     }
     if (err == _kOneWayFileTransferError) {
       if (DateTime.now().millisecondsSinceEpoch - _lastTimeShowMsgbox > 3000) {
@@ -1071,7 +1185,40 @@ class JobController {
   }
 
   Future<void> cancelJob(int id) async {
+    unregisterTransferConflictJob(id);
     await bind.sessionCancelJob(sessionId: sessionId, actId: id);
+  }
+
+  Future<void> cancelTransferConflictBatch(int jobId) async {
+    final batchId = _transferConflictJobToBatch[jobId];
+    final batchJobIds = batchId == null ? [jobId] : <int>[];
+    if (batchId != null) {
+      for (final entry in _transferConflictJobToBatch.entries) {
+        if (entry.value == batchId) {
+          batchJobIds.add(entry.key);
+        }
+      }
+      for (final id in batchJobIds) {
+        unregisterTransferConflictJob(id);
+      }
+    }
+    final jobIdsToCancel = batchJobIds.toSet();
+    for (final job in jobTable) {
+      if (!jobIdsToCancel.contains(job.id) || job.state == JobState.done) {
+        continue;
+      }
+      job.state = JobState.done;
+      job.err = "cancel";
+      job.recvJobRes = true;
+    }
+    jobTable.refresh();
+    for (final id in batchJobIds) {
+      try {
+        await bind.sessionCancelJob(sessionId: sessionId, actId: id);
+      } catch (e) {
+        debugPrint("Failed to cancel transfer job $id in conflict batch: $e");
+      }
+    }
   }
 
   Future<void> loadLastJob(Map<String, dynamic> evt) async {
@@ -1120,7 +1267,7 @@ class JobController {
         ..state = JobState.paused;
       jobTable.add(jobProgress);
     }
-
+    registerTransferConflictBatch([currJobId]);
     await bind.sessionAddJob(
       sessionId: sessionId,
       isRemote: isRemote,
@@ -1168,6 +1315,9 @@ class JobController {
 
   void clear() {
     jobTable.clear();
+    _transferConflictJobToBatch.clear();
+    _transferConflictRememberBatchId = null;
+    _transferConflictRememberOverrideConfirm = null;
     jobResultListener.clear();
   }
 }
@@ -1510,6 +1660,9 @@ class JobProgress {
 
   String display() {
     if (type == JobType.transfer) {
+      if (state == JobState.done && err == "cancel") {
+        return translate("Cancel");
+      }
       if (state == JobState.done && err == "skipped") {
         return translate("Skipped");
       }
@@ -1819,21 +1972,44 @@ class _FileDialogEvent extends BaseEvent<FileDialogType, Map<String, dynamic>> {
 
 class FileDialogEventLoop
     extends BaseEventLoop<FileDialogType, Map<String, dynamic>> {
+  int? _batchId;
   bool? _overrideConfirm;
   bool _skip = false;
 
   @override
   Future<void> onPreConsume(
       BaseEvent<FileDialogType, Map<String, dynamic>> evt) async {
-    var event = evt as _FileDialogEvent;
+    final event = evt as _FileDialogEvent;
+    final model = event.fileModel.target;
+    final jobId = int.tryParse(evt.data['id']?.toString() ?? '');
+    final batchId = model == null || jobId == null
+        ? null
+        : model.jobController.transferConflictBatchId(jobId);
+    final keepRemembered = model != null &&
+        model.jobController.isTransferConflictRememberBatch(batchId);
+    // The loop only preloads the remembered batch choice. The model updates it
+    // after the user answers the current overwrite dialog.
+    if (_batchId != batchId && !keepRemembered) {
+      _batchId = batchId;
+      _overrideConfirm = null;
+      _skip = false;
+    } else {
+      _batchId = batchId;
+    }
+    if (keepRemembered) {
+      _overrideConfirm =
+          model.jobController.transferConflictRememberOverrideConfirm(batchId);
+      _skip = _overrideConfirm == null;
+    }
     event.setOverrideConfirm(_overrideConfirm);
     event.setSkip(_skip);
     debugPrint(
-        "FileDialogEventLoop: consuming<jobId: ${evt.data['id']} overrideConfirm: $_overrideConfirm, skip: $_skip>");
+        "FileDialogEventLoop: consuming<jobId: ${evt.data['id']} batchId: $_batchId overrideConfirm: $_overrideConfirm, skip: $_skip>");
   }
 
   @override
   Future<void> onEventsClear() {
+    _batchId = null;
     _overrideConfirm = null;
     _skip = false;
     return super.onEventsClear();

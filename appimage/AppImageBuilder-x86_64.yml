@@ -15,11 +15,11 @@ script:
 AppDir:
   path: ./AppDir
   app_info:
-    id: sehcontrol
-    name: sehcontrol
-    icon: sehcontrol
-    version: 1.4.5
-    exec: usr/share/sehcontrol/sehcontrol
+    id: rustdesk
+    name: rustdesk
+    icon: rustdesk
+    version: 1.4.9
+    exec: usr/share/rustdesk/rustdesk
     exec_args: $@
   apt:
     arch:

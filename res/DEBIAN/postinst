@@ -6,15 +6,14 @@ if [ "$1" = configure ]; then
 
 	INITSYS=$(ls -al /proc/1/exe | awk -F' ' '{print $NF}' | awk -F'/' '{print $NF}')
 	ln -f -s /usr/share/sehcontrol/sehcontrol /usr/bin/sehcontrol
-	
+
+
 	if [ "systemd" == "$INITSYS" ]; then
 
 		if [ -e /etc/systemd/system/sehcontrol.service ]; then
 			rm /etc/systemd/system/sehcontrol.service /usr/lib/systemd/system/sehcontrol.service /usr/lib/systemd/user/sehcontrol.service >/dev/null  2>&1
 		fi
-		version=$(python3 -V 2>&1 | grep -Po '(?<=Python )(.+)')
-		parsedVersion=$(echo "${version//./}")
-        mkdir -p /usr/lib/systemd/system/
+		mkdir -p /usr/lib/systemd/system/
 		cp /usr/share/sehcontrol/files/systemd/sehcontrol.service /usr/lib/systemd/system/sehcontrol.service
 		# try fix error in Ubuntu 18.04
 		# Failed to reload sehcontrol.service: Unit sehcontrol.service is not loaded properly: Exec format error.

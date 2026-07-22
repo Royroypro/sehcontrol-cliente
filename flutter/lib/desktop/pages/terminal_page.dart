@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common.dart';
@@ -15,6 +16,7 @@ class TerminalPage extends StatefulWidget {
     required this.tabController,
     required this.isSharedPassword,
     required this.terminalId,
+    required this.tabKey,
     this.forceRelay,
     this.connToken,
   }) : super(key: key);
@@ -25,6 +27,9 @@ class TerminalPage extends StatefulWidget {
   final bool? isSharedPassword;
   final String? connToken;
   final int terminalId;
+
+  /// Tab key for focus management, passed from parent to avoid duplicate construction
+  final String tabKey;
   final SimpleWrapper<State<TerminalPage>?> _lastState = SimpleWrapper(null);
 
   FFI get ffi => (_lastState.value! as _TerminalPageState)._ffi;
@@ -39,13 +44,21 @@ class TerminalPage extends StatefulWidget {
 
 class _TerminalPageState extends State<TerminalPage>
     with AutomaticKeepAliveClientMixin {
+  static const EdgeInsets _defaultTerminalPadding =
+      EdgeInsets.symmetric(horizontal: 5.0, vertical: 2.0);
+
   late FFI _ffi;
   late TerminalModel _terminalModel;
   double? _cellHeight;
+  final FocusNode _terminalFocusNode = FocusNode(canRequestFocus: false);
+  StreamSubscription<DesktopTabState>? _tabStateSubscription;
 
   @override
   void initState() {
     super.initState();
+
+    // Listen for tab selection changes to request focus
+    _tabStateSubscription = widget.tabController.state.listen(_onTabStateChanged);
 
     // Use shared FFI instance from connection manager
     _ffi = TerminalConnectionManager.getConnection(
@@ -64,6 +77,13 @@ class _TerminalPageState extends State<TerminalPage>
     _terminalModel.onResizeExternal = (w, h, pw, ph) {
       _cellHeight = ph * 1.0;
 
+      // Enable focus once terminal has valid dimensions (first valid resize)
+      if (!_terminalFocusNode.canRequestFocus && w > 0 && h > 0) {
+        _terminalFocusNode.canRequestFocus = true;
+        // Auto-focus if this tab is currently selected
+        _requestFocusIfSelected();
+      }
+
       // Schedule the setState for the next frame
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) {
@@ -74,6 +94,13 @@ class _TerminalPageState extends State<TerminalPage>
 
     // Register this terminal model with FFI for event routing
     _ffi.registerTerminalModel(widget.terminalId, _terminalModel);
+
+    // Auto-close tab when shell exits
+    _terminalModel.onClosed = () {
+      if (mounted) {
+        widget.tabController.closeBy(widget.tabKey);
+      }
+    };
 
     // Initialize terminal connection
     WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -99,25 +126,67 @@ class _TerminalPageState extends State<TerminalPage>
 
   @override
   void dispose() {
+    // Cancel tab state subscription to prevent memory leak
+    _tabStateSubscription?.cancel();
     // Unregister terminal model from FFI
     _ffi.unregisterTerminalModel(widget.terminalId);
     _terminalModel.dispose();
+    _terminalFocusNode.dispose();
     // Release connection reference instead of closing directly
     TerminalConnectionManager.releaseConnection(widget.id);
     super.dispose();
+  }
+
+  void _onTabStateChanged(DesktopTabState state) {
+    // Check if this tab is now selected and request focus
+    if (state.selected >= 0 && state.selected < state.tabs.length) {
+      final selectedTab = state.tabs[state.selected];
+      if (selectedTab.key == widget.tabKey && mounted) {
+        _requestFocusIfSelected();
+      }
+    }
+  }
+
+  void _requestFocusIfSelected() {
+    if (!mounted || !_terminalFocusNode.canRequestFocus) return;
+    // Use post-frame callback to ensure widget is fully laid out in focus tree
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      // Re-check conditions after frame: mounted, focusable, still selected, not already focused
+      if (!mounted || !_terminalFocusNode.canRequestFocus || _terminalFocusNode.hasFocus) return;
+      final state = widget.tabController.state.value;
+      if (state.selected >= 0 && state.selected < state.tabs.length) {
+        if (state.tabs[state.selected].key == widget.tabKey) {
+          _terminalFocusNode.requestFocus();
+        }
+      }
+    });
   }
 
   // This method ensures that the number of visible rows is an integer by computing the
   // extra space left after dividing the available height by the height of a single
   // terminal row (`_cellHeight`) and distributing it evenly as top and bottom padding.
   EdgeInsets _calculatePadding(double heightPx) {
-    if (_cellHeight == null) {
-      return const EdgeInsets.symmetric(horizontal: 5.0, vertical: 2.0);
+    final cellHeight = _cellHeight;
+    if (!heightPx.isFinite ||
+        heightPx <= 0 ||
+        cellHeight == null ||
+        !cellHeight.isFinite ||
+        cellHeight <= 0) {
+      return _defaultTerminalPadding;
     }
-    final rows = (heightPx / _cellHeight!).floor();
-    final extraSpace = heightPx - rows * _cellHeight!;
+    final rows = (heightPx / cellHeight).floor();
+    if (rows <= 0) {
+      return _defaultTerminalPadding;
+    }
+    final extraSpace = heightPx - rows * cellHeight;
+    if (!extraSpace.isFinite || extraSpace < 0) {
+      return _defaultTerminalPadding;
+    }
     final topBottom = extraSpace / 2.0;
-    return EdgeInsets.symmetric(horizontal: 5.0, vertical: topBottom);
+    return EdgeInsets.symmetric(
+      horizontal: _defaultTerminalPadding.horizontal / 2,
+      vertical: topBottom,
+    );
   }
 
   @override
@@ -131,7 +200,9 @@ class _TerminalPageState extends State<TerminalPage>
           return TerminalView(
             _terminalModel.terminal,
             controller: _terminalModel.terminalController,
-            autofocus: true,
+            focusNode: _terminalFocusNode,
+            // Note: autofocus is not used here because focus is managed manually
+            // via _onTabStateChanged() to handle tab switching properly.
             backgroundOpacity: 0.7,
             padding: _calculatePadding(heightPx),
             onSecondaryTapDown: (details, offset) async {
