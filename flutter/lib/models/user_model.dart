@@ -27,6 +27,10 @@ class UserModel {
   final RxBool membershipBlocked = false.obs;
   final RxString membershipMessage = ''.obs;
   final RxnInt membershipDaysLeft = RxnInt();
+  final RxString membershipPlanName = ''.obs;
+  final Rx<DateTime?> membershipExpiresAt = Rx<DateTime?>(null);
+  final RxnInt membershipDeviceCount = RxnInt();
+  final RxnInt membershipMaxDevices = RxnInt();
   Timer? _membershipTimer;
   WebSocketChannel? _realtimeChannel;
   Timer? _realtimePingTimer;
@@ -132,6 +136,10 @@ class UserModel {
     membershipBlocked.value = false;
     membershipMessage.value = '';
     membershipDaysLeft.value = null;
+    membershipPlanName.value = '';
+    membershipExpiresAt.value = null;
+    membershipDeviceCount.value = null;
+    membershipMaxDevices.value = null;
     disconnectRealtimeChannel();
   }
 
@@ -156,6 +164,14 @@ class UserModel {
     membershipMessage.value = (data['message'] ?? '').toString();
     final daysLeft = data['days_left'];
     membershipDaysLeft.value = daysLeft is int ? daysLeft : null;
+    membershipPlanName.value = (data['plan_name'] ?? '').toString();
+    final deviceCount = data['device_count'];
+    membershipDeviceCount.value = deviceCount is int ? deviceCount : null;
+    final maxDevices = data['max_devices'];
+    membershipMaxDevices.value = maxDevices is int ? maxDevices : null;
+    final expiresAtRaw = data['plan_expires_at'];
+    membershipExpiresAt.value =
+        expiresAtRaw is String ? DateTime.tryParse(expiresAtRaw) : null;
   }
 
   /// Polls unread admin/system messages (expiry warnings, suspension

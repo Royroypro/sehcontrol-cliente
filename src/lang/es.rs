@@ -769,6 +769,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("membership_expiring_tip", "Tu plan de membresía está por vencer."),
         ("membership_blocked_tip", "Tu cuenta está restringida actualmente. Contacta a tu administrador para más información."),
         ("Account restricted", "Cuenta restringida"),
-        ("Got it", "Entendido")
+        ("Got it", "Entendido"),
+        ("Plan", "Plan"),
+        ("Expires", "Vence"),
+        ("Devices", "Dispositivos")
     ].iter().cloned().collect();
 }

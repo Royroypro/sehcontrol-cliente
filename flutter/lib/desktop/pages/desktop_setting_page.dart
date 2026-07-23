@@ -2087,7 +2087,7 @@ class _AccountState extends State<_Account> {
     return ListView(
       controller: scrollController,
       children: [
-        _Card(title: 'Account', children: [accountAction(), useInfo()]),
+        _Card(title: 'Account', children: [accountAction(), useInfo(), membershipInfo()]),
       ],
     ).marginOnly(bottom: _kListViewBottomMargin);
   }
@@ -2153,6 +2153,58 @@ class _AccountState extends State<_Account> {
             }),
           ),
         )).marginOnly(left: 18, top: 16);
+  }
+
+  /// Shows the membership panel's plan name/expiration/device count, once
+  /// checkMembershipStatus() or the realtime channel has populated them.
+  /// Hidden for deployments without a membership panel (plan name stays
+  /// empty forever in that case) and while logged out.
+  Widget membershipInfo() {
+    return Obx(() {
+      final planName = gFFI.userModel.membershipPlanName.value;
+      if (gFFI.userModel.userName.value.isEmpty || planName.isEmpty) {
+        return const Offstage();
+      }
+      final expiresAt = gFFI.userModel.membershipExpiresAt.value;
+      final expiresText = expiresAt == null
+          ? '-'
+          : '${expiresAt.year}-${expiresAt.month.toString().padLeft(2, '0')}-${expiresAt.day.toString().padLeft(2, '0')}';
+      final deviceCount = gFFI.userModel.membershipDeviceCount.value;
+      final maxDevices = gFFI.userModel.membershipMaxDevices.value;
+      return Container(
+        padding: const EdgeInsets.all(12),
+        decoration: BoxDecoration(
+          color: Theme.of(context).colorScheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(10),
+        ),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Text(
+              translate('Plan'),
+              style: TextStyle(
+                fontSize: 12,
+                color: Theme.of(context).textTheme.bodySmall?.color,
+              ),
+            ),
+            Text(
+              planName,
+              style: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 8),
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text('${translate('Expires')}: $expiresText'),
+                if (maxDevices != null)
+                  Text(
+                      '${translate('Devices')}: ${deviceCount ?? '-'}/$maxDevices'),
+              ],
+            ),
+          ],
+        ),
+      ).marginOnly(left: 18, top: 8);
+    });
   }
 
   Widget? _buildUserAvatar() {

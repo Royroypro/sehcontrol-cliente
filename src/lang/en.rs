@@ -283,6 +283,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("membership_expiring_tip", "Your membership plan is expiring soon."),
         ("membership_blocked_tip", "Your account is currently restricted. Contact your administrator for details."),
         ("Account restricted", "Account restricted"),
-        ("Got it", "Got it")
+        ("Got it", "Got it"),
+        ("Plan", "Plan"),
+        ("Expires", "Expires"),
+        ("Devices", "Devices")
     ].iter().cloned().collect();
 }
