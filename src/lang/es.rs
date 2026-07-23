@@ -766,5 +766,9 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("All monitors", "Todos los monitores"),
         ("#{} monitor", "Monitor {}"),
         ("conn-e2ee-unavailable-tip", "No se pudo verificar el cifrado de extremo a extremo.\nEs posible que el dispositivo remoto aún se esté configurando. Inténtelo de nuevo más tarde.\nSi esto sigue ocurriendo, es posible que el servidor no sea de confianza.\n¿Continuar de todos modos?"),
+        ("membership_expiring_tip", "Tu plan de membresía está por vencer."),
+        ("membership_blocked_tip", "Tu cuenta está restringida actualmente. Contacta a tu administrador para más información."),
+        ("Account restricted", "Cuenta restringida"),
+        ("Got it", "Entendido")
     ].iter().cloned().collect();
 }

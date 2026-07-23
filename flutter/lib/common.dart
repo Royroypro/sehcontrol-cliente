@@ -3916,6 +3916,57 @@ Widget buildMembershipBanner() {
   });
 }
 
+/// Persistent, non-dismissible lock screen shown over the whole main page
+/// while the membership panel reports the account suspended/expired.
+/// Unlike [showMembershipBlockedDialog] (a one-off popup you can close and
+/// forget), this stays up and blocks interaction with everything beneath it
+/// for as long as `membershipBlocked` is true, and disappears on its own
+/// the next time polling sees the account unblocked — there is nothing to
+/// click through. Meant to be layered on top of a page's content via Stack,
+/// e.g. `Stack(children: [pageContent, buildMembershipLockOverlay()])`.
+Widget buildMembershipLockOverlay() {
+  return Obx(() {
+    final blocked = gFFI.userModel.membershipBlocked.value;
+    if (!blocked) return const SizedBox.shrink();
+    final message = gFFI.userModel.membershipMessage.value;
+    return Positioned.fill(
+      child: AbsorbPointer(
+        child: Container(
+          color: Colors.black.withOpacity(0.9),
+          alignment: Alignment.center,
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 420),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.lock_outline_rounded,
+                    color: Colors.redAccent, size: 56),
+                SizedBox(height: 16),
+                Text(
+                  translate('Account restricted'),
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                      color: Colors.white,
+                      fontSize: 22,
+                      fontWeight: FontWeight.bold),
+                ),
+                SizedBox(height: 12),
+                Text(
+                  message.isNotEmpty
+                      ? message
+                      : translate('membership_blocked_tip'),
+                  textAlign: TextAlign.center,
+                  style: TextStyle(color: Colors.white70, fontSize: 15),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  });
+}
+
 bool _membershipBlockedDialogOpen = false;
 
 /// Blocking, informational-only dialog shown when the membership panel

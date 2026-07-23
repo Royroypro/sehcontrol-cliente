@@ -50,8 +50,6 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   var watchIsCanRecordAudio = false;
   Timer? _updateTimer;
   bool isCardClosed = false;
-  Worker? _membershipBlockedWorker;
-  bool _membershipBlockedDialogShown = false;
 
   final RxBool _editHover = false.obs;
   final RxBool _block = false.obs;
@@ -63,12 +61,17 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     super.build(context);
     final isIncomingOnly = bind.isIncomingOnly();
     return _buildBlock(
-        child: Row(
-      crossAxisAlignment: CrossAxisAlignment.start,
+        child: Stack(
       children: [
-        buildLeftPane(context),
-        if (!isIncomingOnly) const VerticalDivider(width: 1),
-        if (!isIncomingOnly) Expanded(child: buildRightPane(context)),
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            buildLeftPane(context),
+            if (!isIncomingOnly) const VerticalDivider(width: 1),
+            if (!isIncomingOnly) Expanded(child: buildRightPane(context)),
+          ],
+        ),
+        buildMembershipLockOverlay(),
       ],
     ));
   }
@@ -864,16 +867,6 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       }
     });
     _uniLinksSubscription = listenUniLinks();
-    _membershipBlockedWorker = ever(gFFI.userModel.membershipBlocked, (blocked) {
-      if (blocked == true) {
-        if (!_membershipBlockedDialogShown) {
-          _membershipBlockedDialogShown = true;
-          showMembershipBlockedDialog(gFFI.userModel.membershipMessage.value);
-        }
-      } else {
-        _membershipBlockedDialogShown = false;
-      }
-    });
 
     if (bind.isIncomingOnly()) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -902,7 +895,6 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     _uniLinksSubscription?.cancel();
     Get.delete<RxBool>(tag: 'stop-service');
     _updateTimer?.cancel();
-    _membershipBlockedWorker?.dispose();
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }

@@ -102,7 +102,12 @@ class HomePageState extends State<HomePage> {
               }
             }),
           ),
-          body: _pages.elementAt(_selectedIndex),
+          body: Stack(
+            children: [
+              _pages.elementAt(_selectedIndex),
+              buildMembershipLockOverlay(),
+            ],
+          ),
         ));
   }
 
