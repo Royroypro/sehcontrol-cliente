@@ -365,39 +365,49 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
   Widget _listItem({required _TabInfo tab}) {
     return Obx(() {
       bool selected = tab.key == selectedTab.value;
-      return SizedBox(
+      return Container(
         width: _kTabWidth,
         height: _kTabHeight,
-        child: InkWell(
-          onTap: () {
-            if (selectedTab.value != tab.key) {
-              int index = DesktopSettingPage.tabKeys.indexOf(tab.key);
-              if (index == -1) {
-                return;
+        padding: const EdgeInsets.symmetric(horizontal: 8),
+        child: Material(
+          color: Colors.transparent,
+          child: InkWell(
+            borderRadius: BorderRadius.circular(10),
+            onTap: () {
+              if (selectedTab.value != tab.key) {
+                int index = DesktopSettingPage.tabKeys.indexOf(tab.key);
+                if (index == -1) {
+                  return;
+                }
+                controller.jumpToPage(index);
               }
-              controller.jumpToPage(index);
-            }
-            selectedTab.value = tab.key;
-          },
-          child: Row(children: [
-            Container(
-              width: 4,
-              height: _kTabHeight * 0.7,
-              color: selected ? _accentColor : null,
-            ),
-            Icon(
-              selected ? tab.selected : tab.unselected,
-              color: selected ? _accentColor : null,
-              size: 20,
-            ).marginOnly(left: 13, right: 10),
-            Text(
-              translate(tab.label),
-              style: TextStyle(
+              selectedTab.value = tab.key;
+            },
+            child: Container(
+              decoration: BoxDecoration(
+                color: selected
+                    ? _accentColor.withOpacity(0.15)
+                    : Colors.transparent,
+                borderRadius: BorderRadius.circular(10),
+              ),
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              child: Row(children: [
+                Icon(
+                  selected ? tab.selected : tab.unselected,
                   color: selected ? _accentColor : null,
-                  fontWeight: FontWeight.w400,
-                  fontSize: _kContentFontSize),
+                  size: 20,
+                ).marginOnly(right: 10),
+                Text(
+                  translate(tab.label),
+                  style: TextStyle(
+                      color: selected ? _accentColor : null,
+                      fontWeight:
+                          selected ? FontWeight.w600 : FontWeight.w400,
+                      fontSize: _kContentFontSize),
+                ),
+              ]),
             ),
-          ]),
+          ),
         ),
       );
     });
@@ -478,16 +488,43 @@ class _GeneralState extends State<_General> {
       }
 
       return _Card(title: 'Service', children: [
-        _Button(serviceStop.value ? 'Start' : 'Stop', () {
-          () async {
-            serviceBtnEnabled.value = false;
-            await start_service(serviceStop.value);
-            // enable the button after 1 second
-            Future.delayed(const Duration(seconds: 1), () {
-              serviceBtnEnabled.value = true;
-            });
-          }();
-        }, enabled: serviceBtnEnabled.value)
+        Row(
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            Expanded(
+              child: Row(
+                children: [
+                  Container(
+                    width: 10,
+                    height: 10,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: serviceStop.value
+                          ? Colors.redAccent
+                          : Colors.greenAccent.shade400,
+                    ),
+                  ).marginOnly(right: 8),
+                  Text(
+                    serviceStop.value
+                        ? translate('Stopped')
+                        : translate('Running'),
+                    style: const TextStyle(fontWeight: FontWeight.w600),
+                  ),
+                ],
+              ),
+            ),
+            _Button(serviceStop.value ? 'Start' : 'Stop', () {
+              () async {
+                serviceBtnEnabled.value = false;
+                await start_service(serviceStop.value);
+                // enable the button after 1 second
+                Future.delayed(const Duration(seconds: 1), () {
+                  serviceBtnEnabled.value = true;
+                });
+              }();
+            }, enabled: serviceBtnEnabled.value)
+          ],
+        ),
       ]);
     });
   }
@@ -2575,6 +2612,10 @@ Widget _Card(
         child: SizedBox(
           width: _kCardFixedWidth,
           child: Card(
+            elevation: 0,
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
             child: Column(
               children: [
                 Row(
@@ -2585,15 +2626,20 @@ Widget _Card(
                       textAlign: TextAlign.start,
                       style: const TextStyle(
                         fontSize: _kTitleFontSize,
+                        fontWeight: FontWeight.w600,
                       ),
                     )),
                     ...?title_suffix
                   ],
-                ).marginOnly(left: _kContentHMargin, top: 10, bottom: 10),
+                ).marginOnly(
+                    left: _kContentHMargin,
+                    right: _kContentHMargin,
+                    top: 14,
+                    bottom: 12),
                 ...children
                     .map((e) => e.marginOnly(top: 4, right: _kContentHMargin)),
               ],
-            ).marginOnly(bottom: 10),
+            ).marginOnly(bottom: 14),
           ).marginOnly(left: _kCardLeftMargin, top: 15),
         ),
       ),

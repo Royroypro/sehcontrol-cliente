@@ -121,6 +121,7 @@ class _PeerTabPageState extends State<PeerTabPage>
                     Expanded(
                         child: visibleContextMenuListener(
                             _createSwitchBar(context))),
+                    ..._buildReservedTagChips(context),
                     if (stateGlobal.isPortrait.isTrue)
                       ..._portraitRightActions(context)
                     else
@@ -132,6 +133,67 @@ class _PeerTabPageState extends State<PeerTabPage>
         _createPeersView(),
       ],
     );
+  }
+
+  /// "Todos"/"Mis equipos" are display-only relabels of the existing
+  /// Recent/Group tabs (there's no unified "all devices" pool today; Recent
+  /// is the closest approximation). Other tabs keep their existing names.
+  String _tabLabel(PeerTabModel model, int t) {
+    if (t == PeerTabIndex.recent.index) return translate('All');
+    if (t == PeerTabIndex.group.index) return translate('My Devices');
+    return model.tabTooltip(t);
+  }
+
+  int _tabCount(int t) {
+    if (t == PeerTabIndex.recent.index) {
+      return gFFI.recentPeersModel.getPeersCount();
+    }
+    if (t == PeerTabIndex.fav.index) return gFFI.favoritePeersModel.getPeersCount();
+    if (t == PeerTabIndex.lan.index) return gFFI.lanPeersModel.getPeersCount();
+    if (t == PeerTabIndex.ab.index) return gFFI.abModel.currentAbPeers.length;
+    if (t == PeerTabIndex.group.index) return gFFI.groupModel.peers.length;
+    return 0;
+  }
+
+  /// "Cabinas"/"Clientes" are reserved Address Book tags (see
+  /// docs/CLIENT_INTEGRATION.md addendum on this): tapping one switches to
+  /// the Address Book tab pre-filtered to just that tag, reusing the
+  /// existing tag-selection/filtering already implemented there — no new
+  /// data model or server endpoint needed.
+  static const List<String> reservedTagChips = ['Cabinas', 'Clientes'];
+
+  List<Widget> _buildReservedTagChips(BuildContext context) {
+    return reservedTagChips.map((tag) {
+      return Obx(() {
+        final count = gFFI.abModel.currentAbPeers
+            .where((p) => p.tags.contains(tag))
+            .length;
+        final selected = gFFI.peerTabModel.currentTab == PeerTabIndex.ab.index &&
+            gFFI.abModel.selectedTags.length == 1 &&
+            gFFI.abModel.selectedTags.first == tag;
+        final color = selected
+            ? MyTheme.tabbar(context).selectedTextColor
+            : MyTheme.tabbar(context).unSelectedTextColor;
+        return InkWell(
+          onTap: () async {
+            gFFI.abModel.selectedTags
+              ..clear()
+              ..add(tag);
+            await handleTabSelection(PeerTabIndex.ab.index);
+          },
+          child: Container(
+            decoration: selected
+                ? BoxDecoration(
+                    border:
+                        Border(bottom: BorderSide(width: 2, color: color!)))
+                : null,
+            child: Text('$tag ($count)',
+                    style: TextStyle(color: color, fontSize: 13))
+                .paddingSymmetric(horizontal: 8),
+          ),
+        );
+      });
+    }).toList();
   }
 
   Widget _createSwitchBar(BuildContext context) {
@@ -169,8 +231,15 @@ class _PeerTabPageState extends State<PeerTabPage>
                         decoration: (hover.value
                             ? (selected ? decoBorder : deco)
                             : (selected ? decoBorder : null)),
-                        child: Icon(model.tabIcon(t), color: color)
-                            .paddingSymmetric(horizontal: 4),
+                        child: Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(model.tabIcon(t), color: color, size: 16),
+                            const SizedBox(width: 6),
+                            Text('${_tabLabel(model, t)} (${_tabCount(t)})',
+                                style: TextStyle(color: color, fontSize: 13)),
+                          ],
+                        ).paddingSymmetric(horizontal: 4),
                       ).paddingSymmetric(horizontal: 4),
                       onTap: isOptionFixed(kOptionPeerTabIndex)
                           ? null

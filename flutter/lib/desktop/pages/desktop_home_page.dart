@@ -13,6 +13,7 @@ import 'package:flutter_hbb/desktop/pages/connection_page.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_setting_page.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';
 import 'package:flutter_hbb/desktop/widgets/update_progress.dart';
+import 'package:flutter_hbb/models/peer_tab_model.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_hbb/models/server_model.dart';
 import 'package:flutter_hbb/models/state_model.dart';
@@ -50,6 +51,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   var watchIsCanRecordAudio = false;
   Timer? _updateTimer;
   bool isCardClosed = false;
+  final RxBool _usingPublicServer = true.obs;
 
   final RxBool _editHover = false.obs;
   final RxBool _block = false.obs;
@@ -63,17 +65,88 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     return _buildBlock(
         child: Stack(
       children: [
-        Row(
-          crossAxisAlignment: CrossAxisAlignment.start,
+        Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
           children: [
-            buildLeftPane(context),
-            if (!isIncomingOnly) const VerticalDivider(width: 1),
-            if (!isIncomingOnly) Expanded(child: buildRightPane(context)),
+            if (!isIncomingOnly) _buildHeader(context),
+            Expanded(
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  buildLeftPane(context),
+                  if (!isIncomingOnly) const VerticalDivider(width: 1),
+                  if (!isIncomingOnly) Expanded(child: buildRightPane(context)),
+                ],
+              ),
+            ),
           ],
         ),
         buildMembershipLockOverlay(),
       ],
     ));
+  }
+
+  /// Top header bar: brand, "Control Remoto"/"Mis Equipos" nav shortcuts, and
+  /// help/notifications/settings icons. "Mis Equipos" jumps the peer-tab
+  /// bar embedded in ConnectionPage to the group/"Accessible devices" tab
+  /// rather than opening a separate page, since that's the closest existing
+  /// concept to a dedicated devices view.
+  Widget _buildHeader(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      decoration: BoxDecoration(
+        border: Border(
+          bottom: BorderSide(color: Theme.of(context).dividerColor),
+        ),
+      ),
+      child: Row(
+        children: [
+          SizedBox(width: 28, height: 28, child: loadLogo()),
+          const SizedBox(width: 10),
+          Text(
+            bind.mainGetAppNameSync().toUpperCase(),
+            style: const TextStyle(
+                fontSize: 16, fontWeight: FontWeight.bold, letterSpacing: 0.5),
+          ),
+          const SizedBox(width: 28),
+          _HeaderNavButton(
+            icon: Icons.desktop_windows_outlined,
+            title: translate('Control Remote Desktop'),
+            subtitle: translate('desk_tip'),
+            onTap: () {},
+          ),
+          const SizedBox(width: 8),
+          _HeaderNavButton(
+            icon: Icons.devices_other_outlined,
+            title: translate('Accessible devices'),
+            onTap: () =>
+                gFFI.peerTabModel.setCurrentTab(PeerTabIndex.group.index),
+          ),
+          const Spacer(),
+          IconButton(
+            tooltip: translate('Help'),
+            icon: const Icon(Icons.help_outline),
+            onPressed: () =>
+                launchUrl(Uri.parse('https://sehcontrol.sehuacho.com')),
+          ),
+          Obx(() => IconButton(
+                tooltip: translate('Notifications'),
+                icon: unreadTopRightBuilder(gFFI.userModel.unreadNotificationCount,
+                    icon: const Icon(Icons.notifications_outlined)),
+                onPressed: () => gFFI.userModel.clearUnreadNotifications(),
+              )),
+          IconButton(
+            tooltip: translate('Settings'),
+            icon: const Icon(Icons.settings_outlined),
+            onPressed: () {
+              if (DesktopSettingPage.tabKeys.isNotEmpty) {
+                DesktopSettingPage.switch2page(DesktopSettingPage.tabKeys[0]);
+              }
+            },
+          ),
+        ],
+      ),
+    );
   }
 
   Widget _buildBlock({required Widget child}) {
@@ -97,8 +170,11 @@ class _DesktopHomePageState extends State<DesktopHomePage>
         child: loadLogo(),
       ),
       buildTip(context),
-      if (!isOutgoingOnly) buildIDBoard(context),
-      if (!isOutgoingOnly) buildPasswordBoard(context),
+      if (!isOutgoingOnly) _sidebarCard(context, child: buildIDBoard(context)),
+      if (!isOutgoingOnly)
+        _sidebarCard(context, child: buildPasswordBoard(context)),
+      if (!isOutgoingOnly) _buildIncomingAccessToggle(context),
+      if (!isOutgoingOnly) _buildStatusCard(context),
       FutureBuilder<Widget>(
         future: Future.value(
             Obx(() => buildHelpCards(stateGlobal.updateUrl.value))),
@@ -118,6 +194,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
         },
       ),
       buildPluginEntry(),
+      if (!isOutgoingOnly) _buildProCard(context),
     ];
     if (isIncomingOnly) {
       children.addAll([
@@ -190,6 +267,147 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     return Container(
       color: Theme.of(context).scaffoldBackgroundColor,
       child: ConnectionPage(),
+    );
+  }
+
+  /// Wraps an existing sidebar block (ID board, password board, ...) in a
+  /// rounded card background without touching its internal layout/logic.
+  Widget _sidebarCard(BuildContext context, {required Widget child}) {
+    return Container(
+      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(12),
+      ),
+      child: child,
+    );
+  }
+
+  /// Toggle for "incoming access" — same control as the Service Start/Stop
+  /// button in Settings > General (`serviceStop` / `start_service`), just
+  /// presented as a switch here.
+  Widget _buildIncomingAccessToggle(BuildContext context) {
+    return _sidebarCard(
+      context,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+        child: Obx(() => Row(
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(translate('Accept sessions via password'),
+                          style: const TextStyle(
+                              fontSize: 13, fontWeight: FontWeight.w600)),
+                      Text(
+                        svcStopped.value
+                            ? translate('Stopped')
+                            : translate('Running'),
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: svcStopped.value
+                              ? Colors.redAccent
+                              : Colors.greenAccent.shade400,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Switch(
+                  value: !svcStopped.value,
+                  onChanged: (v) async => await start_service(!v),
+                ),
+              ],
+            )),
+      ),
+    );
+  }
+
+  /// Read-only status summary: real service state (same source as
+  /// [OnlineStatusWidget]) plus encryption, which is always AES-256 in
+  /// RustDesk. "Conexión"/"Red" don't have a real quality metric plumbed
+  /// for the local session today, so they show a coarse label derived from
+  /// whether a public relay is in use — not a precise network measurement.
+  Widget _buildStatusCard(BuildContext context) {
+    Widget row(String label, Widget value) => Padding(
+          padding: const EdgeInsets.symmetric(vertical: 3),
+          child: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(label, style: Theme.of(context).textTheme.bodySmall),
+              value,
+            ],
+          ),
+        );
+    return _sidebarCard(
+      context,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        child: Obx(() => Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                row(
+                    translate('Service'),
+                    Text(
+                      stateGlobal.svcStatus.value == SvcStatus.ready
+                          ? translate('Ready')
+                          : svcStopped.value
+                              ? translate('Stopped')
+                              : translate('connecting_status'),
+                      style: const TextStyle(fontWeight: FontWeight.w600),
+                    )),
+                row(
+                    translate('Connection Type'),
+                    Text(
+                      _usingPublicServer.value ? 'Relay' : 'Direct',
+                      style: const TextStyle(fontWeight: FontWeight.w600),
+                    )),
+                row(translate('Encryption'), const Text('AES-256',
+                    style: TextStyle(fontWeight: FontWeight.w600))),
+              ],
+            )),
+      ),
+    );
+  }
+
+  /// Static upsell card — no purchase/upgrade backend exists, so
+  /// "Actualizar ahora" just opens the marketing site, same pattern as the
+  /// existing "Website" link in [buildTip].
+  Widget _buildProCard(BuildContext context) {
+    return _sidebarCard(
+      context,
+      child: Padding(
+        padding: const EdgeInsets.all(12),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Row(
+              children: [
+                const Icon(Icons.star, color: Colors.amber, size: 18),
+                const SizedBox(width: 6),
+                Text('${bind.mainGetAppNameSync()} PRO',
+                    style: const TextStyle(fontWeight: FontWeight.w700)),
+              ],
+            ),
+            const SizedBox(height: 6),
+            Text(
+              translate('sehcontrol_pro_tip'),
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+            const SizedBox(height: 10),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                onPressed: () =>
+                    launchUrl(Uri.parse('https://sehcontrol.sehuacho.com')),
+                child: Text(translate('Upgrade now')),
+              ),
+            ),
+          ],
+        ),
+      ),
     );
   }
 
@@ -725,6 +943,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
         svcStopped.value = v;
         setState(() {});
       }
+      _usingPublicServer.value = await bind.mainIsUsingPublicServer();
       if (watchIsCanScreenRecording) {
         if (bind.mainIsCanScreenRecording(prompt: false)) {
           watchIsCanScreenRecording = false;
@@ -1159,4 +1378,58 @@ void setPasswordDialog({VoidCallback? notEmptyCallback}) async {
       onCancel: close,
     );
   });
+}
+
+/// One of the tab-like nav buttons in the home page header (e.g.
+/// "Control Remoto" / "Mis Equipos"): an icon, a title, and an optional
+/// subtitle underneath.
+class _HeaderNavButton extends StatelessWidget {
+  final IconData icon;
+  final String title;
+  final String? subtitle;
+  final VoidCallback onTap;
+
+  const _HeaderNavButton({
+    required this.icon,
+    required this.title,
+    this.subtitle,
+    required this.onTap,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 20, color: MyTheme.accent),
+              const SizedBox(width: 8),
+              Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    title,
+                    style: const TextStyle(
+                        fontSize: 13, fontWeight: FontWeight.w600),
+                  ),
+                  if (subtitle != null)
+                    Text(
+                      subtitle!,
+                      style: Theme.of(context).textTheme.bodySmall,
+                    ),
+                ],
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
 }

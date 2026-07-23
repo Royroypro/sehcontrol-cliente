@@ -317,10 +317,13 @@ class _ConnectionPageState extends State<ConnectionPage>
             child: Column(
           children: [
             Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Flexible(child: _buildRemoteIDTextField(context)),
+                const SizedBox(width: 16),
+                _buildSecureConnectionCard(context),
               ],
-            ).marginOnly(top: 22),
+            ).marginOnly(top: 22, right: 12),
             SizedBox(height: 12),
             Divider().paddingOnly(right: 12),
             Expanded(child: PeerTabPage()),
@@ -347,6 +350,53 @@ class _ConnectionPageState extends State<ConnectionPage>
 
   /// UI for the remote ID TextField.
   /// Search for a peer.
+  /// Static info card next to the connect box. RustDesk always encrypts
+  /// sessions with AES-256 end-to-end, so this text is accurate without
+  /// needing any per-connection data.
+  Widget _buildSecureConnectionCard(BuildContext context) {
+    return Container(
+      width: 240,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(13),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.verified_user_outlined,
+                  color: Colors.greenAccent, size: 18),
+              const SizedBox(width: 6),
+              Text(translate('Secure Connection'),
+                  style: const TextStyle(fontWeight: FontWeight.w600)),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            translate('secure_connection_tip'),
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+          const SizedBox(height: 8),
+          InkWell(
+            onTap: () {
+              const url = 'https://sehcontrol.sehuacho.com';
+              canLaunchUrlString(url).then((can) {
+                if (can) launchUrlString(url);
+              });
+            },
+            child: Text(
+              translate('Learn more'),
+              style: const TextStyle(
+                  color: Colors.blue, decoration: TextDecoration.underline),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   Widget _buildRemoteIDTextField(BuildContext context) {
     var w = Container(
       width: 320 + 20 * 2,

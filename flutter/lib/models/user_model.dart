@@ -31,6 +31,9 @@ class UserModel {
   final Rx<DateTime?> membershipExpiresAt = Rx<DateTime?>(null);
   final RxnInt membershipDeviceCount = RxnInt();
   final RxnInt membershipMaxDevices = RxnInt();
+  // Notification-bell badge count; every new message bumps it, opening the
+  // bell just clears it back to 0 (no persistent inbox yet).
+  final RxInt unreadNotificationCount = 0.obs;
   Timer? _membershipTimer;
   WebSocketChannel? _realtimeChannel;
   Timer? _realtimePingTimer;
@@ -140,7 +143,12 @@ class UserModel {
     membershipExpiresAt.value = null;
     membershipDeviceCount.value = null;
     membershipMaxDevices.value = null;
+    unreadNotificationCount.value = 0;
     disconnectRealtimeChannel();
+  }
+
+  void clearUnreadNotifications() {
+    unreadNotificationCount.value = 0;
   }
 
   /// throw nothing: failures (no server, offline, non-200, bad json) are
@@ -205,6 +213,7 @@ class UserModel {
     if (message.isEmpty) return;
     showToast(title.isEmpty ? message : '$title\n$message',
         timeout: const Duration(seconds: 5));
+    unreadNotificationCount.value++;
     final id = item['id'];
     if (id != null) {
       unawaited(_ackMessage(id));

@@ -3688,13 +3688,14 @@ class ComboBox extends StatelessWidget {
     current = keys[index];
     return Container(
       decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainerHighest,
         border: Border.all(
           color: enabled
               ? MyTheme.color(context).border2 ?? MyTheme.border
               : MyTheme.border,
         ),
         borderRadius:
-            BorderRadius.circular(8), //border raiuds of dropdown button
+            BorderRadius.circular(10), //border raiuds of dropdown button
       ),
       height: 42, // should be the height of a TextField
       child: Obx(() => DropdownButton<String>(

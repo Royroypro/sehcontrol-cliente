@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 
+import '../../common.dart';
+
 class SupportSidebarBlock extends StatelessWidget {
   const SupportSidebarBlock({super.key});
 
@@ -20,10 +22,15 @@ class SupportSidebarBlock extends StatelessWidget {
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
           const Divider(height: 16),
-          Text('Soporte', style: Theme.of(context).textTheme.labelMedium),
+          Text('Soporte',
+              style: Theme.of(context)
+                  .textTheme
+                  .labelMedium
+                  ?.copyWith(fontWeight: FontWeight.w600)),
           const SizedBox(height: 8),
           _MiniLink(
             icon: Icons.chat,
+            iconColor: const Color(0xFF25D366),
             title: 'WhatsApp',
             subtitle: '+$whatsapp',
             onTap: () => _open('https://wa.me/$whatsapp'),
@@ -31,6 +38,7 @@ class SupportSidebarBlock extends StatelessWidget {
           const SizedBox(height: 6),
           _MiniLink(
             icon: Icons.public,
+            iconColor: MyTheme.accent,
             title: 'Web',
             subtitle: 'sehcontrol.sehuacho.com',
             onTap: () => _open(web),
@@ -43,12 +51,14 @@ class SupportSidebarBlock extends StatelessWidget {
 
 class _MiniLink extends StatelessWidget {
   final IconData icon;
+  final Color? iconColor;
   final String title;
   final String subtitle;
   final VoidCallback onTap;
 
   const _MiniLink({
     required this.icon,
+    this.iconColor,
     required this.title,
     required this.subtitle,
     required this.onTap,
@@ -56,26 +66,34 @@ class _MiniLink extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return InkWell(
-      borderRadius: BorderRadius.circular(10),
-      onTap: onTap,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 8),
-        child: Row(
-          children: [
-            Icon(icon, size: 18),
-            const SizedBox(width: 10),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(title, style: Theme.of(context).textTheme.bodyMedium),
-                  const SizedBox(height: 2),
-                  Text(subtitle, style: Theme.of(context).textTheme.bodySmall),
-                ],
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        borderRadius: BorderRadius.circular(10),
+        onTap: onTap,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 8),
+          child: Row(
+            children: [
+              Icon(icon, size: 18, color: iconColor),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(title,
+                        style: Theme.of(context)
+                            .textTheme
+                            .bodyMedium
+                            ?.copyWith(fontWeight: FontWeight.w600)),
+                    const SizedBox(height: 2),
+                    Text(subtitle,
+                        style: Theme.of(context).textTheme.bodySmall),
+                  ],
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
         ),
       ),
     );

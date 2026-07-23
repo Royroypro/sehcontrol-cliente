@@ -772,6 +772,20 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Got it", "Entendido"),
         ("Plan", "Plan"),
         ("Expires", "Vence"),
-        ("Devices", "Dispositivos")
+        ("Devices", "Dispositivos"),
+        ("Running", "En ejecución"),
+        ("Stopped", "Detenido"),
+        ("Help", "Ayuda"),
+        ("Notifications", "Notificaciones"),
+        ("Ready", "Listo"),
+        ("Accept sessions via password", "Aceptar sesiones por contraseña"),
+        ("Connection Type", "Conexión"),
+        ("Encryption", "Cifrado"),
+        ("Upgrade now", "Actualizar ahora"),
+        ("sehcontrol_pro_tip", "Más velocidad, historial ilimitado y funciones avanzadas."),
+        ("Learn more", "Más información"),
+        ("secure_connection_tip", "Todas las conexiones están protegidas con cifrado de extremo a extremo AES-256."),
+        ("All", "Todos"),
+        ("My Devices", "Mis equipos")
     ].iter().cloned().collect();
 }
