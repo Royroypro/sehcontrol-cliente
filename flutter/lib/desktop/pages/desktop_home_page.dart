@@ -11,7 +11,6 @@ import 'package:flutter_hbb/common/widgets/custom_password.dart';
 import 'package:flutter_hbb/consts.dart';
 import 'package:flutter_hbb/desktop/pages/connection_page.dart';
 import 'package:flutter_hbb/desktop/pages/desktop_setting_page.dart';
-import 'package:flutter_hbb/desktop/pages/desktop_tab_page.dart';
 import 'package:flutter_hbb/desktop/widgets/update_progress.dart';
 import 'package:flutter_hbb/models/peer_tab_model.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
@@ -51,7 +50,6 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   var watchIsCanRecordAudio = false;
   Timer? _updateTimer;
   bool isCardClosed = false;
-  final RxBool _usingPublicServer = true.obs;
 
   final RxBool _editHover = false.obs;
   final RxBool _block = false.obs;
@@ -148,12 +146,12 @@ class _DesktopHomePageState extends State<DesktopHomePage>
             onPressed: () =>
                 launchUrl(Uri.parse('https://sehcontrol.sehuacho.com')),
           ),
-          Obx(() => IconButton(
-                tooltip: translate('Notifications'),
-                icon: unreadTopRightBuilder(gFFI.userModel.unreadNotificationCount,
-                    icon: const Icon(Icons.notifications_outlined)),
-                onPressed: () => gFFI.userModel.clearUnreadNotifications(),
-              )),
+          IconButton(
+            tooltip: translate('Notifications'),
+            icon: unreadTopRightBuilder(gFFI.userModel.unreadNotificationCount,
+                icon: const Icon(Icons.notifications_outlined)),
+            onPressed: () => gFFI.userModel.clearUnreadNotifications(),
+          ),
           IconButton(
             tooltip: translate('Settings'),
             icon: const Icon(Icons.settings_outlined),
@@ -346,9 +344,9 @@ class _DesktopHomePageState extends State<DesktopHomePage>
 
   /// Read-only status summary: real service state (same source as
   /// [OnlineStatusWidget]) plus encryption, which is always AES-256 in
-  /// RustDesk. "Conexión"/"Red" don't have a real quality metric plumbed
-  /// for the local session today, so they show a coarse label derived from
-  /// whether a public relay is in use — not a precise network measurement.
+  /// RustDesk. Trimmed to just these two per user feedback that the earlier
+  /// 3-row version (which also showed a coarse Relay/Direct approximation)
+  /// was more detail than useful here.
   Widget _buildStatusCard(BuildContext context) {
     Widget row(String label, Widget value) => Padding(
           padding: const EdgeInsets.symmetric(vertical: 3),
@@ -377,12 +375,6 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                               : translate('connecting_status'),
                       style: const TextStyle(fontWeight: FontWeight.w600),
                     )),
-                row(
-                    translate('Connection Type'),
-                    Text(
-                      _usingPublicServer.value ? 'Relay' : 'Direct',
-                      style: const TextStyle(fontWeight: FontWeight.w600),
-                    )),
                 row(translate('Encryption'), const Text('AES-256',
                     style: TextStyle(fontWeight: FontWeight.w600))),
               ],
@@ -391,10 +383,62 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     );
   }
 
-  /// Static upsell card — no purchase/upgrade backend exists, so
-  /// "Actualizar ahora" just opens the marketing site, same pattern as the
-  /// existing "Website" link in [buildTip].
+  /// Shows the user's actual plan (name/expiration/devices — same data and
+  /// source already surfaced in Settings > Account, see `membershipInfo()`
+  /// in desktop_setting_page.dart) once they're logged in with an active
+  /// plan. Falls back to the generic marketing card (no purchase/upgrade
+  /// backend exists, so "Actualizar ahora" just opens the marketing site)
+  /// when there's no plan to show.
   Widget _buildProCard(BuildContext context) {
+    return Obx(() {
+      final planName = gFFI.userModel.membershipPlanName.value;
+      final hasPlan =
+          gFFI.userModel.userName.value.isNotEmpty && planName.isNotEmpty;
+      if (!hasPlan) return _buildProMarketingCard(context);
+      final expiresAt = gFFI.userModel.membershipExpiresAt.value;
+      final expiresText = expiresAt == null
+          ? '-'
+          : '${expiresAt.year}-${expiresAt.month.toString().padLeft(2, '0')}-${expiresAt.day.toString().padLeft(2, '0')}';
+      final deviceCount = gFFI.userModel.membershipDeviceCount.value;
+      final maxDevices = gFFI.userModel.membershipMaxDevices.value;
+      Widget row(String label, String value) => Padding(
+            padding: const EdgeInsets.symmetric(vertical: 3),
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(label, style: Theme.of(context).textTheme.bodySmall),
+                Text(value, style: const TextStyle(fontWeight: FontWeight.w600)),
+              ],
+            ),
+          );
+      return _sidebarCard(
+        context,
+        child: Padding(
+          padding: const EdgeInsets.all(12),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  const Icon(Icons.star, color: Colors.amber, size: 18),
+                  const SizedBox(width: 6),
+                  Text(planName,
+                      style: const TextStyle(fontWeight: FontWeight.w700)),
+                ],
+              ),
+              const SizedBox(height: 6),
+              row(translate('Expires'), expiresText),
+              if (deviceCount != null)
+                row(translate('Devices'),
+                    maxDevices != null ? '$deviceCount / $maxDevices' : '$deviceCount'),
+            ],
+          ),
+        ),
+      );
+    });
+  }
+
+  Widget _buildProMarketingCard(BuildContext context) {
     return _sidebarCard(
       context,
       child: Padding(
@@ -451,23 +495,16 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                 children: [
                   Container(
                     height: 25,
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      crossAxisAlignment: CrossAxisAlignment.start,
-                      children: [
-                        Text(
-                          translate("ID"),
-                          style: TextStyle(
-                              fontSize: 14,
-                              color: Theme.of(context)
-                                  .textTheme
-                                  .titleLarge
-                                  ?.color
-                                  ?.withOpacity(0.5)),
-                        ).marginOnly(top: 5),
-                        buildPopupMenu(context)
-                      ],
-                    ),
+                    child: Text(
+                      translate("ID"),
+                      style: TextStyle(
+                          fontSize: 14,
+                          color: Theme.of(context)
+                              .textTheme
+                              .titleLarge
+                              ?.color
+                              ?.withOpacity(0.5)),
+                    ).marginOnly(top: 5),
                   ),
                   Flexible(
                     child: GestureDetector(
@@ -495,31 +532,6 @@ class _DesktopHomePageState extends State<DesktopHomePage>
           ),
         ],
       ),
-    );
-  }
-
-  Widget buildPopupMenu(BuildContext context) {
-    final textColor = Theme.of(context).textTheme.titleLarge?.color;
-    RxBool hover = false.obs;
-    return InkWell(
-      onTap: DesktopTabPage.onAddSetting,
-      child: Tooltip(
-        message: translate('Settings'),
-        child: Obx(
-          () => CircleAvatar(
-            radius: 15,
-            backgroundColor: hover.value
-                ? Theme.of(context).scaffoldBackgroundColor
-                : Theme.of(context).colorScheme.background,
-            child: Icon(
-              Icons.more_vert_outlined,
-              size: 20,
-              color: hover.value ? textColor : textColor?.withOpacity(0.5),
-            ),
-          ),
-        ),
-      ),
-      onHover: (value) => hover.value = value,
     );
   }
 
@@ -962,7 +974,6 @@ class _DesktopHomePageState extends State<DesktopHomePage>
         svcStopped.value = v;
         setState(() {});
       }
-      _usingPublicServer.value = await bind.mainIsUsingPublicServer();
       if (watchIsCanScreenRecording) {
         if (bind.mainIsCanScreenRecording(prompt: false)) {
           watchIsCanScreenRecording = false;
