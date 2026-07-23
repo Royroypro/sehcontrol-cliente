@@ -6,6 +6,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_hbb/common/hbbs/hbbs.dart';
 import 'package:flutter_hbb/models/ab_model.dart';
 import 'package:get/get.dart';
+import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../common.dart';
 import '../utils/http_service.dart' as http;
@@ -27,6 +28,9 @@ class UserModel {
   final RxString membershipMessage = ''.obs;
   final RxnInt membershipDaysLeft = RxnInt();
   Timer? _membershipTimer;
+  WebSocketChannel? _realtimeChannel;
+  Timer? _realtimePingTimer;
+  bool _realtimeReconnectScheduled = false;
 
   bool get isLogin => userName.isNotEmpty;
   String get displayNameOrUserName =>
@@ -107,17 +111,19 @@ class UserModel {
     }
   }
 
-  /// Starts (or restarts) periodic polling of `/api/membership/status` and
-  /// `/api/messages`. No-op if the client has no `api_server` configured,
-  /// matching the "no membership panel deployed" behavior of the rest of
-  /// this feature. Both checks share one timer/interval since the server
-  /// doesn't refresh either dataset more often than every 5 minutes.
+  /// Starts (or restarts) the realtime WebSocket channel plus a low-frequency
+  /// HTTP poll of `/api/membership/status` and `/api/messages` as a fallback
+  /// for when the socket is down and hasn't reconnected yet. No-op if the
+  /// client has no `api_server` configured, matching the "no membership
+  /// panel deployed" behavior of the rest of this feature.
   void startMembershipPolling() {
     _membershipTimer?.cancel();
-    _membershipTimer = periodic_immediate(const Duration(minutes: 5), () async {
+    _membershipTimer =
+        periodic_immediate(const Duration(minutes: 15), () async {
       await checkMembershipStatus();
       await checkMessages();
     });
+    connectRealtimeChannel();
   }
 
   void stopMembershipPolling() {
@@ -126,6 +132,7 @@ class UserModel {
     membershipBlocked.value = false;
     membershipMessage.value = '';
     membershipDaysLeft.value = null;
+    disconnectRealtimeChannel();
   }
 
   /// throw nothing: failures (no server, offline, non-200, bad json) are
@@ -138,14 +145,17 @@ class UserModel {
       final resp = await http.get(Uri.parse('$url/api/membership/status'),
           headers: getHttpHeaders());
       if (resp.statusCode != 200) return;
-      final data = jsonDecode(decode_http_response(resp));
-      membershipBlocked.value = data['blocked'] == true;
-      membershipMessage.value = (data['message'] ?? '').toString();
-      final daysLeft = data['days_left'];
-      membershipDaysLeft.value = daysLeft is int ? daysLeft : null;
+      _applyMembershipStatus(jsonDecode(decode_http_response(resp)));
     } catch (e) {
       debugPrint('Failed to checkMembershipStatus: $e');
     }
+  }
+
+  void _applyMembershipStatus(Map data) {
+    membershipBlocked.value = data['blocked'] == true;
+    membershipMessage.value = (data['message'] ?? '').toString();
+    final daysLeft = data['days_left'];
+    membershipDaysLeft.value = daysLeft is int ? daysLeft : null;
   }
 
   /// Polls unread admin/system messages (expiry warnings, suspension
@@ -166,18 +176,22 @@ class UserModel {
       if (data is! List) return;
       for (final item in data) {
         if (item is! Map) continue;
-        final title = (item['title'] ?? '').toString();
-        final message = (item['message'] ?? '').toString();
-        if (message.isEmpty) continue;
-        showToast(title.isEmpty ? message : '$title\n$message',
-            timeout: const Duration(seconds: 5));
-        final id = item['id'];
-        if (id != null) {
-          unawaited(_ackMessage(id));
-        }
+        _showMessageAndAck(item);
       }
     } catch (e) {
       debugPrint('Failed to checkMessages: $e');
+    }
+  }
+
+  void _showMessageAndAck(Map item) {
+    final title = (item['title'] ?? '').toString();
+    final message = (item['message'] ?? '').toString();
+    if (message.isEmpty) return;
+    showToast(title.isEmpty ? message : '$title\n$message',
+        timeout: const Duration(seconds: 5));
+    final id = item['id'];
+    if (id != null) {
+      unawaited(_ackMessage(id));
     }
   }
 
@@ -188,6 +202,91 @@ class UserModel {
           headers: getHttpHeaders());
     } catch (e) {
       debugPrint('Failed to ack message $id: $e');
+    }
+  }
+
+  /// Opens the realtime push channel (`connected`/`membership_status`/
+  /// `message`/`pong` events) so membership and message changes reach the
+  /// client immediately instead of waiting for the next HTTP poll. The poll
+  /// started by [startMembershipPolling] is kept running regardless, as a
+  /// low-frequency fallback for when this socket is down. No-op with no
+  /// api_server or access_token available.
+  void connectRealtimeChannel() {
+    disconnectRealtimeChannel();
+    unawaited(() async {
+      final url = await bind.mainGetApiServer();
+      final token = bind.mainGetLocalOption(key: 'access_token');
+      if (url.trim().isEmpty || token.isEmpty) return;
+      // Naive http->ws / https->wss: "http" is a prefix of "https", so
+      // replacing it with "ws" leaves the trailing "s" in place for TLS.
+      final wsUrl = '${url.replaceFirst('http', 'ws')}/api/ws?token=$token';
+      try {
+        final channel = WebSocketChannel.connect(Uri.parse(wsUrl));
+        _realtimeChannel = channel;
+        channel.stream.listen(
+          (raw) => _handleRealtimeEvent(raw),
+          onDone: _scheduleRealtimeReconnect,
+          onError: (e) {
+            debugPrint('Realtime channel error: $e');
+            _scheduleRealtimeReconnect();
+          },
+          cancelOnError: true,
+        );
+        _realtimePingTimer?.cancel();
+        _realtimePingTimer =
+            Timer.periodic(const Duration(seconds: 30), (_) {
+          try {
+            _realtimeChannel?.sink.add('ping');
+          } catch (e) {
+            debugPrint('Failed to ping realtime channel: $e');
+          }
+        });
+      } catch (e) {
+        debugPrint('Failed to connect realtime channel: $e');
+        _scheduleRealtimeReconnect();
+      }
+    }());
+  }
+
+  void disconnectRealtimeChannel() {
+    _realtimePingTimer?.cancel();
+    _realtimePingTimer = null;
+    _realtimeChannel?.sink.close();
+    _realtimeChannel = null;
+  }
+
+  void _scheduleRealtimeReconnect() {
+    if (_realtimeReconnectScheduled || _membershipTimer == null) return;
+    _realtimeReconnectScheduled = true;
+    Future.delayed(const Duration(seconds: 5), () {
+      _realtimeReconnectScheduled = false;
+      // Only reconnect if polling (i.e. a logged-in session) is still active;
+      // stopMembershipPolling()/logOut() may have run while we were waiting.
+      if (_membershipTimer != null) {
+        connectRealtimeChannel();
+      }
+    });
+  }
+
+  void _handleRealtimeEvent(dynamic raw) {
+    try {
+      if (raw is! String) return;
+      final event = jsonDecode(raw);
+      if (event is! Map) return;
+      final data = event['data'];
+      switch (event['type']) {
+        case 'connected':
+        case 'pong':
+          break;
+        case 'membership_status':
+          if (data is Map) _applyMembershipStatus(data);
+          break;
+        case 'message':
+          if (data is Map) _showMessageAndAck(data);
+          break;
+      }
+    } catch (e) {
+      debugPrint('Failed to handle realtime event: $e');
     }
   }
 
