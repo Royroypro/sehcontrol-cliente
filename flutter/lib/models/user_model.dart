@@ -107,13 +107,17 @@ class UserModel {
     }
   }
 
-  /// Starts (or restarts) periodic polling of `/api/membership/status`.
-  /// No-op if the client has no `api_server` configured, matching the
-  /// "no membership panel deployed" behavior of the rest of this feature.
+  /// Starts (or restarts) periodic polling of `/api/membership/status` and
+  /// `/api/messages`. No-op if the client has no `api_server` configured,
+  /// matching the "no membership panel deployed" behavior of the rest of
+  /// this feature. Both checks share one timer/interval since the server
+  /// doesn't refresh either dataset more often than every 5 minutes.
   void startMembershipPolling() {
     _membershipTimer?.cancel();
-    _membershipTimer =
-        periodic_immediate(const Duration(minutes: 5), checkMembershipStatus);
+    _membershipTimer = periodic_immediate(const Duration(minutes: 5), () async {
+      await checkMembershipStatus();
+      await checkMessages();
+    });
   }
 
   void stopMembershipPolling() {
@@ -141,6 +145,49 @@ class UserModel {
       membershipDaysLeft.value = daysLeft is int ? daysLeft : null;
     } catch (e) {
       debugPrint('Failed to checkMembershipStatus: $e');
+    }
+  }
+
+  /// Polls unread admin/system messages (expiry warnings, suspension
+  /// notices, manual broadcasts, ...) and surfaces each as a toast,
+  /// acking it right away so it isn't shown again on the next poll.
+  /// Same failure handling as [checkMembershipStatus]: any error here is
+  /// swallowed, never disrupts the rest of the app.
+  Future<void> checkMessages() async {
+    if (!isLogin) return;
+    try {
+      final url = await bind.mainGetApiServer();
+      if (url.trim().isEmpty) return;
+      final resp = await http.get(
+          Uri.parse('$url/api/messages?unread=1'),
+          headers: getHttpHeaders());
+      if (resp.statusCode != 200) return;
+      final data = jsonDecode(decode_http_response(resp));
+      if (data is! List) return;
+      for (final item in data) {
+        if (item is! Map) continue;
+        final title = (item['title'] ?? '').toString();
+        final message = (item['message'] ?? '').toString();
+        if (message.isEmpty) continue;
+        showToast(title.isEmpty ? message : '$title\n$message',
+            timeout: const Duration(seconds: 5));
+        final id = item['id'];
+        if (id != null) {
+          unawaited(_ackMessage(id));
+        }
+      }
+    } catch (e) {
+      debugPrint('Failed to checkMessages: $e');
+    }
+  }
+
+  Future<void> _ackMessage(dynamic id) async {
+    try {
+      final url = await bind.mainGetApiServer();
+      await http.post(Uri.parse('$url/api/messages/$id/ack'),
+          headers: getHttpHeaders());
+    } catch (e) {
+      debugPrint('Failed to ack message $id: $e');
     }
   }
 
