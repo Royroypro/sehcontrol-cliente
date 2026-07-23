@@ -334,7 +334,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                 ),
                 Switch(
                   value: !svcStopped.value,
-                  onChanged: (v) async => await start_service(!v),
+                  onChanged: (v) async => await start_service(v),
                 ),
               ],
             )),
