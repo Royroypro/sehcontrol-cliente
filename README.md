@@ -59,6 +59,31 @@ Si el repositorio ya fue clonado sin submódulos:
 git submodule update --init --recursive
 ```
 
+## Publicar un Release
+
+El script `scripts/publish-release.ps1` crea la etiqueta, activa GitHub Actions,
+espera la publicación y puede adjuntar archivos al Release. Requiere
+[GitHub CLI](https://cli.github.com/) con una sesión iniciada mediante
+`gh auth login`.
+
+Para publicar la compilación Windows existente:
+
+```powershell
+.\scripts\publish-release.ps1 v1.5.0 -PackageWindows
+```
+
+Para adjuntar uno o varios instaladores específicos:
+
+```powershell
+.\scripts\publish-release.ps1 v1.5.0 `
+  -AssetPath .\dist\Sehcontrol-Setup.exe, .\dist\Sehcontrol.msi
+```
+
+Antes de ejecutarlo, la rama `master` debe estar limpia y completamente
+publicada. El script detecta los remotos `sehcontrol` u `origin` y verifica que
+apunten a este repositorio. Las credenciales se administran mediante GitHub CLI
+y nunca se guardan en el código.
+
 ## Compilación
 
 ### Interfaz Flutter
@@ -134,4 +159,3 @@ base para esta adaptación.
 El uso, modificación y distribución de este código debe respetar las licencias
 aplicables del proyecto RustDesk y de cada dependencia incluida. Los nombres,
 marcas y recursos propios de Sehcontrol pertenecen a sus respectivos titulares.
-
