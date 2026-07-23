@@ -46,6 +46,20 @@ def system2(cmd):
         sys.exit(-1)
 
 
+def archive_binary(path):
+    """Copies a built installer/binary into ./binarios (repo root) so it
+    survives cleanup of the root-level output file between builds. Never
+    raises: a failed copy shouldn't fail the whole build."""
+    try:
+        binarios_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'binarios')
+        os.makedirs(binarios_dir, exist_ok=True)
+        dest = os.path.join(binarios_dir, os.path.basename(path))
+        shutil.copy2(path, dest)
+        print(f'archived to: {dest}')
+    except Exception as e:
+        print(f'Warning: failed to archive {path} to binarios/: {e}')
+
+
 def get_version():
     with open("Cargo.toml", encoding="utf-8") as fh:
         for line in fh:
@@ -466,6 +480,7 @@ def build_flutter_windows(version, features, skip_portable_pack):
     os.rename('./rustdesk_portable.exe', f'./sehcontrol-{version}-install.exe')
     print(
         f'output location: {os.path.abspath(os.curdir)}/sehcontrol-{version}-install.exe')
+    archive_binary(f'./sehcontrol-{version}-install.exe')
 
 
 def main():
