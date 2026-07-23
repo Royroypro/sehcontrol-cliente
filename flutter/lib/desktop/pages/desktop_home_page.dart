@@ -422,8 +422,14 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                 children: [
                   const Icon(Icons.star, color: Colors.amber, size: 18),
                   const SizedBox(width: 6),
-                  Text(planName,
-                      style: const TextStyle(fontWeight: FontWeight.w700)),
+                  Expanded(
+                    child: Text(
+                      planName,
+                      style: const TextStyle(fontWeight: FontWeight.w700),
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
                 ],
               ),
               const SizedBox(height: 6),
