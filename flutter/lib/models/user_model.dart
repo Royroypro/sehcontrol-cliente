@@ -14,6 +14,22 @@ import 'model.dart';
 import 'platform_model.dart';
 
 bool refreshingUser = false;
+const _trustedServerKeyOption = 'trusted-server-key';
+const _trustedServerKeyFingerprintOption = 'trusted-server-key-fingerprint';
+
+class ServerNotification {
+  final String id;
+  final String title;
+  final String message;
+  final DateTime receivedAt;
+
+  const ServerNotification({
+    required this.id,
+    required this.title,
+    required this.message,
+    required this.receivedAt,
+  });
+}
 
 class UserModel {
   final RxString userName = ''.obs;
@@ -31,9 +47,11 @@ class UserModel {
   final Rx<DateTime?> membershipExpiresAt = Rx<DateTime?>(null);
   final RxnInt membershipDeviceCount = RxnInt();
   final RxnInt membershipMaxDevices = RxnInt();
-  // Notification-bell badge count; every new message bumps it, opening the
-  // bell just clears it back to 0 (no persistent inbox yet).
+  // Messages received during this session. The server notification is acked
+  // immediately, so retain its content locally for the notification bell.
   final RxInt unreadNotificationCount = 0.obs;
+  final RxList<ServerNotification> notifications = <ServerNotification>[].obs;
+  final Set<String> _seenNotificationIds = {};
   Timer? _membershipTimer;
   WebSocketChannel? _realtimeChannel;
   Timer? _realtimePingTimer;
@@ -143,12 +161,18 @@ class UserModel {
     membershipExpiresAt.value = null;
     membershipDeviceCount.value = null;
     membershipMaxDevices.value = null;
-    unreadNotificationCount.value = 0;
+    clearNotifications();
     disconnectRealtimeChannel();
   }
 
   void clearUnreadNotifications() {
     unreadNotificationCount.value = 0;
+  }
+
+  void clearNotifications() {
+    notifications.clear();
+    _seenNotificationIds.clear();
+    clearUnreadNotifications();
   }
 
   /// throw nothing: failures (no server, offline, non-200, bad json) are
@@ -167,19 +191,33 @@ class UserModel {
     }
   }
 
-  void _applyMembershipStatus(Map data) {
-    membershipBlocked.value = data['blocked'] == true;
-    membershipMessage.value = (data['message'] ?? '').toString();
-    final daysLeft = data['days_left'];
-    membershipDaysLeft.value = daysLeft is int ? daysLeft : null;
-    membershipPlanName.value = (data['plan_name'] ?? '').toString();
-    final deviceCount = data['device_count'];
-    membershipDeviceCount.value = deviceCount is int ? deviceCount : null;
-    final maxDevices = data['max_devices'];
-    membershipMaxDevices.value = maxDevices is int ? maxDevices : null;
-    final expiresAtRaw = data['plan_expires_at'];
-    membershipExpiresAt.value =
-        expiresAtRaw is String ? DateTime.tryParse(expiresAtRaw) : null;
+  void _applyMembershipStatus(Map data, {bool partial = false}) {
+    if (!partial || data.containsKey('blocked')) {
+      membershipBlocked.value = data['blocked'] == true;
+    }
+    if (!partial || data.containsKey('message')) {
+      membershipMessage.value = (data['message'] ?? '').toString();
+    }
+    if (!partial || data.containsKey('days_left')) {
+      final daysLeft = data['days_left'];
+      membershipDaysLeft.value = daysLeft is int ? daysLeft : null;
+    }
+    if (!partial || data.containsKey('plan_name')) {
+      membershipPlanName.value = (data['plan_name'] ?? '').toString();
+    }
+    if (!partial || data.containsKey('device_count')) {
+      final deviceCount = data['device_count'];
+      membershipDeviceCount.value = deviceCount is int ? deviceCount : null;
+    }
+    if (!partial || data.containsKey('max_devices')) {
+      final maxDevices = data['max_devices'];
+      membershipMaxDevices.value = maxDevices is int ? maxDevices : null;
+    }
+    if (!partial || data.containsKey('plan_expires_at')) {
+      final expiresAtRaw = data['plan_expires_at'];
+      membershipExpiresAt.value =
+          expiresAtRaw is String ? DateTime.tryParse(expiresAtRaw) : null;
+    }
   }
 
   /// Polls unread admin/system messages (expiry warnings, suspension
@@ -192,8 +230,7 @@ class UserModel {
     try {
       final url = await bind.mainGetApiServer();
       if (url.trim().isEmpty) return;
-      final resp = await http.get(
-          Uri.parse('$url/api/messages?unread=1'),
+      final resp = await http.get(Uri.parse('$url/api/messages?unread=1'),
           headers: getHttpHeaders());
       if (resp.statusCode != 200) return;
       final data = jsonDecode(decode_http_response(resp));
@@ -211,12 +248,26 @@ class UserModel {
     final title = (item['title'] ?? '').toString();
     final message = (item['message'] ?? '').toString();
     if (message.isEmpty) return;
+    final id = (item['id'] ?? '').toString();
+    if (id.isNotEmpty && !_seenNotificationIds.add(id)) return;
+    notifications.insert(
+      0,
+      ServerNotification(
+        id: id,
+        title: title,
+        message: message,
+        receivedAt: DateTime.now(),
+      ),
+    );
+    if (notifications.length > 50) {
+      notifications.removeRange(50, notifications.length);
+    }
     showToast(title.isEmpty ? message : '$title\n$message',
         timeout: const Duration(seconds: 5));
     unreadNotificationCount.value++;
-    final id = item['id'];
-    if (id != null) {
-      unawaited(_ackMessage(id));
+    final rawId = item['id'];
+    if (rawId != null) {
+      unawaited(_ackMessage(rawId));
     }
   }
 
@@ -258,8 +309,7 @@ class UserModel {
           cancelOnError: true,
         );
         _realtimePingTimer?.cancel();
-        _realtimePingTimer =
-            Timer.periodic(const Duration(seconds: 30), (_) {
+        _realtimePingTimer = Timer.periodic(const Duration(seconds: 30), (_) {
           try {
             _realtimeChannel?.sink.add('ping');
           } catch (e) {
@@ -303,8 +353,11 @@ class UserModel {
         case 'connected':
         case 'pong':
           break;
+        case 'server_key_changed':
+          unawaited(_refreshAndApplyServerKey());
+          break;
         case 'membership_status':
-          if (data is Map) _applyMembershipStatus(data);
+          if (data is Map) _applyMembershipStatus(data, partial: true);
           break;
         case 'message':
           if (data is Map) _showMessageAndAck(data);
@@ -312,6 +365,56 @@ class UserModel {
       }
     } catch (e) {
       debugPrint('Failed to handle realtime event: $e');
+    }
+  }
+
+  Future<void> _refreshAndApplyServerKey() async {
+    try {
+      final apiUrl = Uri.parse(await bind.mainGetApiServer());
+      if (apiUrl.scheme != 'https') {
+        debugPrint('Rejected server key rotation over non-HTTPS API');
+        return;
+      }
+      final uri = apiUrl.resolve('/api/public/server-key');
+      final resp = await http.get(uri);
+      if (resp.statusCode != 200) {
+        debugPrint('Server key refresh failed: HTTP ${resp.statusCode}');
+        return;
+      }
+      final decoded = jsonDecode(decode_http_response(resp));
+      if (decoded is! Map) return;
+      final payload =
+          decoded['server_key'] is Map ? decoded['server_key'] as Map : decoded;
+      if (payload['algorithm'] != 'Ed25519') {
+        debugPrint('Rejected server key with unsupported algorithm');
+        return;
+      }
+      final publicKey = (payload['public_key'] ?? '').toString().trim();
+      final expectedFingerprint =
+          (payload['fingerprint_sha256'] ?? '').toString().trim().toLowerCase();
+      if (!RegExp(r'^[0-9a-f]{64}$').hasMatch(expectedFingerprint)) {
+        debugPrint('Rejected server key with invalid SHA-256 fingerprint');
+        return;
+      }
+      final keyBytes = base64Decode(publicKey);
+      if (keyBytes.length != 32) {
+        debugPrint('Rejected invalid Ed25519 public key length');
+        return;
+      }
+      final currentKey = await bind.mainGetOption(key: 'key');
+      if (currentKey == publicKey) return;
+
+      await bind.mainSetOption(
+          key: _trustedServerKeyOption,
+          value: jsonEncode({
+            'public_key': publicKey,
+            'fingerprint_sha256': expectedFingerprint,
+          }));
+      await bind.mainSetLocalOption(
+          key: _trustedServerKeyFingerprintOption, value: expectedFingerprint);
+      debugPrint('Trusted server key rotated successfully');
+    } catch (e) {
+      debugPrint('Failed to rotate trusted server key: $e');
     }
   }
 

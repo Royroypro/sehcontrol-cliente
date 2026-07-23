@@ -459,6 +459,9 @@ def build_flutter_windows(version, features, skip_portable_pack):
             exit(-1)
     os.chdir('flutter')
     system2('flutter build windows --release')
+    system2(
+        f'powershell -NoProfile -ExecutionPolicy Bypass -File '
+        f'../scripts/fetch_printer_driver.ps1 -Architecture {win_arch}')
     os.chdir('..')
     shutil.copy2('target/release/deps/dylib_virtual_display.dll',
                  flutter_build_dir_2)

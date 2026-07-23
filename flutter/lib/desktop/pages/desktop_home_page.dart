@@ -82,7 +82,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                   children: [
                     buildLeftPane(context),
                     if (!isIncomingOnly) const VerticalDivider(width: 1),
-                    if (!isIncomingOnly) Expanded(child: buildRightPane(context)),
+                    if (!isIncomingOnly)
+                      Expanded(child: buildRightPane(context)),
                   ],
                 ),
               ),
@@ -135,22 +136,28 @@ class _DesktopHomePageState extends State<DesktopHomePage>
           const SizedBox(width: 8),
           _HeaderNavButton(
             icon: Icons.devices_other_outlined,
-            title: translate('Accessible devices'),
-            onTap: () =>
-                gFFI.peerTabModel.setCurrentTab(PeerTabIndex.group.index),
+            title: translate('My Devices'),
+            // Jumps to the Address Book tab (Cabinas/Clientes) rather than
+            // the RustDesk "Grupo" tab: the latter needs /api/users,
+            // /api/peers and /api/device-group/accessible, which the
+            // Sehcontrol server doesn't implement (404s), while the address
+            // book already works against the existing /api/ab/* endpoints.
+            onTap: () {
+              gFFI.abModel.selectedTags.clear();
+              gFFI.peerTabModel.setCurrentTab(PeerTabIndex.ab.index);
+            },
           ),
           const Spacer(),
           IconButton(
             tooltip: translate('Help'),
             icon: const Icon(Icons.help_outline),
-            onPressed: () =>
-                launchUrl(Uri.parse('https://sehcontrol.sehuacho.com')),
+            onPressed: () => launchUrl(Uri.parse(kSehcontrolHelpUrl)),
           ),
           IconButton(
             tooltip: translate('Notifications'),
             icon: unreadTopRightBuilder(gFFI.userModel.unreadNotificationCount,
                 icon: const Icon(Icons.notifications_outlined)),
-            onPressed: () => gFFI.userModel.clearUnreadNotifications(),
+            onPressed: () => _showNotificationsDialog(context),
           ),
           IconButton(
             tooltip: translate('Settings'),
@@ -160,6 +167,79 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                 DesktopSettingPage.switch2page(DesktopSettingPage.tabKeys[0]);
               }
             },
+          ),
+        ],
+      ),
+    );
+  }
+
+  Future<void> _showNotificationsDialog(BuildContext context) async {
+    gFFI.userModel.clearUnreadNotifications();
+    await showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Row(
+          children: [
+            const Icon(Icons.notifications_outlined),
+            const SizedBox(width: 8),
+            Text(translate('Notifications')),
+          ],
+        ),
+        content: SizedBox(
+          width: 440,
+          height: 400,
+          child: Obx(() {
+            final notifications = gFFI.userModel.notifications;
+            if (notifications.isEmpty) {
+              return const Padding(
+                padding: EdgeInsets.symmetric(vertical: 24),
+                child: Text(
+                  'No hay notificaciones',
+                  textAlign: TextAlign.center,
+                ),
+              );
+            }
+            return ListView.separated(
+              shrinkWrap: true,
+              itemCount: notifications.length,
+              separatorBuilder: (_, __) => const Divider(),
+              itemBuilder: (_, index) {
+                final notification = notifications[index];
+                final time = TimeOfDay.fromDateTime(notification.receivedAt)
+                    .format(dialogContext);
+                return ListTile(
+                  contentPadding: EdgeInsets.zero,
+                  leading: const Icon(Icons.campaign_outlined),
+                  title: notification.title.isEmpty
+                      ? null
+                      : Text(notification.title,
+                          style: const TextStyle(fontWeight: FontWeight.w600)),
+                  subtitle: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(notification.message),
+                      const SizedBox(height: 4),
+                      Text(
+                        time,
+                        style: Theme.of(dialogContext).textTheme.bodySmall,
+                      ),
+                    ],
+                  ),
+                );
+              },
+            );
+          }),
+        ),
+        actions: [
+          Obx(() => TextButton(
+                onPressed: gFFI.userModel.notifications.isEmpty
+                    ? null
+                    : gFFI.userModel.clearNotifications,
+                child: Text(translate('Clear')),
+              )),
+          TextButton(
+            onPressed: () => Navigator.of(dialogContext).pop(),
+            child: Text(translate('Close')),
           ),
         ],
       ),
@@ -375,8 +455,10 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                               : translate('connecting_status'),
                       style: const TextStyle(fontWeight: FontWeight.w600),
                     )),
-                row(translate('Encryption'), const Text('AES-256',
-                    style: TextStyle(fontWeight: FontWeight.w600))),
+                row(
+                    translate('Encryption'),
+                    const Text('AES-256',
+                        style: TextStyle(fontWeight: FontWeight.w600))),
               ],
             )),
       ),
@@ -407,7 +489,8 @@ class _DesktopHomePageState extends State<DesktopHomePage>
               mainAxisAlignment: MainAxisAlignment.spaceBetween,
               children: [
                 Text(label, style: Theme.of(context).textTheme.bodySmall),
-                Text(value, style: const TextStyle(fontWeight: FontWeight.w600)),
+                Text(value,
+                    style: const TextStyle(fontWeight: FontWeight.w600)),
               ],
             ),
           );
@@ -435,8 +518,11 @@ class _DesktopHomePageState extends State<DesktopHomePage>
               const SizedBox(height: 6),
               row(translate('Expires'), expiresText),
               if (deviceCount != null)
-                row(translate('Devices'),
-                    maxDevices != null ? '$deviceCount / $maxDevices' : '$deviceCount'),
+                row(
+                    translate('Devices'),
+                    maxDevices != null
+                        ? '$deviceCount / $maxDevices'
+                        : '$deviceCount'),
             ],
           ),
         ),
@@ -469,8 +555,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
             SizedBox(
               width: double.infinity,
               child: ElevatedButton(
-                onPressed: () =>
-                    launchUrl(Uri.parse('https://sehcontrol.sehuacho.com')),
+                onPressed: () => launchUrl(Uri.parse(kSehcontrolWebsiteUrl)),
                 child: Text(translate('Upgrade now')),
               ),
             ),
@@ -662,16 +747,17 @@ class _DesktopHomePageState extends State<DesktopHomePage>
             children: [
               if (!isOutgoingOnly)
                 Align(
-                  alignment: Alignment.centerLeft,
+                  alignment: Alignment.center,
                   child: Text(
                     translate("Your Desktop"),
+                    textAlign: TextAlign.center,
                     style: Theme.of(context).textTheme.titleLarge,
                   ),
                 ),
               const SizedBox(width: 8),
               TextButton(
                 onPressed: () {
-                  launchUrl(Uri.parse('https://sehcontrol.sehuacho.com'));
+                  launchUrl(Uri.parse(kSehcontrolWebsiteUrl));
                 },
                 child: Text(
                   translate("Website"),

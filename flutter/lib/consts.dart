@@ -4,6 +4,12 @@ import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/models/state_model.dart';
 import 'package:get/get.dart';
 
+const String kSehcontrolWebsiteUrl = 'https://sehcontrol.sehuacho.com';
+const String kSehcontrolHelpUrl = '$kSehcontrolWebsiteUrl/ayuda';
+const String kSehcontrolMoreInformationUrl =
+    '$kSehcontrolWebsiteUrl/mas-informacion';
+const String kSehcontrolPrivacyUrl = '$kSehcontrolWebsiteUrl/privacy.html';
+
 const int kMaxVirtualDisplayCount = 4;
 const int kAllVirtualDisplay = -1;
 
@@ -148,8 +154,7 @@ const String kOptionRemoteMenubarDragLeft = "remote-menubar-drag-left";
 const String kOptionRemoteMenubarDragRight = "remote-menubar-drag-right";
 const String kOptionRemoteMenubarEdge = "remote-menubar-edge";
 const String kOptionRemoteMenubarFraction = "remote-menubar-frac";
-const String kOptionAllowMultiEdgeToolbarDock =
-    "allow-multi-edge-toolbar-dock";
+const String kOptionAllowMultiEdgeToolbarDock = "allow-multi-edge-toolbar-dock";
 const String kOptionHideAbTagsPanel = "hideAbTagsPanel";
 const String kOptionRemoteMenubarState = "remoteMenubarState";
 const String kOptionPeerSorting = "peer-sorting";
@@ -174,9 +179,12 @@ const String kOptionShowVirtualMouse = "show-virtual-mouse";
 const String kOptionVirtualMouseScale = "virtual-mouse-scale";
 const String kOptionShowVirtualJoystick = "show-virtual-joystick";
 const String kOptionAllowAskForNoteAtEndOfConnection = "allow-ask-for-note";
-const String kOptionAllowMonitorSwitchMainToolbar = "allow-monitor-switch-main-toolbar";
-const String kOptionAllowMonitorSwitchMinToolbar = "allow-monitor-switch-min-toolbar";
-const String kOptionEnableShowTerminalExtraKeys = "enable-show-terminal-extra-keys";
+const String kOptionAllowMonitorSwitchMainToolbar =
+    "allow-monitor-switch-main-toolbar";
+const String kOptionAllowMonitorSwitchMinToolbar =
+    "allow-monitor-switch-min-toolbar";
+const String kOptionEnableShowTerminalExtraKeys =
+    "enable-show-terminal-extra-keys";
 
 // network options
 const String kOptionAllowWebSocket = "allow-websocket";
@@ -211,8 +219,10 @@ const String kOptionDisableFloatingWindow = "disable-floating-window";
 
 const String kOptionKeepScreenOn = "keep-screen-on";
 
-const String kOptionKeepAwakeDuringIncomingSessions = "keep-awake-during-incoming-sessions";
-const String kOptionKeepAwakeDuringOutgoingSessions = "keep-awake-during-outgoing-sessions";
+const String kOptionKeepAwakeDuringIncomingSessions =
+    "keep-awake-during-incoming-sessions";
+const String kOptionKeepAwakeDuringOutgoingSessions =
+    "keep-awake-during-outgoing-sessions";
 
 const String kOptionShowMobileAction = "showMobileActions";
 

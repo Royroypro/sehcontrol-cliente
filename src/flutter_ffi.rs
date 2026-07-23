@@ -974,6 +974,26 @@ pub fn main_show_option(_key: String) -> SyncReturn<bool> {
 }
 
 pub fn main_set_option(key: String, value: String) {
+    if key == config::TRUSTED_SERVER_KEY_OPTION {
+        let payload = serde_json::from_str::<serde_json::Value>(&value).ok();
+        let public_key = payload
+            .as_ref()
+            .and_then(|value| value.get("public_key"))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        let fingerprint = payload
+            .as_ref()
+            .and_then(|value| value.get("fingerprint_sha256"))
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        if config::Config::set_trusted_server_key(public_key.to_owned(), fingerprint) {
+            crate::ui_interface::set_options(config::Config::get_options());
+            crate::rendezvous_mediator::RendezvousMediator::restart();
+        } else {
+            log::error!("Rejected invalid trusted server key");
+        }
+        return;
+    }
     #[cfg(target_os = "android")]
     {
         let is_permission_option = key.eq(config::keys::OPTION_ENABLE_CLIPBOARD)

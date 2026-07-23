@@ -1950,7 +1950,12 @@ pub async fn io_loop<T: InvokeUiSession>(handler: Session<T>, round: u32) {
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     let (sender, mut receiver) = mpsc::unbounded_channel::<Data>();
     *handler.sender.write().unwrap() = Some(sender.clone());
-    let token = LocalConfig::get_option("access_token");
+    // The membership API token is only valid for HTTP/WebSocket requests.
+    // Passing it to an OSS hbbs makes the client enter the Server Pro
+    // secure-first flow, while OSS hbbs waits for PunchHoleRequest first.
+    // Keep the credentials separate so a future Pro deployment can provide
+    // its rendezvous token explicitly without exposing the membership token.
+    let token = LocalConfig::get_option("rendezvous_access_token");
     let key = crate::get_key(false).await;
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     if handler.is_port_forward() {

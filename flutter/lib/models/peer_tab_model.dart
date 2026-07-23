@@ -42,7 +42,9 @@ class PeerTabModel with ChangeNotifier {
     true,
     !isWeb && bind.mainGetLocalOption(key: "disable-discovery-panel") != "Y",
     !(bind.isDisableAb() || bind.isDisableAccount()),
-    !(bind.isDisableGroupPanel() || bind.isDisableAccount()),
+    // Sehcontrol's managed devices come from /api/ab/*. The RustDesk Pro
+    // group endpoints are not available on the Sehcontrol server.
+    false,
   ]);
   final List<bool> _isVisible = List.filled(maxTabCount, true, growable: false);
   List<bool> get isVisibleEnabled => () {

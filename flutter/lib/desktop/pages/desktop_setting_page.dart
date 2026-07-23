@@ -401,8 +401,7 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
                   translate(tab.label),
                   style: TextStyle(
                       color: selected ? _accentColor : null,
-                      fontWeight:
-                          selected ? FontWeight.w600 : FontWeight.w400,
+                      fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
                       fontSize: _kContentFontSize),
                 ),
               ]),
@@ -1674,6 +1673,12 @@ class _NetworkState extends State<_Network> with AutomaticKeepAliveClientMixin {
         isWeb || bind.mainGetBuildinOption(key: kOptionHideProxySetting) == 'Y';
     final hideWebSocket = isWeb ||
         bind.mainGetBuildinOption(key: kOptionHideWebSocketSetting) == 'Y';
+    final serverConfigFixed = [
+      'custom-rendezvous-server',
+      'relay-server',
+      'api-server',
+      'key',
+    ].every((key) => isOptionFixed(key) == true);
 
     if (hideServer && hideProxy && hideWebSocket) {
       return Offstage();
@@ -1687,6 +1692,7 @@ class _NetworkState extends State<_Network> with AutomaticKeepAliveClientMixin {
       Widget? trailing,
       bool showTooltip = false,
       String tooltipMessage = '',
+      bool enabled = true,
     }) {
       final titleWidget = showTooltip
           ? Row(
@@ -1723,8 +1729,8 @@ class _NetworkState extends State<_Network> with AutomaticKeepAliveClientMixin {
       return ListTile(
         leading: Icon(icon, color: _accentColor),
         title: titleWidget,
-        enabled: !locked,
-        onTap: onTap,
+        enabled: !locked && enabled,
+        onTap: enabled ? onTap : null,
         trailing: trailing,
         shape: RoundedRectangleBorder(
           borderRadius: BorderRadius.circular(10),
@@ -1767,6 +1773,10 @@ class _NetworkState extends State<_Network> with AutomaticKeepAliveClientMixin {
                 listTile(
                   icon: Icons.dns_outlined,
                   title: 'ID/Relay Server',
+                  enabled: !serverConfigFixed,
+                  trailing: serverConfigFixed
+                      ? const Icon(Icons.lock_outline, size: 18)
+                      : null,
                   onTap: () => showServerSettings(gFFI.dialogManager, setState),
                 ),
               if (!hideProxy && !hideServer) divider,
@@ -2124,7 +2134,9 @@ class _AccountState extends State<_Account> {
     return ListView(
       controller: scrollController,
       children: [
-        _Card(title: 'Account', children: [accountAction(), useInfo(), membershipInfo()]),
+        _Card(
+            title: 'Account',
+            children: [accountAction(), useInfo(), membershipInfo()]),
       ],
     ).marginOnly(bottom: _kListViewBottomMargin);
   }
@@ -2547,8 +2559,7 @@ class _AboutState extends State<_About> {
                         .marginSymmetric(vertical: 4.0)),
               InkWell(
                   onTap: () {
-                    launchUrlString(
-                        'https://sehcontrol.sehuacho.com/privacy.html');
+                    launchUrlString(kSehcontrolPrivacyUrl);
                   },
                   child: Text(
                     translate('Privacy Statement'),
@@ -2556,7 +2567,7 @@ class _AboutState extends State<_About> {
                   ).marginSymmetric(vertical: 4.0)),
               InkWell(
                   onTap: () {
-                    launchUrlString('https://sehcontrol.sehuacho.com');
+                    launchUrlString(kSehcontrolWebsiteUrl);
                   },
                   child: Text(
                     translate('Website'),

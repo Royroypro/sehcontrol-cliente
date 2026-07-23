@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../../common.dart';
+import '../../consts.dart';
 
 class SupportSidebarBlock extends StatelessWidget {
   const SupportSidebarBlock({super.key});
@@ -14,7 +15,6 @@ class SupportSidebarBlock extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     const whatsapp = '51948793154'; // sin +
-    const web = 'https://sehcontrol.sehuacho.com';
 
     return Padding(
       padding: const EdgeInsets.fromLTRB(10, 8, 10, 12),
@@ -41,7 +41,7 @@ class SupportSidebarBlock extends StatelessWidget {
             iconColor: MyTheme.accent,
             title: 'Web',
             subtitle: 'sehcontrol.sehuacho.com',
-            onTap: () => _open(web),
+            onTap: () => _open(kSehcontrolWebsiteUrl),
           ),
         ],
       ),

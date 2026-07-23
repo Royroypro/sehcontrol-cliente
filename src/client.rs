@@ -452,6 +452,12 @@ let nat_type = if interface.is_force_relay() {
 
 if !key.is_empty() && !token.is_empty() {
     // mainly for the security of token
+    log::info!(
+        "Secure rendezvous protocol: client_version={}, server={}, initial_application_bytes=0; \
+         waiting for server KeyExchange before sending PunchHoleRequest",
+        crate::VERSION,
+        rendezvous_server
+    );
     secure_tcp(&mut socket, &key)
         .await
         .map_err(|e| anyhow!("Failed to secure tcp: {}", e))?;

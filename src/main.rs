@@ -16,11 +16,7 @@ fn main() {
     common::global_clean();
 }
 
-#[cfg(not(any(
-    target_os = "android",
-    target_os = "ios",
-    feature = "flutter"
-)))]
+#[cfg(not(any(target_os = "android", target_os = "ios", feature = "flutter")))]
 fn main() {
     #[cfg(all(windows, not(feature = "inline")))]
     unsafe {

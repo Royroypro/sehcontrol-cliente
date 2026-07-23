@@ -19,7 +19,10 @@ fn get_printer_name(app_name: &str) -> Vec<u16> {
 
 #[cfg(target_os = "windows")]
 fn get_driver_name() -> Vec<u16> {
-    "Sehcontrol v4 Printer Driver"
+    // This must match the signed driver's model name in
+    // RustDeskPrinterDriver.inf. Changing it would invalidate the package
+    // signature and makes AddPrinterW fail with ERROR_UNKNOWN_PRINTER_DRIVER.
+    "RustDesk v4 Printer Driver"
         .encode_utf16()
         .chain(Some(0))
         .collect()

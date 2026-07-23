@@ -70,7 +70,7 @@ pub fn install_update_printer(app_name: &str) -> ResultType<()> {
     };
 
     if should_install_driver {
-        allow_err!(install_driver(&rd_printer_driver_name, inf_file.as_ptr()));
+        install_driver(&rd_printer_driver_name, inf_file.as_ptr())?;
     }
 
     add_printer(&rd_printer_name, &rd_printer_driver_name, &rd_printer_port)?;

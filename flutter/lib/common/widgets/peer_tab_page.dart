@@ -135,12 +135,11 @@ class _PeerTabPageState extends State<PeerTabPage>
     );
   }
 
-  /// "Todos"/"Mis equipos" are display-only relabels of the existing
-  /// Recent/Group tabs (there's no unified "all devices" pool today; Recent
-  /// is the closest approximation). Other tabs keep their existing names.
+  /// Sehcontrol stores managed devices in the address book. Its server does
+  /// not expose RustDesk Pro's device-group endpoints.
   String _tabLabel(PeerTabModel model, int t) {
     if (t == PeerTabIndex.recent.index) return translate('All');
-    if (t == PeerTabIndex.group.index) return translate('My Devices');
+    if (t == PeerTabIndex.ab.index) return translate('My Devices');
     return model.tabTooltip(t);
   }
 

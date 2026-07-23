@@ -1952,6 +1952,35 @@ pub fn check_process(arg: &str, mut same_uid: bool) -> bool {
     false
 }
 
+fn rendezvous_message_type(union: &rendezvous_message::Union) -> &'static str {
+    match union {
+        rendezvous_message::Union::RegisterPeer(_) => "RegisterPeer",
+        rendezvous_message::Union::RegisterPeerResponse(_) => "RegisterPeerResponse",
+        rendezvous_message::Union::PunchHoleRequest(_) => "PunchHoleRequest",
+        rendezvous_message::Union::PunchHole(_) => "PunchHole",
+        rendezvous_message::Union::PunchHoleSent(_) => "PunchHoleSent",
+        rendezvous_message::Union::PunchHoleResponse(_) => "PunchHoleResponse",
+        rendezvous_message::Union::FetchLocalAddr(_) => "FetchLocalAddr",
+        rendezvous_message::Union::LocalAddr(_) => "LocalAddr",
+        rendezvous_message::Union::ConfigureUpdate(_) => "ConfigureUpdate",
+        rendezvous_message::Union::RegisterPk(_) => "RegisterPk",
+        rendezvous_message::Union::RegisterPkResponse(_) => "RegisterPkResponse",
+        rendezvous_message::Union::SoftwareUpdate(_) => "SoftwareUpdate",
+        rendezvous_message::Union::RequestRelay(_) => "RequestRelay",
+        rendezvous_message::Union::RelayResponse(_) => "RelayResponse",
+        rendezvous_message::Union::TestNatRequest(_) => "TestNatRequest",
+        rendezvous_message::Union::TestNatResponse(_) => "TestNatResponse",
+        rendezvous_message::Union::PeerDiscovery(_) => "PeerDiscovery",
+        rendezvous_message::Union::OnlineRequest(_) => "OnlineRequest",
+        rendezvous_message::Union::OnlineResponse(_) => "OnlineResponse",
+        rendezvous_message::Union::KeyExchange(_) => "KeyExchange",
+        rendezvous_message::Union::Hc(_) => "HealthCheck",
+        rendezvous_message::Union::HttpProxyRequest(_) => "HttpProxyRequest",
+        rendezvous_message::Union::HttpProxyResponse(_) => "HttpProxyResponse",
+        _ => "Unknown",
+    }
+}
+
 async fn secure_tcp_impl(conn: &mut Stream, key: &str, log_on_success: bool) -> ResultType<()> {
     // Skip additional encryption when using WebSocket connections (wss://)
     // as WebSocket Secure (wss://) already provides transport layer encryption.
@@ -1964,36 +1993,54 @@ async fn secure_tcp_impl(conn: &mut Stream, key: &str, log_on_success: bool) -> 
     let Some(rs_pk) = rs_pk else {
         bail!("Handshake failed: invalid public key from rendezvous server");
     };
-    match timeout(READ_TIMEOUT, conn.next()).await? {
+    log::info!("Secure rendezvous handshake: waiting for server KeyExchange as first protobuf");
+    match timeout(READ_TIMEOUT, conn.next())
+        .await
+        .context("Timed out waiting for server KeyExchange as first protobuf")?
+    {
         Some(Ok(bytes)) => {
-            if let Ok(msg_in) = RendezvousMessage::parse_from_bytes(&bytes) {
-                match msg_in.union {
-                    Some(rendezvous_message::Union::KeyExchange(ex)) => {
-                        if ex.keys.len() != 1 {
-                            bail!("Handshake failed: invalid key exchange message");
-                        }
-                        let their_pk_b = sign::verify(&ex.keys[0], &rs_pk)
-                            .map_err(|_| anyhow!("Signature mismatch in key exchange"))?;
-                        let (asymmetric_value, symmetric_value, key) = create_symmetric_key_msg(
-                            get_pk(&their_pk_b)
-                                .context("Wrong their public length in key exchange")?,
-                        );
-                        let mut msg_out = RendezvousMessage::new();
-                        msg_out.set_key_exchange(KeyExchange {
-                            keys: vec![asymmetric_value, symmetric_value],
-                            ..Default::default()
-                        });
-                        timeout(CONNECT_TIMEOUT, conn.send(&msg_out)).await??;
-                        conn.set_key(key);
-                        if log_on_success {
-                            log::info!("Connection secured");
-                        }
+            let msg_in = RendezvousMessage::parse_from_bytes(&bytes)
+                .context("Handshake failed: first server frame is not a RendezvousMessage")?;
+            let Some(union) = msg_in.union else {
+                bail!("Handshake failed: first server protobuf has no message type");
+            };
+            let message_type = rendezvous_message_type(&union);
+            log::info!(
+                "Secure rendezvous handshake: received first protobuf type={}, frame_bytes={}",
+                message_type,
+                bytes.len()
+            );
+            match union {
+                rendezvous_message::Union::KeyExchange(ex) => {
+                    if ex.keys.len() != 1 {
+                        bail!("Handshake failed: invalid key exchange message");
                     }
-                    _ => {}
+                    let their_pk_b = sign::verify(&ex.keys[0], &rs_pk)
+                        .map_err(|_| anyhow!("Signature mismatch in key exchange"))?;
+                    let (asymmetric_value, symmetric_value, key) = create_symmetric_key_msg(
+                        get_pk(&their_pk_b).context("Wrong their public length in key exchange")?,
+                    );
+                    let mut msg_out = RendezvousMessage::new();
+                    msg_out.set_key_exchange(KeyExchange {
+                        keys: vec![asymmetric_value, symmetric_value],
+                        ..Default::default()
+                    });
+                    timeout(CONNECT_TIMEOUT, conn.send(&msg_out)).await??;
+                    conn.set_key(key);
+                    if log_on_success {
+                        log::info!("Connection secured");
+                    }
                 }
+                _ => bail!(
+                    "Handshake failed: expected KeyExchange as first protobuf, received {}",
+                    message_type
+                ),
             }
         }
-        _ => {}
+        Some(Err(err)) => {
+            bail!("Handshake failed while reading server KeyExchange: {}", err);
+        }
+        None => bail!("Handshake failed: server closed before sending KeyExchange"),
     }
     Ok(())
 }

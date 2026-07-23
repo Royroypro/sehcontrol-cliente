@@ -211,7 +211,8 @@ pub fn use_texture_render() -> bool {
 
 #[inline]
 pub fn is_option_fixed(key: &str) -> bool {
-    config::OVERWRITE_DISPLAY_SETTINGS
+    config::locked_server_option(key).is_some()
+        || config::OVERWRITE_DISPLAY_SETTINGS
         .read()
         .unwrap()
         .contains_key(key)
@@ -420,6 +421,10 @@ pub fn set_options(m: HashMap<String, String>) {
 
 #[inline]
 pub fn set_option(key: String, value: String) {
+    if config::locked_server_option(&key).is_some() {
+        log::warn!("Ignoring an attempt to change locked server option: {key}");
+        return;
+    }
     if &key == "stop-service" {
         #[cfg(target_os = "macos")]
         {

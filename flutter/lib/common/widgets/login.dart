@@ -267,8 +267,7 @@ class _WidgetOPState extends State<WidgetOP> {
                   Padding(
                     padding: const EdgeInsets.only(top: 8.0),
                     child: Builder(builder: (context) {
-                      final errorColor =
-                          Theme.of(context).colorScheme.error;
+                      final errorColor = Theme.of(context).colorScheme.error;
                       final bgColor = Theme.of(context)
                           .colorScheme
                           .errorContainer
@@ -289,12 +288,11 @@ class _WidgetOPState extends State<WidgetOP> {
                             Flexible(
                               child: SelectableText(
                                 translate(_failedMsg),
-                                style: DefaultTextStyle.of(context)
-                                    .style
-                                    .copyWith(
-                                      fontSize: 13,
-                                      color: errorColor,
-                                    ),
+                                style:
+                                    DefaultTextStyle.of(context).style.copyWith(
+                                          fontSize: 13,
+                                          color: errorColor,
+                                        ),
                               ),
                             ),
                           ],
@@ -452,6 +450,127 @@ class LoginWidgetUserPass extends StatelessWidget {
 
 const kAuthReqTypeOidc = 'oidc/';
 
+Widget _buildUpgradePlansPanel(BuildContext context, VoidCallback onBack) {
+  const plansUrl = 'https://sehcontrol.sehuacho.com/actualizar-planes';
+  final mutedColor =
+      Theme.of(context).textTheme.bodyMedium?.color?.withValues(alpha: 0.72);
+
+  Widget benefit(IconData icon, String text) => Padding(
+        padding: const EdgeInsets.only(bottom: 12),
+        child: Row(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            Container(
+              width: 30,
+              height: 30,
+              decoration: BoxDecoration(
+                color: const Color(0xFF0D7BFF).withValues(alpha: 0.14),
+                borderRadius: BorderRadius.circular(9),
+              ),
+              child: Icon(icon, size: 17, color: const Color(0xFF258BFF)),
+            ),
+            const SizedBox(width: 11),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.only(top: 5),
+                child: Text(text, style: const TextStyle(fontSize: 14)),
+              ),
+            ),
+          ],
+        ),
+      );
+
+  return Column(
+    mainAxisSize: MainAxisSize.min,
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Container(
+            width: 48,
+            height: 48,
+            decoration: BoxDecoration(
+              gradient: const LinearGradient(
+                colors: [Color(0xFF087DFF), Color(0xFF36A5FF)],
+                begin: Alignment.topLeft,
+                end: Alignment.bottomRight,
+              ),
+              borderRadius: BorderRadius.circular(14),
+            ),
+            child: const Icon(Icons.workspace_premium_rounded,
+                color: Colors.white, size: 27),
+          ),
+          const SizedBox(width: 14),
+          const Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Potencia tu experiencia',
+                  style: TextStyle(fontSize: 20, fontWeight: FontWeight.w700),
+                ),
+                SizedBox(height: 4),
+                Text(
+                  'Encuentra el plan ideal para tus equipos.',
+                  style: TextStyle(fontSize: 13.5),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+      const SizedBox(height: 22),
+      benefit(Icons.speed_rounded, 'Conexiones más rápidas y estables'),
+      benefit(Icons.devices_rounded, 'Planes adaptados a tus equipos'),
+      benefit(Icons.support_agent_rounded, 'Soporte y funciones avanzadas'),
+      const SizedBox(height: 5),
+      Text(
+        'Puedes revisar las opciones y regresar al inicio de sesión.',
+        style: TextStyle(fontSize: 12.5, color: mutedColor),
+      ),
+      const SizedBox(height: 20),
+      Row(
+        children: [
+          Expanded(
+            child: OutlinedButton.icon(
+              onPressed: onBack,
+              icon: const Icon(Icons.arrow_back_rounded, size: 18),
+              style: OutlinedButton.styleFrom(
+                minimumSize: const Size(0, 44),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(11),
+                ),
+              ),
+              label: const Text('Regresar'),
+            ),
+          ),
+          const SizedBox(width: 12),
+          Expanded(
+            flex: 2,
+            child: FilledButton.icon(
+              onPressed: () => launchUrl(
+                Uri.parse(plansUrl),
+                mode: LaunchMode.externalApplication,
+              ),
+              icon: const Icon(Icons.open_in_new_rounded, size: 18),
+              label: const Text('Ver planes'),
+              style: FilledButton.styleFrom(
+                backgroundColor: const Color(0xFF087DFF),
+                foregroundColor: Colors.white,
+                minimumSize: const Size(0, 44),
+                shape: RoundedRectangleBorder(
+                  borderRadius: BorderRadius.circular(11),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    ],
+  );
+}
+
 // call this directly
 Future<bool?> loginDialog() async {
   var username =
@@ -463,6 +582,7 @@ Future<bool?> loginDialog() async {
   String? usernameMsg;
   String? passwordMsg;
   var isInProgress = false;
+  var showUpgradePlans = false;
   final RxString curOP = ''.obs;
   // Track hover state for the close icon
   bool isCloseHovered = false;
@@ -621,7 +741,7 @@ Future<bool?> loginDialog() async {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Text(
-          translate('Login'),
+          showUpgradePlans ? 'Actualizar planes' : translate('Login'),
         ).marginOnly(top: MyTheme.dialogPadding),
         MouseRegion(
           onEnter: (_) => setState(() => isCloseHovered = true),
@@ -653,25 +773,81 @@ Future<bool?> loginDialog() async {
       title: title,
       titlePadding: titlePadding,
       contentBoxConstraints: BoxConstraints(minWidth: 400),
-      content: Column(
-        crossAxisAlignment: CrossAxisAlignment.center,
-        children: [
-          const SizedBox(
-            height: 8.0,
-          ),
-          LoginWidgetUserPass(
-            username: username,
-            pass: password,
-            usernameMsg: usernameMsg,
-            passMsg: passwordMsg,
-            isInProgress: isInProgress,
-            curOP: curOP,
-            onLogin: onLogin,
-            userFocusNode: userFocusNode,
-          ),
-          thirdAuthWidget(),
-        ],
-      ),
+      content: showUpgradePlans
+          ? _buildUpgradePlansPanel(
+              context, () => setState(() => showUpgradePlans = false))
+          : Column(
+              crossAxisAlignment: CrossAxisAlignment.center,
+              children: [
+                const SizedBox(
+                  height: 8.0,
+                ),
+                LoginWidgetUserPass(
+                  username: username,
+                  pass: password,
+                  usernameMsg: usernameMsg,
+                  passMsg: passwordMsg,
+                  isInProgress: isInProgress,
+                  curOP: curOP,
+                  onLogin: onLogin,
+                  userFocusNode: userFocusNode,
+                ),
+                thirdAuthWidget(),
+                const SizedBox(height: 18),
+                Row(
+                  children: [
+                    Expanded(
+                      child: Divider(
+                        color: Theme.of(context)
+                            .dividerColor
+                            .withValues(alpha: 0.55),
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      child: Text(
+                        '¿Necesitas más capacidad?',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: Theme.of(context)
+                              .textTheme
+                              .bodySmall
+                              ?.color
+                              ?.withValues(alpha: 0.7),
+                        ),
+                      ),
+                    ),
+                    Expanded(
+                      child: Divider(
+                        color: Theme.of(context)
+                            .dividerColor
+                            .withValues(alpha: 0.55),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    onPressed: isInProgress
+                        ? null
+                        : () => setState(() => showUpgradePlans = true),
+                    icon:
+                        const Icon(Icons.workspace_premium_outlined, size: 19),
+                    label: const Text('Actualizar planes'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: const Color(0xFF258BFF),
+                      minimumSize: const Size(0, 44),
+                      side: const BorderSide(color: Color(0xFF258BFF)),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(11),
+                      ),
+                    ),
+                  ),
+                ),
+              ],
+            ),
       onCancel: onDialogCancel,
       onSubmit: onLogin,
     );

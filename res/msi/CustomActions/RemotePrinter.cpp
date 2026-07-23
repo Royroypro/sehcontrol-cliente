@@ -21,7 +21,8 @@ namespace RemotePrinter
     LPCWCH RD_DRIVER_INF_PATH = L"drivers\\RustDeskPrinterDriver\\RustDeskPrinterDriver.inf";
     LPCWCH RD_PRINTER_PORT = L"Sehcontrol Printer";
     LPCWCH RD_PRINTER_NAME = L"Sehcontrol Printer";
-    LPCWCH RD_PRINTER_DRIVER_NAME = L"Sehcontrol v4 Printer Driver";
+    // Must match the model name in the signed RustDeskPrinterDriver.inf.
+    LPCWCH RD_PRINTER_DRIVER_NAME = L"RustDesk v4 Printer Driver";
     LPCWCH XCV_MONITOR_LOCAL_PORT = L",XcvMonitor Local Port";
 
     using FuncEnum = std::function<BOOL(DWORD level, LPBYTE pDriverInfo, DWORD cbBuf, LPDWORD pcbNeeded, LPDWORD pcReturned)>;

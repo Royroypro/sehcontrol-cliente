@@ -206,11 +206,28 @@ void runMobileApp() async {
 /// fails — matches today's behavior (login optional) for deployments
 /// without a membership panel. Must run after the widget tree is mounted;
 /// `OverlayDialogManager.show` errors out if called before `runApp`.
+bool _enforcingRequiredLogin = false;
+
 Future<void> _enforceLoginIfRequired() async {
-  if (gFFI.userModel.isLogin) return;
-  if (!await UserModel.fetchForceLogin()) return;
-  while (!gFFI.userModel.isLogin) {
-    await loginDialog();
+  if (_enforcingRequiredLogin || gFFI.userModel.isLogin) return;
+  _enforcingRequiredLogin = true;
+  try {
+    if (!await UserModel.fetchForceLogin()) return;
+    while (!gFFI.userModel.isLogin) {
+      final loggedIn = await loginDialog();
+      if (loggedIn != true) {
+        // Closing a mandatory login dialog means the user wants to leave the
+        // application. Do not reopen it in a loop or leave the main window
+        // trapped behind another modal.
+        await bind.mainOnMainWindowClose();
+        await rustDeskWinManager.closeAllSubWindows();
+        await windowManager.setPreventClose(false);
+        await windowManager.close();
+        return;
+      }
+    }
+  } finally {
+    _enforcingRequiredLogin = false;
   }
 }
 

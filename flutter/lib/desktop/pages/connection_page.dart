@@ -381,9 +381,8 @@ class _ConnectionPageState extends State<ConnectionPage>
           const SizedBox(height: 8),
           InkWell(
             onTap: () {
-              const url = 'https://sehcontrol.sehuacho.com';
-              canLaunchUrlString(url).then((can) {
-                if (can) launchUrlString(url);
+              canLaunchUrlString(kSehcontrolMoreInformationUrl).then((can) {
+                if (can) launchUrlString(kSehcontrolMoreInformationUrl);
               });
             },
             child: Text(
