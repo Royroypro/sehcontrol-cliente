@@ -61,29 +61,48 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   @override
   Widget build(BuildContext context) {
     super.build(context);
-    final isIncomingOnly = bind.isIncomingOnly();
-    return _buildBlock(
-        child: Stack(
-      children: [
-        Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            if (!isIncomingOnly) _buildHeader(context),
-            Expanded(
-              child: Row(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  buildLeftPane(context),
-                  if (!isIncomingOnly) const VerticalDivider(width: 1),
-                  if (!isIncomingOnly) Expanded(child: buildRightPane(context)),
-                ],
+    // Wrapped in try/catch so a future bug here shows a readable error
+    // instead of a blank window — release builds strip the layout
+    // assertions that would otherwise explain a silent rendering failure.
+    try {
+      final isIncomingOnly = bind.isIncomingOnly();
+      return _buildBlock(
+          child: Stack(
+        children: [
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              // Fixed height: the header's content (icons/buttons with no
+              // explicit intrinsic size) left this unbounded, which silently
+              // produced a blank window in release builds instead of the
+              // debug-only "unbounded height" assertion that would flag it.
+              if (!isIncomingOnly)
+                SizedBox(height: 60, child: _buildHeader(context)),
+              Expanded(
+                child: Row(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    buildLeftPane(context),
+                    if (!isIncomingOnly) const VerticalDivider(width: 1),
+                    if (!isIncomingOnly) Expanded(child: buildRightPane(context)),
+                  ],
+                ),
               ),
-            ),
-          ],
+            ],
+          ),
+          buildMembershipLockOverlay(),
+        ],
+      ));
+    } catch (e, st) {
+      debugPrint('DesktopHomePage build failed: $e\n$st');
+      return Container(
+        color: Colors.black,
+        child: SingleChildScrollView(
+          child: Text('$e\n$st',
+              style: const TextStyle(color: Colors.red, fontSize: 12)),
         ),
-        buildMembershipLockOverlay(),
-      ],
-    ));
+      );
+    }
   }
 
   /// Top header bar: brand, "Control Remoto"/"Mis Equipos" nav shortcuts, and
