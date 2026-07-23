@@ -1,0 +1,43 @@
+name: Publish Sehcontrol Release
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish release
+        uses: softprops/action-gh-release@de2c0eb89ae2a093876385947365aca7b0e5f844
+        with:
+          name: Sehcontrol Cliente ${{ github.ref_name }}
+          body: |
+            ## Sehcontrol Cliente ${{ github.ref_name }}
+
+            Primera versión pública del cliente de escritorio remoto Sehcontrol.
+
+            ### Características
+
+            - Interfaz e identidad visual de Sehcontrol.
+            - Integración con cuentas, membresías, planes y equipos.
+            - Servidor ID y relay preconfigurados.
+            - Configuración protegida y preparada para rotación de clave pública.
+            - Mejoras en notificaciones, enlaces de ayuda y experiencia de usuario.
+
+            ### Créditos
+
+            Sehcontrol está basado en el proyecto de código abierto
+            [RustDesk](https://github.com/rustdesk/rustdesk). Agradecemos a sus
+            autores, mantenedores y colaboradores.
+
+            > Use la aplicación únicamente en equipos propios o con autorización.
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+
