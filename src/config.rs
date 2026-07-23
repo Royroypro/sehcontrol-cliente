@@ -16,6 +16,7 @@ use regex::Regex;
 use serde as de;
 use serde_derive::{Deserialize, Serialize};
 use serde_json;
+use sha2::{Digest, Sha256};
 use sodiumoxide::base64;
 use sodiumoxide::crypto::sign;
 
@@ -74,7 +75,14 @@ lazy_static::lazy_static! {
     static ref USER_DEFAULT_CONFIG: RwLock<(UserDefaultConfig, Instant)> = RwLock::new((UserDefaultConfig::load(), Instant::now()));
     pub static ref NEW_STORED_PEER_CONFIG: Mutex<HashSet<String>> = Default::default();
     pub static ref DEFAULT_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
-    pub static ref OVERWRITE_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
+    pub static ref OVERWRITE_SETTINGS: RwLock<HashMap<String, String>> = RwLock::new(
+        HashMap::from([
+            ("custom-rendezvous-server".to_owned(), DEFAULT_RENDEZVOUS_SERVER.to_owned()),
+            ("relay-server".to_owned(), DEFAULT_RENDEZVOUS_SERVER.to_owned()),
+            ("api-server".to_owned(), DEFAULT_API_SERVER.to_owned()),
+            ("key".to_owned(), RS_PUB_KEY.to_owned()),
+        ])
+    );
     pub static ref DEFAULT_DISPLAY_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
     pub static ref OVERWRITE_DISPLAY_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
     pub static ref DEFAULT_LOCAL_SETTINGS: RwLock<HashMap<String, String>> = Default::default();
@@ -117,13 +125,35 @@ const CHARS: &[char] = &[
     'm', 'n', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z',
 ];
 
-pub const RENDEZVOUS_SERVERS: &[&str] = &["sehcontrol.sehuacho.com"];
+pub const DEFAULT_RENDEZVOUS_SERVER: &str = "sehcontrol.sehuacho.com";
+pub const DEFAULT_API_SERVER: &str = "https://sehcontrol.sehuacho.com";
+pub const RENDEZVOUS_SERVERS: &[&str] = &[DEFAULT_RENDEZVOUS_SERVER];
 // pub const RENDEZVOUS_SERVERS: &[&str] = &[
 //   "sehcontrol.sehuacho.com",
 //   "sehcontrol2.sehuacho.com",
 // ];
 
 pub const RS_PUB_KEY: &str = "20WVH2iU16txMRGam1ciZqhVfzfAJlFzNhgSdAFHWwk=";
+pub const TRUSTED_SERVER_KEY_OPTION: &str = "trusted-server-key";
+
+pub fn locked_server_option(key: &str) -> Option<String> {
+    match key {
+        keys::OPTION_CUSTOM_RENDEZVOUS_SERVER => Some(DEFAULT_RENDEZVOUS_SERVER.to_owned()),
+        keys::OPTION_RELAY_SERVER => Some(DEFAULT_RENDEZVOUS_SERVER.to_owned()),
+        keys::OPTION_API_SERVER => Some(DEFAULT_API_SERVER.to_owned()),
+        keys::OPTION_KEY => Some(
+            CONFIG2
+                .read()
+                .unwrap()
+                .options
+                .get(TRUSTED_SERVER_KEY_OPTION)
+                .filter(|value| !value.is_empty())
+                .cloned()
+                .unwrap_or_else(|| RS_PUB_KEY.to_owned()),
+        ),
+        _ => None,
+    }
+}
 
 pub const RENDEZVOUS_PORT: i32 = 21116;
 pub const RELAY_PORT: i32 = 21117;
@@ -915,77 +945,76 @@ impl Config {
         }
     }
 
-pub fn get_rendezvous_server() -> String {
-    let mut rendezvous_server = EXE_RENDEZVOUS_SERVER.read().unwrap().clone();
-    if rendezvous_server.is_empty() {
-        rendezvous_server = Self::get_option("custom-rendezvous-server");
-    }
-    if rendezvous_server.is_empty() {
-        rendezvous_server = PROD_RENDEZVOUS_SERVER.read().unwrap().clone();
-    }
-    if rendezvous_server.is_empty() {
-        rendezvous_server = CONFIG2.read().unwrap().rendezvous_server.clone();
-    }
-    if rendezvous_server.is_empty() {
-        let servers = Self::get_rendezvous_servers();
-        rendezvous_server = servers.get(0).cloned().unwrap_or_default();
+    pub fn get_rendezvous_server() -> String {
+        let mut rendezvous_server = EXE_RENDEZVOUS_SERVER.read().unwrap().clone();
+        if rendezvous_server.is_empty() {
+            rendezvous_server = Self::get_option("custom-rendezvous-server");
+        }
+        if rendezvous_server.is_empty() {
+            rendezvous_server = PROD_RENDEZVOUS_SERVER.read().unwrap().clone();
+        }
+        if rendezvous_server.is_empty() {
+            rendezvous_server = CONFIG2.read().unwrap().rendezvous_server.clone();
+        }
+        if rendezvous_server.is_empty() {
+            let servers = Self::get_rendezvous_servers();
+            rendezvous_server = servers.get(0).cloned().unwrap_or_default();
+        }
+
+        if !rendezvous_server.contains(':') {
+            rendezvous_server = format!("{rendezvous_server}:{RENDEZVOUS_PORT}");
+        }
+        rendezvous_server
     }
 
-    if !rendezvous_server.contains(':') {
-        rendezvous_server = format!("{rendezvous_server}:{RENDEZVOUS_PORT}");
-    }
-    rendezvous_server
-}
+    pub fn get_rendezvous_servers() -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
 
-pub fn get_rendezvous_servers() -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-
-    // 1) Fuente preferida (va primero si existe)
-    let s = EXE_RENDEZVOUS_SERVER.read().unwrap().clone();
-    if !s.is_empty() {
-        out.push(s);
-    } else {
-        let s = Self::get_option("custom-rendezvous-server");
+        // 1) Fuente preferida (va primero si existe)
+        let s = EXE_RENDEZVOUS_SERVER.read().unwrap().clone();
         if !s.is_empty() {
             out.push(s);
         } else {
-            let s = PROD_RENDEZVOUS_SERVER.read().unwrap().clone();
+            let s = Self::get_option("custom-rendezvous-server");
             if !s.is_empty() {
                 out.push(s);
             } else {
-                let s = CONFIG2.read().unwrap().rendezvous_server.clone();
+                let s = PROD_RENDEZVOUS_SERVER.read().unwrap().clone();
                 if !s.is_empty() {
                     out.push(s);
                 } else {
-                    let serial_obsolute = CONFIG2.read().unwrap().serial > SERIAL;
-                    if serial_obsolute {
-                        let ss: Vec<String> = Self::get_option("rendezvous-servers")
-                            .split(',')
-                            .map(|x| x.trim())
-                            .filter(|x| x.contains('.'))
-                            .map(|x| x.to_owned())
-                            .collect();
-                        out.extend(ss);
+                    let s = CONFIG2.read().unwrap().rendezvous_server.clone();
+                    if !s.is_empty() {
+                        out.push(s);
+                    } else {
+                        let serial_obsolute = CONFIG2.read().unwrap().serial > SERIAL;
+                        if serial_obsolute {
+                            let ss: Vec<String> = Self::get_option("rendezvous-servers")
+                                .split(',')
+                                .map(|x| x.trim())
+                                .filter(|x| x.contains('.'))
+                                .map(|x| x.to_owned())
+                                .collect();
+                            out.extend(ss);
+                        }
                     }
                 }
             }
         }
-    }
 
-    // 2) SIEMPRE agrega los defaults como fallback (alta disponibilidad real)
-    for s in RENDEZVOUS_SERVERS.iter() {
-        let s = s.to_string();
-        if !out.contains(&s) {
-            out.push(s);
+        // 2) SIEMPRE agrega los defaults como fallback (alta disponibilidad real)
+        for s in RENDEZVOUS_SERVERS.iter() {
+            let s = s.to_string();
+            if !out.contains(&s) {
+                out.push(s);
+            }
         }
+
+        // 3) Limpieza final (vacíos y espacios)
+        out.retain(|x| !x.trim().is_empty());
+
+        out
     }
-
-    // 3) Limpieza final (vacíos y espacios)
-    out.retain(|x| !x.trim().is_empty());
-
-    out
-}
-
 
     pub fn reset_online() {
         *ONLINE.lock().unwrap() = Default::default();
@@ -1251,6 +1280,16 @@ pub fn get_rendezvous_servers() -> Vec<String> {
         let mut res = DEFAULT_SETTINGS.read().unwrap().clone();
         res.extend(CONFIG2.read().unwrap().options.clone());
         res.extend(OVERWRITE_SETTINGS.read().unwrap().clone());
+        for key in [
+            keys::OPTION_CUSTOM_RENDEZVOUS_SERVER,
+            keys::OPTION_RELAY_SERVER,
+            keys::OPTION_API_SERVER,
+            keys::OPTION_KEY,
+        ] {
+            if let Some(value) = locked_server_option(key) {
+                res.insert(key.to_owned(), value.to_owned());
+            }
+        }
         res
     }
 
@@ -1270,6 +1309,9 @@ pub fn get_rendezvous_servers() -> Vec<String> {
     }
 
     pub fn get_option(k: &str) -> String {
+        if let Some(value) = locked_server_option(k) {
+            return value.to_owned();
+        }
         get_or(
             &OVERWRITE_SETTINGS,
             &CONFIG2.read().unwrap().options,
@@ -1284,6 +1326,9 @@ pub fn get_rendezvous_servers() -> Vec<String> {
     }
 
     pub fn set_option(k: String, v: String) {
+        if locked_server_option(&k).is_some() {
+            return;
+        }
         if !is_option_can_save(&OVERWRITE_SETTINGS, &k, &DEFAULT_SETTINGS, &v) {
             let mut config = CONFIG2.write().unwrap();
             if config.options.remove(&k).is_some() {
@@ -1301,6 +1346,26 @@ pub fn get_rendezvous_servers() -> Vec<String> {
             }
             config.store();
         }
+    }
+
+    pub fn set_trusted_server_key(key: String, fingerprint: &str) -> bool {
+        #[allow(deprecated)]
+        let Ok(decoded) = base64::decode(&key, base64::Variant::Original) else {
+            return false;
+        };
+        if decoded.len() != 32 {
+            return false;
+        }
+        let actual_fingerprint = format!("{:x}", Sha256::digest(&decoded));
+        if !actual_fingerprint.eq_ignore_ascii_case(fingerprint) {
+            return false;
+        }
+        let mut config = CONFIG2.write().unwrap();
+        config
+            .options
+            .insert(TRUSTED_SERVER_KEY_OPTION.to_owned(), key);
+        config.store();
+        true
     }
 
     pub fn update_id() {
