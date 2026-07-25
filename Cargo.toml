@@ -208,9 +208,17 @@ exclude = ["vdi/host", "examples/custom_plugin"]
 # This allows building and running on systems without libxdo installed (e.g., Wayland-only)
 [patch.crates-io]
 libxdo-sys = { path = "libs/libxdo-sys-stub" }
+# Patch libsodium-sys: its build.rs decides host vs. target behavior using
+# cfg!(windows)/cfg!(target_env = "msvc"), which reflect the build script's
+# own (host) compile target, not the crate's actual TARGET. That's harmless
+# when host == target, but breaks cross-compiling from Windows to Android:
+# it ignores SODIUM_LIB_DIR and always tries to link the bundled Windows/MSVC
+# x64 prebuilt regardless of target. Patched to check the real TARGET string.
+libsodium-sys = { path = "libs/libsodium-sys-patched" }
 
 [package.metadata.winres]
-LegalCopyright = "Copyright © 2026 Purslane Tech Pte. Ltd. All rights reserved."
+LegalCopyright = "Copyright © 2026 Sehcontrol. All rights reserved."
+CompanyName = "Sehcontrol"
 ProductName = "Sehcontrol"
 FileDescription = "Sehcontrol Remote Desktop"
 OriginalFilename = "sehcontrol.exe"

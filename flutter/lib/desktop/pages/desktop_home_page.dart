@@ -569,7 +569,6 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     final model = gFFI.serverModel;
     return Container(
       margin: const EdgeInsets.only(left: 20, right: 11),
-      height: 57,
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.baseline,
         textBaseline: TextBaseline.alphabetic,
@@ -582,21 +581,20 @@ class _DesktopHomePageState extends State<DesktopHomePage>
             child: Padding(
               padding: const EdgeInsets.only(left: 7),
               child: Column(
+                mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  Container(
-                    height: 25,
-                    child: Text(
-                      translate("ID"),
-                      style: TextStyle(
-                          fontSize: 14,
-                          color: Theme.of(context)
-                              .textTheme
-                              .titleLarge
-                              ?.color
-                              ?.withOpacity(0.5)),
-                    ).marginOnly(top: 5),
-                  ),
+                  AutoSizeText(
+                    translate("ID"),
+                    style: TextStyle(
+                        fontSize: 14,
+                        color: Theme.of(context)
+                            .textTheme
+                            .titleLarge
+                            ?.color
+                            ?.withOpacity(0.5)),
+                    maxLines: 1,
+                  ).marginOnly(top: 5),
                   Flexible(
                     child: GestureDetector(
                       onDoubleTap: () {
@@ -743,32 +741,9 @@ class _DesktopHomePageState extends State<DesktopHomePage>
         mainAxisAlignment: MainAxisAlignment.start,
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Column(
-            children: [
-              if (!isOutgoingOnly)
-                Align(
-                  alignment: Alignment.center,
-                  child: Text(
-                    translate("Your Desktop"),
-                    textAlign: TextAlign.center,
-                    style: Theme.of(context).textTheme.titleLarge,
-                  ),
-                ),
-              const SizedBox(width: 8),
-              TextButton(
-                onPressed: () {
-                  launchUrl(Uri.parse(kSehcontrolWebsiteUrl));
-                },
-                child: Text(
-                  translate("Website"),
-                  style: const TextStyle(color: Colors.blue),
-                ),
-              ),
-            ],
-          ),
-          SizedBox(
-            height: 10.0,
-          ),
+          // The "SEHCONTROL" title + website link used to live here, but it
+          // just repeated the header brand above and pushed the ID board
+          // down out of view on short windows. Removed to free that space.
           if (!isOutgoingOnly)
             Text(
               translate("desk_tip"),
@@ -819,12 +794,17 @@ class _DesktopHomePageState extends State<DesktopHomePage>
 
     if (isWindows && !bind.isDisableInstallation()) {
       if (!bind.mainIsInstalled()) {
-        return buildInstallCard(
-            "", bind.isOutgoingOnly() ? "" : "install_tip", "Install",
-            () async {
-          await rustDeskWinManager.closeAllSubWindows();
-          bind.mainGotoInstall();
-        });
+        if (bind.isOutgoingOnly()) {
+          return buildInstallCard("", "", "Install", () async {
+            await rustDeskWinManager.closeAllSubWindows();
+            bind.mainGotoInstall();
+          });
+        }
+        // Shown next to the secure-connection card in the right pane
+        // (ConnectionPage._buildInstallTipCard) instead, since this spot at
+        // the bottom of the sidebar scrolls out of view on short/narrow
+        // windows.
+        return Container();
       } else if (bind.mainIsInstalledLowerVersion()) {
         return buildInstallCard(
             "Status", "Your installation is lower version.", "Click to upgrade",

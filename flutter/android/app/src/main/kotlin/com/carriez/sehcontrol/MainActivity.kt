@@ -1,4 +1,4 @@
-package com.carriez.flutter_hbb
+package com.carriez.sehcontrol
 
 /**
  * Handle events from flutter

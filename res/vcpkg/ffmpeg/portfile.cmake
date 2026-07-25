@@ -87,7 +87,13 @@ if(VCPKG_HOST_IS_WINDOWS)
     vcpkg_acquire_msys(MSYS_ROOT PACKAGES automake1.16)
     set(SHELL "${MSYS_ROOT}/usr/bin/bash.exe")
     vcpkg_add_to_path("${MSYS_ROOT}/usr/share/automake-1.16")
-    string(APPEND OPTIONS " --pkg-config=${CURRENT_HOST_INSTALLED_DIR}/tools/pkgconf/pkgconf${VCPKG_HOST_EXECUTABLE_SUFFIX}")
+    # Trailing space matters: on a Windows host this runs right before an
+    # elseif(VCPKG_TARGET_IS_*) block below whose multi-line OPTIONS string
+    # starts with no leading space of its own (relying on this one) - e.g.
+    # "--target-os=android" for Android. Without it the two flags glue
+    # together into one malformed --pkg-config value and configure silently
+    # never sees --target-os at all.
+    string(APPEND OPTIONS " --pkg-config=${CURRENT_HOST_INSTALLED_DIR}/tools/pkgconf/pkgconf${VCPKG_HOST_EXECUTABLE_SUFFIX} ")
 else()
     find_program(SHELL bash)
 endif()
@@ -234,7 +240,58 @@ if(VCPKG_DETECTED_CMAKE_C_COMPILER)
     string(APPEND OPTIONS " --cc=${CC_filename}")
 
     if(VCPKG_HOST_IS_WINDOWS)
-        string(APPEND OPTIONS " --host_cc=${CC_filename}")
+        if(VCPKG_TARGET_IS_WINDOWS)
+            string(APPEND OPTIONS " --host_cc=${CC_filename}")
+        else()
+            # Cross-compiling from Windows to a non-Windows target (e.g.
+            # Android): CC_filename here is the *target* compiler (NDK
+            # clang), which has no Windows host system headers and can't
+            # build ffmpeg's host-side feature-test programs.
+            #
+            # Use a system-wide (non-NDK) clang.exe as the host compiler:
+            # unlike cl.exe it (a) auto-detects the VS/Windows SDK install
+            # without needing INCLUDE/LIB pre-set, and (b) uses gcc-style
+            # "-o <path>" (space-separated) rather than cl's glued "-Fo<path>",
+            # which is the syntax MSYS2's automatic POSIX->Windows path
+            # conversion actually handles correctly.
+            find_program(Z_FFMPEG_HOST_CLANG_EXECUTABLE NAMES clang.exe clang
+                PATHS "C:/Program Files/LLVM/bin"
+                NO_DEFAULT_PATH)
+            if(NOT Z_FFMPEG_HOST_CLANG_EXECUTABLE)
+                find_program(Z_FFMPEG_HOST_CLANG_EXECUTABLE NAMES clang.exe clang)
+            endif()
+            if(NOT Z_FFMPEG_HOST_CLANG_EXECUTABLE)
+                message(FATAL_ERROR "Could not find a system clang.exe to use as ffmpeg's host_cc when cross-compiling from Windows. Install LLVM (https://github.com/llvm/llvm-project/releases) or adjust this port.")
+            endif()
+            # Can't reference it by bare "clang.exe" on PATH (like CC_filename
+            # above): the *target* NDK clang is also bare "clang.exe" on PATH,
+            # and a shell can't resolve the same bare name to two different
+            # binaries. Embedding the full path directly breaks too - it gets
+            # spliced unquoted into build.sh, so a space in "Program Files"
+            # would be word-split into two arguments. Resolve the legacy 8.3
+            # short path instead: it's space-free and still points at the
+            # real binary, so no separate PATH entry or renaming is needed.
+            execute_process(
+                COMMAND powershell -NoProfile -Command
+                    "(New-Object -ComObject Scripting.FileSystemObject).GetFile('${Z_FFMPEG_HOST_CLANG_EXECUTABLE}').ShortPath"
+                OUTPUT_VARIABLE Z_FFMPEG_HOST_CLANG_SHORTPATH
+                OUTPUT_STRIP_TRAILING_WHITESPACE
+            )
+            if(NOT Z_FFMPEG_HOST_CLANG_SHORTPATH)
+                message(FATAL_ERROR "Could not resolve an 8.3 short path for ${Z_FFMPEG_HOST_CLANG_EXECUTABLE}.")
+            endif()
+            string(REPLACE "\\" "/" Z_FFMPEG_HOST_CLANG_SHORTPATH "${Z_FFMPEG_HOST_CLANG_SHORTPATH}")
+            string(APPEND OPTIONS " --host_cc=${Z_FFMPEG_HOST_CLANG_SHORTPATH}")
+
+            # ffmpeg's own ./configure hard-refuses ("Native MSYS builds are
+            # discouraged") once it detects (via `uname`) it's running under
+            # plain MSYS - it only tolerates the MINGW64/MINGW32 subsystem.
+            # MSYS2's msys-2.0.dll reports a different `uname -s` depending on
+            # the MSYSTEM env var, so set it before build.sh's bash launches
+            # (this MSYS2 install already ships the mingw64 tree, e.g. its
+            # pkgconf package, it's just not activated by default here).
+            set(ENV{MSYSTEM} "MINGW64")
+        endif()
     endif()
 
     list(APPEND prog_env "${CC_path}")

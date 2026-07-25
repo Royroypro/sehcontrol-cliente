@@ -13,6 +13,7 @@ import 'package:get/get.dart';
 import 'package:url_launcher/url_launcher_string.dart';
 import 'package:window_manager/window_manager.dart';
 import 'package:flutter_hbb/models/peer_model.dart';
+import 'package:flutter_hbb/utils/multi_window_manager.dart';
 
 import '../../common.dart';
 import '../../common/formatter/id_formatter.dart';
@@ -212,6 +213,12 @@ class _ConnectionPageState extends State<ConnectionPage>
   final FocusNode _idFocusNode = FocusNode();
   final TextEditingController _idEditingController = TextEditingController();
 
+  /// Drives the pulsing glow on the "install at system level" nudge so it
+  /// isn't easy to miss.
+  late final AnimationController _installTipPulseController =
+      AnimationController(vsync: this, duration: const Duration(milliseconds: 650))
+        ..repeat(reverse: true);
+
   String selectedConnectionType = 'Connect';
 
   bool isWindowMinimized = false;
@@ -245,6 +252,7 @@ class _ConnectionPageState extends State<ConnectionPage>
 
   @override
   void dispose() {
+    _installTipPulseController.dispose();
     _idController.dispose();
     windowManager.removeListener(this);
     _allPeersLoader.clear();
@@ -311,6 +319,7 @@ class _ConnectionPageState extends State<ConnectionPage>
   @override
   Widget build(BuildContext context) {
     final isOutgoingOnly = bind.isOutgoingOnly();
+    final installTipCard = _buildInstallTipCard(context);
     return Column(
       children: [
         Expanded(
@@ -322,6 +331,10 @@ class _ConnectionPageState extends State<ConnectionPage>
                 Flexible(child: _buildRemoteIDTextField(context)),
                 const SizedBox(width: 16),
                 _buildSecureConnectionCard(context),
+                if (installTipCard != null) ...[
+                  const SizedBox(width: 16),
+                  installTipCard,
+                ],
               ],
             ).marginOnly(top: 22, right: 12),
             SizedBox(height: 12),
@@ -393,6 +406,89 @@ class _ConnectionPageState extends State<ConnectionPage>
           ),
         ],
       ),
+    );
+  }
+
+  /// Windows-only nudge to install at the system level (otherwise User
+  /// Account Control can prevent full remote-desktop functionality). Shown
+  /// next to the secure-connection card instead of at the bottom of the left
+  /// sidebar, since that spot scrolls out of view on short/narrow windows.
+  /// Pulses and uses a large filled button so it's hard to miss/ignore.
+  Widget? _buildInstallTipCard(BuildContext context) {
+    if (!isWindows ||
+        bind.isDisableInstallation() ||
+        bind.isOutgoingOnly() ||
+        bind.mainIsInstalled()) {
+      return null;
+    }
+    const baseColor = Color.fromARGB(255, 226, 66, 188);
+    const pulseColor = Color.fromARGB(255, 255, 82, 82);
+    return AnimatedBuilder(
+      animation: _installTipPulseController,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.warning_amber_rounded,
+                  color: pulseColor, size: 22),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(translate('Install'),
+                    style: const TextStyle(
+                        fontWeight: FontWeight.bold, fontSize: 16)),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            translate('install_tip'),
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+          const SizedBox(height: 14),
+          SizedBox(
+            width: double.infinity,
+            child: ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: pulseColor,
+                foregroundColor: Colors.white,
+                padding: const EdgeInsets.symmetric(vertical: 16),
+                textStyle: const TextStyle(
+                    fontWeight: FontWeight.bold, fontSize: 16),
+                shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(10)),
+              ),
+              onPressed: () async {
+                await rustDeskWinManager.closeAllSubWindows();
+                bind.mainGotoInstall();
+              },
+              child: Text(translate('Install')),
+            ),
+          ),
+        ],
+      ),
+      builder: (context, child) {
+        final glow =
+            Color.lerp(baseColor, pulseColor, _installTipPulseController.value)!;
+        return Container(
+          width: 260,
+          padding: const EdgeInsets.all(16),
+          decoration: BoxDecoration(
+            color: Theme.of(context).colorScheme.surfaceContainerHighest,
+            borderRadius: BorderRadius.circular(13),
+            border: Border.all(color: glow, width: 2),
+            boxShadow: [
+              BoxShadow(
+                color: glow.withOpacity(
+                    0.25 + 0.35 * _installTipPulseController.value),
+                blurRadius: 14,
+                spreadRadius: 1,
+              ),
+            ],
+          ),
+          child: child,
+        );
+      },
     );
   }
 
