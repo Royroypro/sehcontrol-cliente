@@ -74,6 +74,18 @@ void showServerSettingsWithValue(
   final relayCtrl = TextEditingController(text: serverConfig.relayServer);
   final apiCtrl = TextEditingController(text: serverConfig.apiServer);
   final keyCtrl = TextEditingController(text: serverConfig.key);
+  const idServerKey = 'custom-rendezvous-server';
+  const relayServerKey = 'relay-server';
+  const apiServerKey = 'api-server';
+  const serverKeyKey = 'key';
+  final idServerFixed = isOptionFixed(idServerKey);
+  final relayServerFixed = isOptionFixed(relayServerKey);
+  final apiServerFixed = isOptionFixed(apiServerKey);
+  final serverKeyFixed = isOptionFixed(serverKeyKey);
+  final allServerConfigFixed =
+      idServerFixed && relayServerFixed && apiServerFixed && serverKeyFixed;
+  final hasFixedServerConfig =
+      idServerFixed || relayServerFixed || apiServerFixed || serverKeyFixed;
 
   RxString idServerMsg = ''.obs;
   RxString relayServerMsg = ''.obs;
@@ -95,10 +107,14 @@ void showServerSettingsWithValue(
           null,
           errMsgs,
           ServerConfig(
-              idServer: idCtrl.text.trim(),
-              relayServer: relayCtrl.text.trim(),
-              apiServer: apiCtrl.text.trim(),
-              key: keyCtrl.text.trim()));
+              idServer:
+                  idServerFixed ? serverConfig.idServer : idCtrl.text.trim(),
+              relayServer: relayServerFixed
+                  ? serverConfig.relayServer
+                  : relayCtrl.text.trim(),
+              apiServer:
+                  apiServerFixed ? serverConfig.apiServer : apiCtrl.text.trim(),
+              key: serverKeyFixed ? serverConfig.key : keyCtrl.text.trim()));
       setState(() {
         isInProgress = false;
       });
@@ -107,7 +123,9 @@ void showServerSettingsWithValue(
 
     Widget buildField(
         String label, TextEditingController controller, String errorMsg,
-        {String? Function(String?)? validator, bool autofocus = false}) {
+        {String? Function(String?)? validator,
+        bool autofocus = false,
+        bool enabled = true}) {
       if (isDesktop || isWeb) {
         return Row(
           children: [
@@ -125,7 +143,8 @@ void showServerSettingsWithValue(
                     EdgeInsets.symmetric(horizontal: 8, vertical: 12),
                 showLabelText: false,
                 validator: validator,
-                autofocus: autofocus,
+                autofocus: autofocus && enabled,
+                enabled: enabled,
               ).workaroundFreezeLinuxMint(),
             ),
           ],
@@ -137,6 +156,8 @@ void showServerSettingsWithValue(
         controller: controller,
         errorMsg: errorMsg,
         validator: validator,
+        autofocus: autofocus && enabled,
+        enabled: enabled,
       ).workaroundFreezeLinuxMint();
     }
 
@@ -144,7 +165,8 @@ void showServerSettingsWithValue(
       title: Row(
         children: [
           Expanded(child: Text(translate('ID/Relay Server'))),
-          ...ServerConfigImportExportWidgets(controllers, errMsgs),
+          if (!hasFixedServerConfig)
+            ...ServerConfigImportExportWidgets(controllers, errMsgs),
         ],
       ),
       content: ConstrainedBox(
@@ -154,17 +176,19 @@ void showServerSettingsWithValue(
                 mainAxisSize: MainAxisSize.min,
                 children: [
                   buildField(translate('ID Server'), idCtrl, idServerMsg.value,
-                      autofocus: true),
+                      autofocus: true, enabled: !idServerFixed),
                   SizedBox(height: 8),
                   if (!isIOS && !isWeb) ...[
                     buildField(translate('Relay Server'), relayCtrl,
-                        relayServerMsg.value),
+                        relayServerMsg.value,
+                        enabled: !relayServerFixed),
                     SizedBox(height: 8),
                   ],
                   buildField(
                     translate('API Server'),
                     apiCtrl,
                     apiServerMsg.value,
+                    enabled: !apiServerFixed,
                     validator: (v) {
                       if (v != null && v.isNotEmpty) {
                         if (!(v.startsWith('http://') ||
@@ -176,7 +200,7 @@ void showServerSettingsWithValue(
                     },
                   ),
                   SizedBox(height: 8),
-                  buildField('Key', keyCtrl, ''),
+                  buildField('Key', keyCtrl, '', enabled: !serverKeyFixed),
                   if (isInProgress)
                     Padding(
                       padding: EdgeInsets.only(top: 8),
@@ -192,15 +216,17 @@ void showServerSettingsWithValue(
         }, isOutline: true),
         dialogButton(
           'OK',
-          onPressed: () async {
-            if (await submit()) {
-              close();
-              showToast(translate('Successful'));
-              upSetState?.call(() {});
-            } else {
-              showToast(translate('Failed'));
-            }
-          },
+          onPressed: allServerConfigFixed
+              ? null
+              : () async {
+                  if (await submit()) {
+                    close();
+                    showToast(translate('Successful'));
+                    upSetState?.call(() {});
+                  } else {
+                    showToast(translate('Failed'));
+                  }
+                },
         ),
       ],
     );
@@ -213,6 +239,7 @@ TextFormField serverSettingsTextFormField({
   required String errorMsg,
   String? Function(String?)? validator,
   bool autofocus = false,
+  bool enabled = true,
   bool showLabelText = true,
   EdgeInsetsGeometry? contentPadding,
 }) {
@@ -225,6 +252,7 @@ TextFormField serverSettingsTextFormField({
     ),
     validator: validator,
     autofocus: autofocus,
+    enabled: enabled,
     keyboardType: TextInputType.visiblePassword,
     textCapitalization: TextCapitalization.none,
     autocorrect: false,

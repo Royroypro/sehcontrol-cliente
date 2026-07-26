@@ -36,8 +36,6 @@ class SettingsPage extends StatefulWidget implements PageShape {
   State<SettingsPage> createState() => _SettingsState();
 }
 
-const url = 'https://rustdesk.com/';
-
 enum KeepScreenOn {
   never,
   duringControlled,
@@ -677,6 +675,13 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
     ));
 
     final disabledSettings = bind.isDisableSettings();
+    final serverConfigFixed = [
+      'custom-rendezvous-server',
+      'relay-server',
+      'api-server',
+      'key',
+    ].every((key) => isOptionFixed(key));
+    const proxyOptionKey = 'proxy-url';
     final hideSecuritySettings =
         bind.mainGetBuildinOption(key: kOptionHideSecuritySetting) == 'Y';
     final settings = SettingsList(
@@ -716,20 +721,31 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
             SettingsTile(
                 title: Text(translate('ID/Relay Server')),
                 leading: Icon(Icons.cloud),
-                onPressed: (context) {
-                  showServerSettings(gFFI.dialogManager, (callback) async {
-                    _isUsingPublicServer = await bind.mainIsUsingPublicServer();
-                    setState(callback);
-                  });
-                }),
-          if (!_hideNetwork && !_hideProxy)
+                trailing:
+                    serverConfigFixed ? const Icon(Icons.lock_outline) : null,
+                onPressed: serverConfigFixed
+                    ? null
+                    : (context) {
+                        showServerSettings(gFFI.dialogManager,
+                            (callback) async {
+                          _isUsingPublicServer =
+                              await bind.mainIsUsingPublicServer();
+                          setState(callback);
+                        });
+                      }),
+          if (!disabledSettings && !_hideNetwork && !_hideProxy)
             SettingsTile(
                 title: Text(translate('Socks5/Http(s) Proxy')),
                 leading: Icon(Icons.network_ping),
-                onPressed: (context) {
-                  changeSocks5Proxy();
-                }),
-          if (isAndroid && !bind.isOutgoingOnly())
+                trailing: isOptionFixed(proxyOptionKey)
+                    ? const Icon(Icons.lock_outline)
+                    : null,
+                onPressed: isOptionFixed(proxyOptionKey)
+                    ? null
+                    : (context) {
+                        changeSocks5Proxy();
+                      }),
+          if (!disabledSettings && isAndroid && !bind.isOutgoingOnly())
             SettingsTile(
                 title: Text(translate('Deploy')),
                 leading: Icon(Icons.cloud_upload),
@@ -751,7 +767,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                       });
                     },
             ),
-          if (!_isUsingPublicServer)
+          if (!disabledSettings && !_isUsingPublicServer)
             SettingsTile.switchTile(
               title: Text(translate('Allow insecure TLS fallback')),
               initialValue: _allowInsecureTlsFallback,
@@ -767,7 +783,10 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                       });
                     },
             ),
-          if (isAndroid && !outgoingOnly && !_isUsingPublicServer)
+          if (!disabledSettings &&
+              isAndroid &&
+              !outgoingOnly &&
+              !_isUsingPublicServer)
             SettingsTile.switchTile(
               title: Text(translate('Disable UDP')),
               initialValue: _disableUdp,
@@ -783,31 +802,35 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                       });
                     },
             ),
-          if (!incomingOnly)
+          if (!disabledSettings && !incomingOnly)
             SettingsTile.switchTile(
               title: Text(translate('Enable UDP hole punching')),
               initialValue: _enableUdpPunch,
-              onToggle: (v) async {
-                await mainSetLocalBoolOption(kOptionEnableUdpPunch, v);
-                final newValue =
-                    mainGetLocalBoolOptionSync(kOptionEnableUdpPunch);
-                setState(() {
-                  _enableUdpPunch = newValue;
-                });
-              },
+              onToggle: isOptionFixed(kOptionEnableUdpPunch)
+                  ? null
+                  : (v) async {
+                      await mainSetLocalBoolOption(kOptionEnableUdpPunch, v);
+                      final newValue =
+                          mainGetLocalBoolOptionSync(kOptionEnableUdpPunch);
+                      setState(() {
+                        _enableUdpPunch = newValue;
+                      });
+                    },
             ),
-          if (!incomingOnly)
+          if (!disabledSettings && !incomingOnly)
             SettingsTile.switchTile(
               title: Text(translate('Enable IPv6 P2P connection')),
               initialValue: _enableIpv6Punch,
-              onToggle: (v) async {
-                await mainSetLocalBoolOption(kOptionEnableIpv6Punch, v);
-                final newValue =
-                    mainGetLocalBoolOptionSync(kOptionEnableIpv6Punch);
-                setState(() {
-                  _enableIpv6Punch = newValue;
-                });
-              },
+              onToggle: isOptionFixed(kOptionEnableIpv6Punch)
+                  ? null
+                  : (v) async {
+                      await mainSetLocalBoolOption(kOptionEnableIpv6Punch, v);
+                      final newValue =
+                          mainGetLocalBoolOptionSync(kOptionEnableIpv6Punch);
+                      setState(() {
+                        _enableIpv6Punch = newValue;
+                      });
+                    },
             ),
           SettingsTile(
               title: Text(translate('Language')),
@@ -831,32 +854,36 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
             SettingsTile.switchTile(
               title: Text(translate('note-at-conn-end-tip')),
               initialValue: _allowAskForNoteAtEndOfConnection,
-              onToggle: (v) async {
-                if (v && !gFFI.userModel.isLogin) {
-                  final res = await loginDialog();
-                  if (res != true) return;
-                }
-                await mainSetLocalBoolOption(
-                    kOptionAllowAskForNoteAtEndOfConnection, v);
-                final newValue = mainGetLocalBoolOptionSync(
-                    kOptionAllowAskForNoteAtEndOfConnection);
-                setState(() {
-                  _allowAskForNoteAtEndOfConnection = newValue;
-                });
-              },
+              onToggle: isOptionFixed(kOptionAllowAskForNoteAtEndOfConnection)
+                  ? null
+                  : (v) async {
+                      if (v && !gFFI.userModel.isLogin) {
+                        final res = await loginDialog();
+                        if (res != true) return;
+                      }
+                      await mainSetLocalBoolOption(
+                          kOptionAllowAskForNoteAtEndOfConnection, v);
+                      final newValue = mainGetLocalBoolOptionSync(
+                          kOptionAllowAskForNoteAtEndOfConnection);
+                      setState(() {
+                        _allowAskForNoteAtEndOfConnection = newValue;
+                      });
+                    },
             ),
           if (!incomingOnly)
             SettingsTile.switchTile(
               title:
                   Text(translate('keep-awake-during-outgoing-sessions-label')),
               initialValue: _preventSleepWhileConnected,
-              onToggle: (v) async {
-                await mainSetLocalBoolOption(
-                    kOptionKeepAwakeDuringOutgoingSessions, v);
-                setState(() {
-                  _preventSleepWhileConnected = v;
-                });
-              },
+              onToggle: isOptionFixed(kOptionKeepAwakeDuringOutgoingSessions)
+                  ? null
+                  : (v) async {
+                      await mainSetLocalBoolOption(
+                          kOptionKeepAwakeDuringOutgoingSessions, v);
+                      setState(() {
+                        _preventSleepWhileConnected = v;
+                      });
+                    },
             ),
         ]),
         if (isAndroid)
@@ -955,7 +982,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
           tiles: [
             SettingsTile(
                 onPressed: (context) async {
-                  await launchUrl(Uri.parse(url));
+                  await launchUrl(Uri.parse(kSehcontrolWebsiteUrl));
                 },
                 title: Text(translate("Version: ") + version),
                 value: Padding(
@@ -984,8 +1011,7 @@ class _SettingsState extends State<SettingsPage> with WidgetsBindingObserver {
                   leading: Icon(Icons.fingerprint)),
             SettingsTile(
               title: Text(translate("Privacy Statement")),
-              onPressed: (context) =>
-                  launchUrlString('https://rustdesk.com/privacy.html'),
+              onPressed: (context) => launchUrlString(kSehcontrolPrivacyUrl),
               leading: Icon(Icons.privacy_tip),
             )
           ],
@@ -1098,8 +1124,7 @@ void showAbout(OverlayDialogManager dialogManager) {
         Text('Version: $version'),
         InkWell(
             onTap: () async {
-              const url = 'https://rustdesk.com/';
-              await launchUrl(Uri.parse(url));
+              await launchUrl(Uri.parse(kSehcontrolWebsiteUrl));
             },
             child: Padding(
               padding: EdgeInsets.symmetric(vertical: 8),

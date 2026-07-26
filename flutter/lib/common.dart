@@ -3593,6 +3593,26 @@ Future<bool> setServerConfig(
   List<RxString>? errMsgs,
   ServerConfig config,
 ) async {
+  const idServerKey = 'custom-rendezvous-server';
+  const relayServerKey = 'relay-server';
+  const apiServerKey = 'api-server';
+  const serverKeyKey = 'key';
+
+  // Enforce managed server policy for every entry point, including imports,
+  // QR codes, deploy flows, and settings dialogs.
+  if (isOptionFixed(idServerKey)) {
+    config.idServer = await bind.mainGetOption(key: idServerKey);
+  }
+  if (isOptionFixed(relayServerKey)) {
+    config.relayServer = await bind.mainGetOption(key: relayServerKey);
+  }
+  if (isOptionFixed(apiServerKey)) {
+    config.apiServer = await bind.mainGetOption(key: apiServerKey);
+  }
+  if (isOptionFixed(serverKeyKey)) {
+    config.key = await bind.mainGetOption(key: serverKeyKey);
+  }
+
   String removeEndSlash(String input) {
     if (input.endsWith('/')) {
       return input.substring(0, input.length - 1);
@@ -3638,11 +3658,18 @@ Future<bool> setServerConfig(
   final oldApiServer = await bind.mainGetApiServer();
 
   // should set one by one
-  await bind.mainSetOption(
-      key: 'custom-rendezvous-server', value: config.idServer);
-  await bind.mainSetOption(key: 'relay-server', value: config.relayServer);
-  await bind.mainSetOption(key: 'api-server', value: config.apiServer);
-  await bind.mainSetOption(key: 'key', value: config.key);
+  if (!isOptionFixed(idServerKey)) {
+    await bind.mainSetOption(key: idServerKey, value: config.idServer);
+  }
+  if (!isOptionFixed(relayServerKey)) {
+    await bind.mainSetOption(key: relayServerKey, value: config.relayServer);
+  }
+  if (!isOptionFixed(apiServerKey)) {
+    await bind.mainSetOption(key: apiServerKey, value: config.apiServer);
+  }
+  if (!isOptionFixed(serverKeyKey)) {
+    await bind.mainSetOption(key: serverKeyKey, value: config.key);
+  }
   final newApiServer = await bind.mainGetApiServer();
   if (oldApiServer.isNotEmpty &&
       oldApiServer != newApiServer &&
@@ -3749,7 +3776,7 @@ Widget loadPowered(BuildContext context) {
     cursor: SystemMouseCursors.click,
     child: GestureDetector(
       onTap: () {
-        launchUrl(Uri.parse('https://rustdesk.com'));
+        launchUrl(Uri.parse(kSehcontrolWebsiteUrl));
       },
       child: Opacity(
           opacity: 0.5,

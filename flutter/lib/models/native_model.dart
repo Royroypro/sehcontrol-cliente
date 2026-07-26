@@ -119,7 +119,7 @@ class PlatformFFI {
   Future<void> init(String appType) async {
     _appType = appType;
     final dylib = isAndroid
-        ? DynamicLibrary.open('sehcontrol.so')
+        ? DynamicLibrary.open('libsehcontrol.so')
         : isLinux
             ? DynamicLibrary.open('sehcontrol.so')
             : isWindows

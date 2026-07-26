@@ -16,3 +16,28 @@ rustflags = [
 #]
 [net]
 git-fetch-with-cli = true
+
+# Android cross-compilation from a Windows host. Set here (not via shell
+# `export`) so it's read directly by cargo regardless of which shell/
+# background process invokes it.
+#
+# CC/CXX point at renamed *copies* of the NDK's versioned clang wrappers
+# (myclang-arm64.cmd, not aarch64-linux-android21-clang.cmd) rather than the
+# originals. cc-rs deliberately rewrites any path whose filename matches the
+# NDK's "<target>-clang" pattern - it swaps in the underlying bare clang.exe
+# via PathBuf::set_file_name() to dodge Windows's ~8k command-line limit -
+# and that rewrite joins the (forward-slash) directory with the new filename
+# using Windows's native backslash. MSYS2 bash/make then reads that
+# backslash as a shell escape character and swallows it, turning
+# ".../bin\clang.exe" into the literal, nonexistent "binclang.exe". A
+# same-directory copy under a name that doesn't match the pattern (it still
+# calls the real clang.exe via its own %~dp0) sidesteps the rewrite so the
+# forward-slash path we set survives intact into the Makefile.
+[target.aarch64-linux-android]
+linker = "C:/Users/rdrf-/AppData/Local/Android/Sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/windows-x86_64/bin/myclang-arm64.cmd"
+
+[env]
+CC_aarch64_linux_android = "C:/Users/rdrf-/AppData/Local/Android/Sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/windows-x86_64/bin/myclang-arm64.cmd"
+CXX_aarch64_linux_android = "C:/Users/rdrf-/AppData/Local/Android/Sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/windows-x86_64/bin/myclangxx-arm64.cmd"
+AR_aarch64_linux_android = "C:/Users/rdrf-/AppData/Local/Android/Sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
+SODIUM_LIB_DIR = "C:/Users/rdrf-/AppData/Local/Temp/libsodium-build/out-arm64"

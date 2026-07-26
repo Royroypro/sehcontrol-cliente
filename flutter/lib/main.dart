@@ -212,17 +212,26 @@ Future<void> _enforceLoginIfRequired() async {
   if (_enforcingRequiredLogin || gFFI.userModel.isLogin) return;
   _enforcingRequiredLogin = true;
   try {
-    if (!await UserModel.fetchForceLogin()) return;
+    // Sehcontrol for Android is account-gated unconditionally. The remote
+    // policy remains relevant on other platforms, but Android must never
+    // expose the application while logged out or while the policy endpoint
+    // is unavailable.
+    final loginRequired = isAndroid || await UserModel.fetchForceLogin();
+    if (!loginRequired) return;
     while (!gFFI.userModel.isLogin) {
       final loggedIn = await loginDialog();
       if (loggedIn != true) {
         // Closing a mandatory login dialog means the user wants to leave the
         // application. Do not reopen it in a loop or leave the main window
         // trapped behind another modal.
-        await bind.mainOnMainWindowClose();
-        await rustDeskWinManager.closeAllSubWindows();
-        await windowManager.setPreventClose(false);
-        await windowManager.close();
+        if (isAndroid) {
+          await SystemNavigator.pop(animated: true);
+        } else {
+          await bind.mainOnMainWindowClose();
+          await rustDeskWinManager.closeAllSubWindows();
+          await windowManager.setPreventClose(false);
+          await windowManager.close();
+        }
         return;
       }
     }

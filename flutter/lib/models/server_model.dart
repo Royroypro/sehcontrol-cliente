@@ -452,6 +452,12 @@ class ServerModel with ChangeNotifier {
     notifyListeners();
     parent.target?.ffiModel.updateEventListener(parent.target!.sessionId, "");
     await parent.target?.invokeMethod("init_service");
+    // The managed SehControl server supports rendezvous over TCP 21116.
+    // Prefer it on Android because some mobile networks silently drop the
+    // UDP registration packets, leaving the service in "connecting".
+    if (isAndroid) {
+      await bind.mainSetOption(key: kOptionDisableUdp, value: defaultOptionYes);
+    }
     // ugly is here, because for desktop, below is useless
     await bind.mainStartService();
     updateClientState();

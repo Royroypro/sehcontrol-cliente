@@ -119,9 +119,19 @@ class _PeerTabPageState extends State<PeerTabPage>
                   crossAxisAlignment: CrossAxisAlignment.center,
                   children: [
                     Expanded(
-                        child: visibleContextMenuListener(
-                            _createSwitchBar(context))),
-                    ..._buildReservedTagChips(context),
+                      child: stateGlobal.isPortrait.isTrue
+                          ? SingleChildScrollView(
+                              scrollDirection: Axis.horizontal,
+                              child: Row(
+                                children: _buildMobileNavigationItems(context),
+                              ),
+                            )
+                          : visibleContextMenuListener(
+                              _createSwitchBar(context)),
+                    ),
+                    if (stateGlobal.isPortrait.isFalse)
+                      ..._buildReservedTagChips(context),
+                    if (stateGlobal.isPortrait.isTrue) const SizedBox(width: 8),
                     if (stateGlobal.isPortrait.isTrue)
                       ..._portraitRightActions(context)
                     else
@@ -139,7 +149,9 @@ class _PeerTabPageState extends State<PeerTabPage>
   /// not expose RustDesk Pro's device-group endpoints.
   String _tabLabel(PeerTabModel model, int t) {
     if (t == PeerTabIndex.recent.index) return translate('All');
-    if (t == PeerTabIndex.ab.index) return translate('My Devices');
+    if (t == PeerTabIndex.ab.index) {
+      return isMobile ? 'Equipos' : translate('My Devices');
+    }
     return model.tabTooltip(t);
   }
 
@@ -147,7 +159,8 @@ class _PeerTabPageState extends State<PeerTabPage>
     if (t == PeerTabIndex.recent.index) {
       return gFFI.recentPeersModel.getPeersCount();
     }
-    if (t == PeerTabIndex.fav.index) return gFFI.favoritePeersModel.getPeersCount();
+    if (t == PeerTabIndex.fav.index)
+      return gFFI.favoritePeersModel.getPeersCount();
     if (t == PeerTabIndex.lan.index) return gFFI.lanPeersModel.getPeersCount();
     if (t == PeerTabIndex.ab.index) return gFFI.abModel.currentAbPeers.length;
     if (t == PeerTabIndex.group.index) return gFFI.groupModel.peers.length;
@@ -161,18 +174,126 @@ class _PeerTabPageState extends State<PeerTabPage>
   /// data model or server endpoint needed.
   static const List<String> reservedTagChips = ['Cabinas', 'Clientes'];
 
+  List<Widget> _buildMobileNavigationItems(BuildContext context) {
+    final model = Provider.of<PeerTabModel>(context);
+    final items = <Widget>[];
+
+    // Keep the managed-device sections visible first on narrow screens.
+    // Secondary history/favorite tabs remain available by scrolling right.
+    if (model.visibleEnabledOrderedIndexs.contains(PeerTabIndex.lan.index)) {
+      items.add(_buildMobileTabChip(context, model, PeerTabIndex.lan.index));
+    }
+    items.add(_buildMobileTabChip(
+      context,
+      model,
+      PeerTabIndex.ab.index,
+    ));
+    items.addAll(reservedTagChips
+        .map((tag) => _buildMobileReservedTagChip(context, tag)));
+
+    for (final tab in model.visibleEnabledOrderedIndexs) {
+      if (tab == PeerTabIndex.ab.index || tab == PeerTabIndex.lan.index) {
+        continue;
+      }
+      items.add(_buildMobileTabChip(context, model, tab));
+    }
+    return items;
+  }
+
+  Widget _buildMobileTabChip(
+    BuildContext context,
+    PeerTabModel model,
+    int tab,
+  ) {
+    final selected = model.currentTab == tab &&
+        (tab != PeerTabIndex.ab.index || gFFI.abModel.selectedTags.isEmpty);
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final color = selected
+        ? (isDark ? Colors.white : const Color(0xFF1565C0))
+        : (isDark ? Colors.white70 : const Color(0xFF424242));
+    return Padding(
+      padding: const EdgeInsets.symmetric(horizontal: 1),
+      child: ChoiceChip(
+        label: Text(
+          '${_tabLabel(model, tab)} (${_tabCount(tab)})',
+          style: TextStyle(color: color, fontSize: 12),
+        ),
+        labelPadding: EdgeInsets.zero,
+        padding: EdgeInsets.zero,
+        selected: selected,
+        showCheckmark: false,
+        visualDensity: const VisualDensity(horizontal: -3, vertical: -4),
+        materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+        side: BorderSide.none,
+        backgroundColor:
+            isDark ? const Color(0xFF303030) : const Color(0xFFF0F1F4),
+        selectedColor:
+            isDark ? const Color(0xFF424242) : const Color(0xFFE3F2FD),
+        onSelected: (_) async {
+          if (tab == PeerTabIndex.ab.index) {
+            gFFI.abModel.selectedTags.clear();
+          }
+          await handleTabSelection(tab);
+          await bind.setLocalFlutterOption(
+              k: kOptionPeerTabIndex, v: tab.toString());
+        },
+      ),
+    );
+  }
+
+  Widget _buildMobileReservedTagChip(BuildContext context, String tag) {
+    return Obx(() {
+      final count = gFFI.abModel.currentAbPeers
+          .where((p) => p.tags.contains(tag))
+          .length;
+      final selected = gFFI.peerTabModel.currentTab == PeerTabIndex.ab.index &&
+          gFFI.abModel.selectedTags.length == 1 &&
+          gFFI.abModel.selectedTags.first == tag;
+      final isDark = Theme.of(context).brightness == Brightness.dark;
+      final color = selected
+          ? (isDark ? Colors.white : const Color(0xFF1565C0))
+          : (isDark ? Colors.white70 : const Color(0xFF424242));
+      return Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 1),
+        child: ChoiceChip(
+          label:
+              Text('$tag ($count)', style: TextStyle(color: color, fontSize: 12)),
+          labelPadding: EdgeInsets.zero,
+          padding: EdgeInsets.zero,
+          selected: selected,
+          showCheckmark: false,
+          visualDensity: const VisualDensity(horizontal: -3, vertical: -4),
+          materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+          side: BorderSide.none,
+          backgroundColor:
+              isDark ? const Color(0xFF303030) : const Color(0xFFF0F1F4),
+          selectedColor:
+              isDark ? const Color(0xFF424242) : const Color(0xFFE3F2FD),
+          onSelected: (_) async {
+            gFFI.abModel.selectedTags
+              ..clear()
+              ..add(tag);
+            await handleTabSelection(PeerTabIndex.ab.index);
+          },
+        ),
+      );
+    });
+  }
+
   List<Widget> _buildReservedTagChips(BuildContext context) {
     return reservedTagChips.map((tag) {
       return Obx(() {
         final count = gFFI.abModel.currentAbPeers
             .where((p) => p.tags.contains(tag))
             .length;
-        final selected = gFFI.peerTabModel.currentTab == PeerTabIndex.ab.index &&
-            gFFI.abModel.selectedTags.length == 1 &&
-            gFFI.abModel.selectedTags.first == tag;
+        final selected =
+            gFFI.peerTabModel.currentTab == PeerTabIndex.ab.index &&
+                gFFI.abModel.selectedTags.length == 1 &&
+                gFFI.abModel.selectedTags.first == tag;
+        final isDark = Theme.of(context).brightness == Brightness.dark;
         final color = selected
-            ? MyTheme.tabbar(context).selectedTextColor
-            : MyTheme.tabbar(context).unSelectedTextColor;
+            ? (isDark ? Colors.white : const Color(0xFF1565C0))
+            : (isDark ? Colors.white70 : const Color(0xFF424242));
         return InkWell(
           onTap: () async {
             gFFI.abModel.selectedTags
@@ -183,8 +304,7 @@ class _PeerTabPageState extends State<PeerTabPage>
           child: Container(
             decoration: selected
                 ? BoxDecoration(
-                    border:
-                        Border(bottom: BorderSide(width: 2, color: color!)))
+                    border: Border(bottom: BorderSide(width: 2, color: color)))
                 : null,
             child: Text('$tag ($count)',
                     style: TextStyle(color: color, fontSize: 13))
@@ -204,52 +324,63 @@ class _PeerTabPageState extends State<PeerTabPage>
         scrollDirection: Axis.horizontal,
         physics: NeverScrollableScrollPhysics(),
         children: model.visibleEnabledOrderedIndexs.map((t) {
-          final selected = model.currentTab == t;
-          final color = selected
-              ? MyTheme.tabbar(context).selectedTextColor
-              : MyTheme.tabbar(context).unSelectedTextColor
-            ?..withOpacity(0.5);
           final hover = false.obs;
           final deco = BoxDecoration(
               color: Theme.of(context).colorScheme.background,
               borderRadius: BorderRadius.circular(6));
-          final decoBorder = BoxDecoration(
-              border: Border(
-            bottom: BorderSide(width: 2, color: color!),
-          ));
           counter += 1;
           return ReorderableDragStartListener(
               key: ValueKey(t),
               index: counter,
-              child: Obx(() => Tooltip(
-                    preferBelow: false,
-                    message: model.tabTooltip(t),
-                    onTriggered: isMobile ? mobileShowTabVisibilityMenu : null,
-                    child: InkWell(
-                      child: Container(
-                        decoration: (hover.value
-                            ? (selected ? decoBorder : deco)
-                            : (selected ? decoBorder : null)),
-                        child: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            Icon(model.tabIcon(t), color: color, size: 16),
-                            const SizedBox(width: 6),
-                            Text('${_tabLabel(model, t)} (${_tabCount(t)})',
-                                style: TextStyle(color: color, fontSize: 13)),
-                          ],
-                        ).paddingSymmetric(horizontal: 4),
+              child: Obx(() {
+                final selected = model.currentTab == t &&
+                    (t != PeerTabIndex.ab.index ||
+                        gFFI.abModel.selectedTags.isEmpty);
+                final color = selected
+                    ? MyTheme.tabbar(context).selectedTextColor
+                    : MyTheme.tabbar(context).unSelectedTextColor
+                  ?..withOpacity(0.5);
+                final decoBorder = BoxDecoration(
+                    border: Border(
+                  bottom: BorderSide(width: 2, color: color!),
+                ));
+                return Tooltip(
+                  preferBelow: false,
+                  message: model.tabTooltip(t),
+                  onTriggered: isMobile ? mobileShowTabVisibilityMenu : null,
+                  child: InkWell(
+                    child: Container(
+                      decoration: (hover.value
+                          ? (selected ? decoBorder : deco)
+                          : (selected ? decoBorder : null)),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(model.tabIcon(t), color: color, size: 16),
+                          const SizedBox(width: 6),
+                          Text('${_tabLabel(model, t)} (${_tabCount(t)})',
+                              style: TextStyle(color: color, fontSize: 13)),
+                        ],
                       ).paddingSymmetric(horizontal: 4),
-                      onTap: isOptionFixed(kOptionPeerTabIndex)
-                          ? null
-                          : () async {
-                              await handleTabSelection(t);
-                              await bind.setLocalFlutterOption(
-                                  k: kOptionPeerTabIndex, v: t.toString());
-                            },
-                      onHover: (value) => hover.value = value,
-                    ),
-                  )));
+                    ).paddingSymmetric(horizontal: 4),
+                    onTap: isOptionFixed(kOptionPeerTabIndex)
+                        ? null
+                        : () async {
+                            // "Equipos" represents the complete set of
+                            // devices associated with the signed-in
+                            // account. Clear reserved Cabinas/Clientes tag
+                            // filters when returning to this tab.
+                            if (t == PeerTabIndex.ab.index) {
+                              gFFI.abModel.selectedTags.clear();
+                            }
+                            await handleTabSelection(t);
+                            await bind.setLocalFlutterOption(
+                                k: kOptionPeerTabIndex, v: t.toString());
+                          },
+                    onHover: (value) => hover.value = value,
+                  ),
+                );
+              }));
         }).toList());
   }
 

@@ -61,7 +61,7 @@ class HomePageState extends State<HomePage> {
 
   @override
   Widget build(BuildContext context) {
-    return WillPopScope(
+    final scaffold = WillPopScope(
         onWillPop: () async {
           if (_selectedIndex != 0) {
             setState(() {
@@ -109,6 +109,35 @@ class HomePageState extends State<HomePage> {
             ],
           ),
         ));
+    return Obx(() {
+      final loginRequired = isAndroid && !gFFI.userModel.isLogin;
+      return Stack(
+        children: [
+          AbsorbPointer(absorbing: loginRequired, child: scaffold),
+          if (loginRequired)
+            Positioned.fill(
+              child: ColoredBox(
+                color: Theme.of(context).scaffoldBackgroundColor,
+                child: Center(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      loadIcon(72),
+                      const SizedBox(height: 24),
+                      const CircularProgressIndicator(),
+                      const SizedBox(height: 18),
+                      Text(
+                        translate('Login'),
+                        style: Theme.of(context).textTheme.titleMedium,
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+        ],
+      );
+    });
   }
 
   Widget appTitle() {
@@ -155,7 +184,20 @@ class HomePageState extends State<HomePage> {
         ],
       );
     }
-    return Text(bind.mainGetAppNameSync());
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        loadIcon(28),
+        const SizedBox(width: 8),
+        Text(
+          bind.mainGetAppNameSync().toUpperCase(),
+          style: const TextStyle(
+            fontWeight: FontWeight.bold,
+            letterSpacing: 0.5,
+          ),
+        ),
+      ],
+    );
   }
 }
 
@@ -250,11 +292,11 @@ class WebHomePage extends StatelessWidget {
       }
     }
     if (id != null) {
-      connect(context, id, 
-        isFileTransfer: isFileTransfer, 
-        isViewCamera: isViewCamera, 
-        isTerminal: isTerminal,
-        password: password);
+      connect(context, id,
+          isFileTransfer: isFileTransfer,
+          isViewCamera: isViewCamera,
+          isTerminal: isTerminal,
+          password: password);
     }
   }
 }

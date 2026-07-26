@@ -53,6 +53,9 @@ class UserModel {
   final RxList<ServerNotification> notifications = <ServerNotification>[].obs;
   final Set<String> _seenNotificationIds = {};
   Timer? _membershipTimer;
+  Timer? _heartbeatTimer;
+  bool _heartbeatInFlight = false;
+  bool _heartbeatConfirmed = false;
   WebSocketChannel? _realtimeChannel;
   Timer? _realtimePingTimer;
   bool _realtimeReconnectScheduled = false;
@@ -148,12 +151,17 @@ class UserModel {
       await checkMembershipStatus();
       await checkMessages();
     });
+    _startHeartbeat();
     connectRealtimeChannel();
   }
 
   void stopMembershipPolling() {
     _membershipTimer?.cancel();
     _membershipTimer = null;
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
+    _heartbeatInFlight = false;
+    _heartbeatConfirmed = false;
     membershipBlocked.value = false;
     membershipMessage.value = '';
     membershipDaysLeft.value = null;
@@ -163,6 +171,43 @@ class UserModel {
     membershipMaxDevices.value = null;
     clearNotifications();
     disconnectRealtimeChannel();
+  }
+
+  void _startHeartbeat() {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
+    if (!isAndroid) return;
+    _heartbeatTimer =
+        periodic_immediate(const Duration(seconds: 15), _sendHeartbeat);
+  }
+
+  Future<void> _sendHeartbeat() async {
+    if (!isLogin || _heartbeatInFlight) return;
+    _heartbeatInFlight = true;
+    try {
+      final url = (await bind.mainGetApiServer()).trim();
+      if (url.isEmpty) return;
+      final resp = await http
+          .post(
+            Uri.parse('$url/api/heartbeat'),
+            headers: const {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'id': await bind.mainGetMyId(),
+              'uuid': await bind.mainGetUuid(),
+            }),
+          )
+          .timeout(const Duration(seconds: 10));
+      if (resp.statusCode < 200 || resp.statusCode >= 300) {
+        debugPrint('Heartbeat failed: HTTP ${resp.statusCode}');
+      } else if (!_heartbeatConfirmed) {
+        _heartbeatConfirmed = true;
+        debugPrint('Android heartbeat confirmed');
+      }
+    } catch (e) {
+      debugPrint('Heartbeat failed: $e');
+    } finally {
+      _heartbeatInFlight = false;
+    }
   }
 
   void clearUnreadNotifications() {
