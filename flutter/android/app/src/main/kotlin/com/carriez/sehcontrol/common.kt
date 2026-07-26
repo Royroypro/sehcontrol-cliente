@@ -50,6 +50,12 @@ const val SYNC_APP_DIR_CONFIG_PATH = "sync_app_dir"
 const val GET_VALUE = "get_value"
 
 const val KEY_IS_SUPPORT_VOICE_CALL = "KEY_IS_SUPPORT_VOICE_CALL"
+// Settings.Secure.ANDROID_ID: survives app data being cleared and reinstalls
+// (unlike RustDesk's own id/uuid, which live in app-private storage and are
+// wiped along with it). Used as the stable per-device identifier sent as
+// deviceInfo.machine_id so the membership panel can re-link the same physical
+// device instead of treating a reinstall as a brand new one.
+const val KEY_ANDROID_ID = "KEY_ANDROID_ID"
 
 const val KEY_SHARED_PREFERENCES = "KEY_SHARED_PREFERENCES"
 const val KEY_START_ON_BOOT_OPT = "KEY_START_ON_BOOT_OPT"

@@ -1,11 +1,38 @@
 import 'dart:convert';
+import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/consts.dart';
 
 import 'package:flutter_hbb/models/peer_model.dart';
 
 import '../../models/platform_model.dart';
+
+/// Stable, per-device identifier for Android, hashed the same way as the
+/// desktop `machine_id` (SHA-256 hex) before it ever leaves the device.
+///
+/// Unlike RustDesk's own `id`/`uuid` (generated into app-private storage and
+/// therefore wiped by "Clear data" or a reinstall), `Settings.Secure.ANDROID_ID`
+/// lives at the OS level and survives both — which is exactly what lets the
+/// membership panel re-link a reinstalled device to its existing record
+/// instead of creating a duplicate. See docs/CLIENT_INTEGRATION.md section 10.
+String? _androidMachineIdCache;
+
+/// Fetched once during mobile app startup (see main.dart), so [LoginRequest.toJson]
+/// can stay synchronous and simply read whatever is already cached by login time.
+Future<void> fetchAndroidMachineId() async {
+  if (!isAndroid) return;
+  try {
+    final rawId = await const MethodChannel('mChannel')
+        .invokeMethod('get_value', 'KEY_ANDROID_ID');
+    if (rawId is String && rawId.isNotEmpty) {
+      _androidMachineIdCache = sha256.convert(utf8.encode(rawId)).toString();
+    }
+  } catch (e) {
+    debugPrint('Failed to fetch Android machine id: $e');
+  }
+}
 
 class HttpType {
   static const kAuthReqTypeAccount = "account";
@@ -171,6 +198,14 @@ class LoginRequest {
       deviceInfo = jsonDecode(bind.mainGetLoginDeviceInfo());
     } catch (e) {
       debugPrint('Failed to decode get device info: $e');
+    }
+    // Desktop platforms already fill this in on the Rust side (see
+    // get_login_device_info() in ui_interface.rs). Android's uuid comes from
+    // Config::get_key_pair() instead, which lives in app-private storage and
+    // is not stable across "Clear data"/reinstall, so it cannot serve the
+    // same purpose there — machine_id has to be added on the Dart side.
+    if (isAndroid && _androidMachineIdCache != null) {
+      deviceInfo['machine_id'] = _androidMachineIdCache;
     }
     data['deviceInfo'] = deviceInfo;
     return data;

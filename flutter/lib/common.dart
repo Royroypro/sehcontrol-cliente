@@ -3944,6 +3944,165 @@ Widget buildMembershipBanner() {
   });
 }
 
+/// Plan/membership summary card shown at the top of the mobile home screen
+/// (below the tags row, above the device list). Purely informational — mirrors
+/// the fields already returned by `/api/membership/status` and cached on
+/// [UserModel] (`membershipPlanName`, `membershipExpiresAt`,
+/// `membershipDeviceCount`/`membershipMaxDevices`). Renders nothing if no
+/// membership panel is configured (i.e. `membershipPlanName` was never
+/// populated), so it stays invisible on stock deployments.
+Widget buildMembershipPlanCard() {
+  return Obx(() {
+    final planName = gFFI.userModel.membershipPlanName.value;
+    if (planName.isEmpty) return const SizedBox.shrink();
+
+    final blocked = gFFI.userModel.membershipBlocked.value;
+    final daysLeft = gFFI.userModel.membershipDaysLeft.value;
+    final expiresAt = gFFI.userModel.membershipExpiresAt.value;
+    final deviceCount = gFFI.userModel.membershipDeviceCount.value;
+    final maxDevices = gFFI.userModel.membershipMaxDevices.value;
+    final expiringSoon = !blocked && daysLeft != null && daysLeft <= 7;
+
+    final Color accentColor = blocked
+        ? Colors.redAccent
+        : expiringSoon
+            ? Colors.orangeAccent
+            : const Color(0xFFFFC24B); // gold
+    final String statusLabel = blocked
+        ? translate('Account restricted')
+        : expiringSoon
+            ? translate('membership_expiring_tip')
+            : translate('Plan active');
+    final String tagline = blocked
+        ? (gFFI.userModel.membershipMessage.value.isNotEmpty
+            ? gFFI.userModel.membershipMessage.value
+            : translate('membership_blocked_tip'))
+        : translate('membership_protection_tagline');
+
+    String expiresLabel = '-';
+    if (expiresAt != null) {
+      final y = expiresAt.year.toString().padLeft(4, '0');
+      final m = expiresAt.month.toString().padLeft(2, '0');
+      final d = expiresAt.day.toString().padLeft(2, '0');
+      expiresLabel = '$y-$m-$d';
+    }
+    final devicesLabel =
+        (deviceCount != null && maxDevices != null) ? '$deviceCount / $maxDevices' : '-';
+
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: 8),
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFF15161C),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: accentColor.withOpacity(0.55), width: 1.2),
+        boxShadow: [
+          BoxShadow(
+            color: accentColor.withOpacity(0.18),
+            blurRadius: 16,
+            spreadRadius: 1,
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.shield_rounded, color: accentColor, size: 30),
+              const SizedBox(width: 10),
+              Expanded(
+                child: Row(
+                  children: [
+                    Flexible(
+                      child: Text(
+                        planName,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 17,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 8),
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                          horizontal: 8, vertical: 3),
+                      decoration: BoxDecoration(
+                        color: accentColor.withOpacity(0.15),
+                        borderRadius: BorderRadius.circular(20),
+                        border: Border.all(color: accentColor.withOpacity(0.6)),
+                      ),
+                      child: Text(
+                        statusLabel,
+                        style: TextStyle(
+                          color: accentColor,
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              Icon(Icons.verified_user_rounded,
+                  color: Colors.white54, size: 14),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  tagline,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(color: Colors.white54, fontSize: 12.5),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Divider(color: Colors.white.withOpacity(0.08), height: 1),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(
+                child: _membershipStat(translate('Expires'), expiresLabel),
+              ),
+              Container(
+                width: 1,
+                height: 30,
+                color: Colors.white.withOpacity(0.08),
+              ),
+              Expanded(
+                child: _membershipStat(translate('Devices'), devicesLabel),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  });
+}
+
+Widget _membershipStat(String label, String value) {
+  return Column(
+    crossAxisAlignment: CrossAxisAlignment.start,
+    children: [
+      Text(label,
+          style: const TextStyle(color: Colors.white38, fontSize: 11.5)),
+      const SizedBox(height: 2),
+      Text(value,
+          style: const TextStyle(
+              color: Colors.white,
+              fontSize: 14.5,
+              fontWeight: FontWeight.w600)),
+    ],
+  );
+}
+
 /// Persistent, non-dismissible lock screen shown over the whole main page
 /// while the membership panel reports the account suspended/expired.
 /// Unlike [showMembershipBlockedDialog] (a one-off popup you can close and

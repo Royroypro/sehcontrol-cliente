@@ -24,6 +24,7 @@ import 'package:provider/provider.dart';
 import 'package:window_manager/window_manager.dart';
 
 import 'common.dart';
+import 'common/hbbs/hbbs.dart';
 import 'common/widgets/login.dart';
 import 'consts.dart';
 import 'mobile/pages/home_page.dart';
@@ -189,6 +190,10 @@ void runMobileApp() async {
   checkUpdate();
   if (isAndroid) androidChannelInit();
   if (isAndroid) platformFFI.syncAndroidServiceAppDirConfigPath();
+  // Must resolve before the first login attempt so LoginRequest.toJson() has
+  // it cached; login itself can happen as early as _enforceLoginIfRequired()
+  // right after the first frame, so this can't be left to run lazily.
+  if (isAndroid) await fetchAndroidMachineId();
   draggablePositions.load();
   await Future.wait([gFFI.abModel.loadCache(), gFFI.groupModel.loadCache()]);
   gFFI.userModel.refreshCurrentUser();

@@ -261,6 +261,13 @@ class MainActivity : FlutterActivity() {
                     if (call.arguments is String) {
                         if (call.arguments == KEY_IS_SUPPORT_VOICE_CALL) {
                             result.success(isSupportVoiceCall())
+                        } else if (call.arguments == KEY_ANDROID_ID) {
+                            result.success(
+                                android.provider.Settings.Secure.getString(
+                                    contentResolver,
+                                    android.provider.Settings.Secure.ANDROID_ID
+                                ) ?: ""
+                            )
                         } else {
                             result.error("-1", "No such key", null)
                         }

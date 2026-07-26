@@ -52,6 +52,8 @@ pub struct LoginDeviceInfo {
     pub os: String,
     pub r#type: String,
     pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
 }
 
 lazy_static::lazy_static! {
@@ -1303,7 +1305,68 @@ pub fn get_login_device_info() -> LoginDeviceInfo {
         os: std::env::consts::OS.to_owned(),
         r#type: "client".to_owned(),
         name: crate::common::hostname(),
+        machine_id: get_hashed_machine_id(),
     }
+}
+
+// A stable, per-machine identifier that survives sehcontrol being uninstalled and
+// reinstalled (unlike the sehcontrol id, which is regenerated locally). Hashed before
+// leaving the device so no raw hardware identifier is transmitted.
+fn get_hashed_machine_id() -> Option<String> {
+    let raw = get_raw_machine_id()?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(raw.as_bytes());
+    Some(hex::encode(hasher.finalize()))
+}
+
+#[cfg(windows)]
+fn get_raw_machine_id() -> Option<String> {
+    use winreg::{
+        enums::{HKEY_LOCAL_MACHINE, KEY_READ, KEY_WOW64_64KEY},
+        RegKey,
+    };
+    let hklm = RegKey::predef(HKEY_LOCAL_MACHINE);
+    // KEY_WOW64_64KEY is required so a 32-bit build is not silently redirected to
+    // SOFTWARE\WOW6432Node\Microsoft\Cryptography, which exists but holds no
+    // MachineGuid. Without it the 32-bit client would send no machine_id at all.
+    // The flag is ignored on 32-bit Windows itself.
+    let key = hklm
+        .open_subkey_with_flags("SOFTWARE\\Microsoft\\Cryptography", KEY_READ | KEY_WOW64_64KEY)
+        .ok()?;
+    key.get_value::<String, _>("MachineGuid").ok()
+}
+
+#[cfg(target_os = "linux")]
+fn get_raw_machine_id() -> Option<String> {
+    std::fs::read_to_string("/etc/machine-id")
+        .or_else(|_| std::fs::read_to_string("/var/lib/dbus/machine-id"))
+        .ok()
+}
+
+#[cfg(target_os = "macos")]
+fn get_raw_machine_id() -> Option<String> {
+    let output = std::process::Command::new("ioreg")
+        .args(["-rd1", "-c", "IOPlatformExpertDevice"])
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.lines().find_map(|line| {
+        if !line.contains("IOPlatformUUID") {
+            return None;
+        }
+        line.split('"').nth(3).map(|s| s.to_owned())
+    })
+}
+
+#[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+fn get_raw_machine_id() -> Option<String> {
+    // Android sends its own stable identifier as `uuid`; nothing to add here.
+    None
 }
 
 #[inline]
