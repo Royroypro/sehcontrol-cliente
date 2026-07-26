@@ -135,6 +135,11 @@ def make_parser():
         help='Enable feature vram, only available on windows now.'
     )
     parser.add_argument(
+        '--screencam',
+        action='store_true',
+        help='Enable feature screencam (Sehcontrol ScreenCam, Windows only). Implies hwcodec.'
+    )
+    parser.add_argument(
         '--portable',
         action='store_true',
         help='Build windows portable'
@@ -292,6 +297,13 @@ def get_features(args):
         features.append('hwcodec')
     if args.vram:
         features.append('vram')
+    if args.screencam:
+        # Cargo.toml's screencam feature already implies hwcodec on its own,
+        # this is just so `--screencam` alone (without also passing
+        # `--hwcodec`) doesn't print a misleading feature list here.
+        if 'hwcodec' not in features:
+            features.append('hwcodec')
+        features.append('screencam')
     if args.flutter:
         features.append('flutter')
     if args.unix_file_copy_paste:

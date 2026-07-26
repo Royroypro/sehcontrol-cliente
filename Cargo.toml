@@ -29,6 +29,9 @@ flutter = ["flutter_rust_bridge"]
 default = ["use_dasp"]
 hwcodec = ["scrap/hwcodec"]
 vram = ["scrap/vram"]
+# Sehcontrol ScreenCam (docs/SCREENCAM_PLAN.md). Hardware-only by design
+# (plan section 7, option A) — depends on hwcodec, no software H.264 path.
+screencam = ["hwcodec"]
 mediacodec = ["scrap/mediacodec"]
 plugin_framework = []
 linux-pkg-config = ["magnum-opus/linux-pkg-config", "scrap/linux-pkg-config"]
