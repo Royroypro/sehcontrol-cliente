@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_hbb/common/hbbs/hbbs.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_hbb/models/user_model.dart';
@@ -453,7 +454,7 @@ const kAuthReqTypeOidc = 'oidc/';
 Widget _buildUpgradePlansPanel(BuildContext context, VoidCallback onBack) {
   const plansUrl = 'https://sehcontrol.sehuacho.com/actualizar-planes';
   final mutedColor =
-      Theme.of(context).textTheme.bodyMedium?.color?.withValues(alpha: 0.72);
+      Theme.of(context).textTheme.bodyMedium?.color?.withOpacity(0.72);
 
   Widget benefit(IconData icon, String text) => Padding(
         padding: const EdgeInsets.only(bottom: 12),
@@ -464,7 +465,7 @@ Widget _buildUpgradePlansPanel(BuildContext context, VoidCallback onBack) {
               width: 30,
               height: 30,
               decoration: BoxDecoration(
-                color: const Color(0xFF0D7BFF).withValues(alpha: 0.14),
+                color: const Color(0xFF0D7BFF).withOpacity(0.14),
                 borderRadius: BorderRadius.circular(9),
               ),
               child: Icon(icon, size: 17, color: const Color(0xFF258BFF)),
@@ -800,7 +801,7 @@ Future<bool?> loginDialog() async {
                       child: Divider(
                         color: Theme.of(context)
                             .dividerColor
-                            .withValues(alpha: 0.55),
+                            .withOpacity(0.55),
                       ),
                     ),
                     Padding(
@@ -813,7 +814,7 @@ Future<bool?> loginDialog() async {
                               .textTheme
                               .bodySmall
                               ?.color
-                              ?.withValues(alpha: 0.7),
+                              ?.withOpacity(0.7),
                         ),
                       ),
                     ),
@@ -821,7 +822,7 @@ Future<bool?> loginDialog() async {
                       child: Divider(
                         color: Theme.of(context)
                             .dividerColor
-                            .withValues(alpha: 0.55),
+                            .withOpacity(0.55),
                       ),
                     ),
                   ],
@@ -853,7 +854,10 @@ Future<bool?> loginDialog() async {
     );
   });
 
-  if (res != null) {
+  // Only refresh account-dependent models after a successful login. Waiting
+  // for this work after Cancel delays the mandatory-login caller and leaves
+  // the Android activity usable behind the dismissed dialog.
+  if (res == true) {
     await UserModel.updateOtherModels();
   }
 
@@ -973,9 +977,12 @@ Future<bool?> verificationCodeDialog(
 
 void logOutConfirmDialog() {
   gFFI.dialogManager.show((setState, close, context) {
-    submit() {
+    submit() async {
       close();
-      gFFI.userModel.logOut();
+      await gFFI.userModel.logOut();
+      if (isAndroid) {
+        await SystemNavigator.pop(animated: true);
+      }
     }
 
     return CustomAlertDialog(
