@@ -9,6 +9,8 @@ import shutil
 import hashlib
 import argparse
 import sys
+import subprocess
+import tempfile
 from pathlib import Path
 
 windows = platform.platform().startswith('Windows')
@@ -45,6 +47,179 @@ def system2(cmd):
         sys.stderr.write(f"Error occurred when executing: `{cmd}`. Exiting.\n")
         sys.exit(-1)
 
+
+
+REPO_ROOT = Path(__file__).resolve().parent
+WINDOW_INJECTION_REPO_URL = 'https://github.com/rustdesk-org/RustDeskTempTopMostWindow.git'
+USBMMIDD_URL = 'https://github.com/rustdesk-org/rdev/releases/download/usbmmidd_v2/usbmmidd_v2.zip'
+
+
+def _run_checked(command, cwd=None):
+    """Run a command without shell parsing and stop the build on failure."""
+    print('>', subprocess.list2cmdline([str(item) for item in command]))
+    subprocess.run(
+        [str(item) for item in command],
+        cwd=str(cwd) if cwd else None,
+        check=True,
+    )
+
+
+def _find_msbuild() -> Path:
+    """Find the Visual Studio MSBuild executable used to compile WindowInjection.dll."""
+    program_files_x86 = Path(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'))
+    vswhere = program_files_x86 / 'Microsoft Visual Studio' / 'Installer' / 'vswhere.exe'
+
+    if vswhere.is_file():
+        result = subprocess.run(
+            [
+                str(vswhere),
+                '-latest',
+                '-products', '*',
+                '-requires', 'Microsoft.Component.MSBuild',
+                '-find', r'MSBuild\**\Bin\amd64\MSBuild.exe',
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        for line in result.stdout.splitlines():
+            candidate = Path(line.strip())
+            if candidate.is_file():
+                return candidate
+
+    candidates = [
+        program_files_x86 / 'Microsoft Visual Studio/2022/BuildTools/MSBuild/Current/Bin/amd64/MSBuild.exe',
+        program_files_x86 / 'Microsoft Visual Studio/2022/Community/MSBuild/Current/Bin/amd64/MSBuild.exe',
+        program_files_x86 / 'Microsoft Visual Studio/2022/Professional/MSBuild/Current/Bin/amd64/MSBuild.exe',
+        program_files_x86 / 'Microsoft Visual Studio/2022/Enterprise/MSBuild/Current/Bin/amd64/MSBuild.exe',
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+
+    from_path = shutil.which('msbuild')
+    if from_path:
+        return Path(from_path)
+
+    raise FileNotFoundError(
+        'MSBuild no fue encontrado. Instala Visual Studio 2022 Build Tools con Desktop development with C++.'
+    )
+
+
+def _build_window_injection(output_dir: Path):
+    """Build and copy WindowInjection.dll for privacy mode 1."""
+    if win_arch != 'x64':
+        raise RuntimeError('La compilación automática de WindowInjection.dll está configurada para Windows x64.')
+
+    repo_dir = REPO_ROOT / 'RustDeskTempTopMostWindow'
+    if not repo_dir.is_dir():
+        _run_checked([
+            'git', 'clone', '--depth', '1',
+            WINDOW_INJECTION_REPO_URL,
+            str(repo_dir),
+        ])
+
+    project = repo_dir / 'WindowInjection' / 'WindowInjection.vcxproj'
+    if not project.is_file():
+        raise FileNotFoundError(f'No se encontró el proyecto: {project}')
+
+    msbuild = _find_msbuild()
+    _run_checked([
+        msbuild,
+        project,
+        '-p:Configuration=Release',
+        '-p:Platform=x64',
+        '-p:PlatformToolset=v143',
+        '-p:TargetVersion=Windows10',
+    ])
+
+    dll = repo_dir / 'WindowInjection' / 'x64' / 'Release' / 'WindowInjection.dll'
+    if not dll.is_file():
+        raise FileNotFoundError(f'La compilación terminó sin generar: {dll}')
+
+    destination = output_dir / 'WindowInjection.dll'
+    shutil.copy2(dll, destination)
+    print(f'Privacy mode 1 component: {destination}')
+
+
+def _prepare_usbmmidd(output_dir: Path):
+    """Download and package the signed usbmmidd_v2 driver for privacy mode 2."""
+    if win_arch != 'x64':
+        raise RuntimeError('El paquete usbmmidd_v2 incluido está configurado para Windows x64.')
+
+    cache_dir = REPO_ROOT / '.build-cache' / 'usbmmidd_v2'
+    source_dir = cache_dir / 'usbmmidd_v2'
+    required_source_files = [
+        source_dir / 'deviceinstaller64.exe',
+        source_dir / 'usbmmidd.cat',
+        source_dir / 'usbmmIdd.inf',
+        source_dir / 'x64' / 'usbmmIdd.dll',
+    ]
+
+    if not all(path.is_file() for path in required_source_files):
+        cache_dir.parent.mkdir(parents=True, exist_ok=True)
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir)
+
+        with tempfile.TemporaryDirectory(prefix='sehcontrol-usbmmidd-') as temp_name:
+            temp_dir = Path(temp_name)
+            archive = temp_dir / 'usbmmidd_v2.zip'
+            print(f'Downloading {USBMMIDD_URL}')
+            urllib.request.urlretrieve(USBMMIDD_URL, archive)
+            with zipfile.ZipFile(archive) as zip_file:
+                zip_file.extractall(temp_dir)
+
+            extracted = temp_dir / 'usbmmidd_v2'
+            if not extracted.is_dir():
+                raise FileNotFoundError('El ZIP de usbmmidd_v2 no contiene la carpeta esperada.')
+            shutil.copytree(extracted, source_dir)
+
+    target_dir = output_dir / 'usbmmidd_v2'
+    if target_dir.exists():
+        shutil.rmtree(target_dir)
+    shutil.copytree(source_dir, target_dir)
+
+    # x64 packaging: keep deviceinstaller64.exe and remove unused 32-bit helpers.
+    shutil.rmtree(target_dir / 'Win32', ignore_errors=True)
+    for unused_name in ('deviceinstaller.exe', 'usbmmidd.bat'):
+        unused = target_dir / unused_name
+        if unused.exists():
+            unused.unlink()
+
+    required_target_files = [
+        target_dir / 'deviceinstaller64.exe',
+        target_dir / 'usbmmidd.cat',
+        target_dir / 'usbmmIdd.inf',
+        target_dir / 'x64' / 'usbmmIdd.dll',
+    ]
+    missing = [str(path) for path in required_target_files if not path.is_file()]
+    if missing:
+        raise FileNotFoundError('Faltan componentes de privacy mode 2: ' + ', '.join(missing))
+
+    print(f'Privacy mode 2 components: {target_dir}')
+
+
+def prepare_windows_privacy_components(output_dir):
+    """Place every privacy-mode dependency beside the packaged Windows app."""
+    destination = Path(output_dir)
+    if not destination.is_absolute():
+        destination = REPO_ROOT / destination
+    destination.mkdir(parents=True, exist_ok=True)
+
+    _build_window_injection(destination)
+    _prepare_usbmmidd(destination)
+
+    required = [
+        destination / 'WindowInjection.dll',
+        destination / 'usbmmidd_v2' / 'deviceinstaller64.exe',
+        destination / 'usbmmidd_v2' / 'usbmmidd.cat',
+        destination / 'usbmmidd_v2' / 'usbmmIdd.inf',
+        destination / 'usbmmidd_v2' / 'x64' / 'usbmmIdd.dll',
+    ]
+    missing = [str(path) for path in required if not path.is_file()]
+    if missing:
+        raise FileNotFoundError('Paquete de privacidad incompleto: ' + ', '.join(missing))
+    print('Windows privacy components validated successfully.')
 
 def archive_binary(path):
     """Copies a built installer/binary into ./binarios (repo root) so it
@@ -465,6 +640,7 @@ def build_flutter_windows(version, features, skip_portable_pack):
     os.chdir('..')
     shutil.copy2('target/release/deps/dylib_virtual_display.dll',
                  flutter_build_dir_2)
+    prepare_windows_privacy_components(flutter_build_dir_2)
     if skip_portable_pack:
         return
     os.chdir('libs/portable')
@@ -533,6 +709,7 @@ def main():
         os.makedirs(res_dir, exist_ok=True)
         system2(
             f'cp -rf target/release/Sehcontrol.exe {res_dir}')
+        prepare_windows_privacy_components(res_dir)
         os.chdir('libs/portable')
         system2('python -m pip install -r requirements.txt')
         system2(
