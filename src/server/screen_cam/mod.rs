@@ -477,6 +477,8 @@ fn capture_loop(cfg: ScreenCamConfig, state: Arc<SharedState>) -> ResultType<()>
         set_local_ip(&ip);
     }
     let mut last_status_report = Instant::now();
+    let mut consecutive_capture_errors = 0u32;
+    const MAX_CONSECUTIVE_CAPTURE_ERRORS: u32 = 3;
 
     loop {
         if !is_enabled() {
@@ -490,6 +492,7 @@ fn capture_loop(cfg: ScreenCamConfig, state: Arc<SharedState>) -> ResultType<()>
         let loop_start = Instant::now();
         match capturer.frame(spf) {
             Ok(frame) => {
+                consecutive_capture_errors = 0;
                 if frame.valid() {
                     let input = frame.to(encoder.yuvfmt(), &mut yuv, &mut mid_data)?;
                     let ms = start.elapsed().as_millis() as i64;
@@ -507,7 +510,17 @@ fn capture_loop(cfg: ScreenCamConfig, state: Arc<SharedState>) -> ResultType<()>
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(e) => {
-                log::error!("[screencam] capture error: {e}, will keep retrying");
+                consecutive_capture_errors += 1;
+                log::error!(
+                    "[screencam] capture error ({}/{}): {e}",
+                    consecutive_capture_errors,
+                    MAX_CONSECUTIVE_CAPTURE_ERRORS
+                );
+                if consecutive_capture_errors >= MAX_CONSECUTIVE_CAPTURE_ERRORS {
+                    bail!(
+                        "capture_invalidated: rebuilding display capturer after repeated error: {e}"
+                    );
+                }
                 std::thread::sleep(Duration::from_millis(500));
             }
         }
