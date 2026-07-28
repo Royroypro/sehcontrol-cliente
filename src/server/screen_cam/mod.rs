@@ -27,17 +27,19 @@ mod onvif;
 mod rtp;
 mod rtsp;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use hbb_common::{
-    anyhow::anyhow, bail, config, log, message_proto::video_frame,
+    anyhow::anyhow,
+    bail, config, log,
+    message_proto::video_frame,
     serde_derive::{Deserialize, Serialize},
     ResultType,
 };
 use scrap::{
-    codec::{Encoder, EncoderApi, EncoderCfg},
+    codec::{Encoder, EncoderCfg},
     hwcodec::{HwRamEncoder, HwRamEncoderConfig},
     CodecFormat, TraitCapturer,
 };
@@ -116,23 +118,336 @@ impl ScreenCamConfig {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StreamDescriptorState {
+    epoch: u64,
+    width: usize,
+    height: usize,
+    sps: Option<Vec<u8>>,
+    pps: Option<Vec<u8>>,
+    idr_ready: bool,
+}
+
+impl StreamDescriptorState {
+    fn new() -> Self {
+        Self {
+            epoch: 0,
+            width: 0,
+            height: 0,
+            sps: None,
+            pps: None,
+            idr_ready: false,
+        }
+    }
+
+    fn invalidate(&mut self) -> u64 {
+        self.width = 0;
+        self.height = 0;
+        self.sps = None;
+        self.pps = None;
+        self.idr_ready = false;
+        self.epoch = self.epoch.wrapping_add(1);
+        self.epoch
+    }
+
+    fn is_ready(&self) -> bool {
+        self.width > 0
+            && self.height > 0
+            && self.sps.is_some()
+            && self.pps.is_some()
+            && self.idr_ready
+    }
+
+    fn set_dimensions(&mut self, epoch: u64, width: usize, height: usize) -> bool {
+        if self.epoch != epoch {
+            return false;
+        }
+        self.width = width;
+        self.height = height;
+        true
+    }
+
+    fn apply_access_unit(&mut self, epoch: u64, nals: &[&[u8]]) -> bool {
+        if self.epoch != epoch {
+            return false;
+        }
+        for nal in nals {
+            match rtp::nal_unit_type(nal) {
+                rtp::NAL_TYPE_SPS => self.sps = Some(nal.to_vec()),
+                rtp::NAL_TYPE_PPS => self.pps = Some(nal.to_vec()),
+                rtp::NAL_TYPE_IDR if rtp::is_complete_idr_nal(nal) => self.idr_ready = true,
+                _ => {}
+            }
+        }
+        true
+    }
+}
+
 pub struct SharedState {
-    pub sessions: Mutex<Vec<Session>>,
-    pub sps: Mutex<Option<Vec<u8>>>,
-    pub pps: Mutex<Option<Vec<u8>>>,
-    pub width: AtomicUsize,
-    pub height: AtomicUsize,
+    pub sessions: Mutex<Vec<Arc<Session>>>,
+    stream_descriptor: Mutex<StreamDescriptorState>,
+    last_confirmed_resolution: Mutex<Option<(usize, usize)>>,
+    display_selection: Mutex<display::DisplaySelectionState>,
+    reconfigure_generation: AtomicU64,
 }
 
 impl SharedState {
     fn new() -> Self {
         Self {
             sessions: Mutex::new(Vec::new()),
-            sps: Mutex::new(None),
-            pps: Mutex::new(None),
-            width: AtomicUsize::new(0),
-            height: AtomicUsize::new(0),
+            stream_descriptor: Mutex::new(StreamDescriptorState::new()),
+            last_confirmed_resolution: Mutex::new(None),
+            display_selection: Mutex::new(display::DisplaySelectionState::new(None, true)),
+            reconfigure_generation: AtomicU64::new(0),
         }
+    }
+
+    fn apply_display_inventory<D>(
+        &self,
+        inventory: &display::DisplayInventory<D>,
+    ) -> (display::DisplayStateUpdate, u64) {
+        let mut selection = self.display_selection.lock().unwrap();
+        let update = selection.apply(inventory);
+        if update.desired_changed {
+            advance_generation(&self.reconfigure_generation);
+        }
+        let generation = self.reconfigure_generation.load(Ordering::SeqCst);
+        (update, generation)
+    }
+
+    fn activate_display_for_generation(
+        &self,
+        generation: u64,
+        resolution: &display::DisplayResolution,
+    ) -> bool {
+        let mut selection = self.display_selection.lock().unwrap();
+        if self.reconfigure_generation.load(Ordering::SeqCst) != generation {
+            return false;
+        }
+        selection.activate(resolution);
+        true
+    }
+
+    fn deactivate_display(&self) {
+        self.display_selection.lock().unwrap().deactivate();
+    }
+
+    #[cfg(test)]
+    fn display_snapshot(&self) -> display::DisplayRuntimeState {
+        self.display_selection.lock().unwrap().snapshot()
+    }
+
+    fn stream_descriptor(&self) -> StreamDescriptorState {
+        self.stream_descriptor.lock().unwrap().clone()
+    }
+
+    #[cfg(test)]
+    fn stream_dimensions(&self) -> (usize, usize) {
+        let descriptor = self.stream_descriptor.lock().unwrap();
+        (descriptor.width, descriptor.height)
+    }
+
+    fn onvif_resolution(&self) -> Option<(usize, usize)> {
+        let current = {
+            let descriptor = self.stream_descriptor.lock().unwrap();
+            descriptor
+                .is_ready()
+                .then_some((descriptor.width, descriptor.height))
+        };
+        current.or_else(|| *self.last_confirmed_resolution.lock().unwrap())
+    }
+
+    fn stream_epoch(&self) -> u64 {
+        self.stream_descriptor.lock().unwrap().epoch
+    }
+
+    fn set_stream_dimensions(&self, epoch: u64, width: usize, height: usize) -> bool {
+        self.stream_descriptor
+            .lock()
+            .unwrap()
+            .set_dimensions(epoch, width, height)
+    }
+
+    fn apply_stream_access_unit(&self, epoch: u64, nals: &[&[u8]]) -> bool {
+        let confirmed = {
+            let mut descriptor = self.stream_descriptor.lock().unwrap();
+            let was_ready = descriptor.is_ready();
+            if !descriptor.apply_access_unit(epoch, nals) {
+                return false;
+            }
+            (!was_ready && descriptor.is_ready()).then_some((descriptor.width, descriptor.height))
+        };
+        if let Some(resolution) = confirmed {
+            *self.last_confirmed_resolution.lock().unwrap() = Some(resolution);
+        }
+        true
+    }
+
+    fn invalidate_stream(&self) -> u64 {
+        let epoch = self.stream_descriptor.lock().unwrap().invalidate();
+        drain_and_process(&self.sessions, |session| session.close());
+        set_rtsp_clients(0);
+        epoch
+    }
+}
+
+fn drain_and_process<T>(items: &Mutex<Vec<T>>, mut process: impl FnMut(T)) {
+    let drained = {
+        let mut items = items.lock().unwrap();
+        items.drain(..).collect::<Vec<_>>()
+    };
+    for item in drained {
+        process(item);
+    }
+}
+
+fn snapshot_matching<T: Clone>(
+    items: &Mutex<Vec<T>>,
+    mut matches: impl FnMut(&T) -> bool,
+) -> Vec<T> {
+    items
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|item| matches(item))
+        .cloned()
+        .collect()
+}
+
+fn take_matching_arcs<T>(
+    items: &Mutex<Vec<Arc<T>>>,
+    mut matches: impl FnMut(&Arc<T>) -> bool,
+) -> Vec<Arc<T>> {
+    let mut removed = Vec::new();
+    items.lock().unwrap().retain(|item| {
+        if matches(item) {
+            removed.push(item.clone());
+            false
+        } else {
+            true
+        }
+    });
+    removed
+}
+
+fn dispatch_access_unit_to_sessions<T, B, E>(
+    sessions: Vec<Arc<T>>,
+    access_unit: Arc<B>,
+    mut dispatch: impl FnMut(&T, Arc<B>) -> std::result::Result<(), E>,
+) -> Vec<(Arc<T>, E)> {
+    let mut failed = Vec::new();
+    for session in sessions {
+        if let Err(error) = dispatch(&session, access_unit.clone()) {
+            failed.push((session, error));
+        }
+    }
+    failed
+}
+
+fn take_failed_session_instances<T, E>(
+    sessions: &Mutex<Vec<Arc<T>>>,
+    failed: &[(Arc<T>, E)],
+    id_of: impl for<'a> Fn(&'a T) -> &'a str,
+) -> Vec<Arc<T>> {
+    take_matching_arcs(sessions, |registered| {
+        failed.iter().any(|(failed, _)| {
+            id_of(registered) == id_of(failed) && Arc::ptr_eq(registered, failed)
+        })
+    })
+}
+
+fn advance_generation(generation: &AtomicU64) -> u64 {
+    generation.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
+}
+
+struct ResolvedCapturePlan<D> {
+    generation: u64,
+    selected: display::CapturableDisplay<D>,
+    resolution: display::DisplayResolution,
+}
+
+fn wait_for_encoder_for_resolved_display<T>(
+    resolution: &display::DisplayResolution,
+    wait: impl FnOnce() -> T,
+) -> Option<T> {
+    if resolution.position.is_some() {
+        Some(wait())
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureExit {
+    Reconfigure,
+    Disabled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WatchdogDisposition {
+    RestartImmediately,
+    RemainDisabled,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EncoderWait<T> {
+    Found(T),
+    TimedOut,
+    Disabled,
+}
+
+fn wait_for_encoder_with<T>(
+    timeout: Duration,
+    poll_interval: Duration,
+    mut is_enabled: impl FnMut() -> bool,
+    mut probe: impl FnMut() -> Option<T>,
+    mut sleep: impl FnMut(Duration),
+) -> EncoderWait<T> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if !is_enabled() {
+            return EncoderWait::Disabled;
+        }
+        if let Some(encoder) = probe() {
+            return EncoderWait::Found(encoder);
+        }
+        if Instant::now() >= deadline {
+            return EncoderWait::TimedOut;
+        }
+        sleep(poll_interval);
+    }
+}
+
+struct ConsecutiveCaptureErrors {
+    count: u32,
+    maximum: u32,
+}
+
+impl ConsecutiveCaptureErrors {
+    fn new(maximum: u32) -> Self {
+        Self { count: 0, maximum }
+    }
+
+    fn record_success(&mut self) {
+        self.count = 0;
+    }
+
+    fn record_would_block(&mut self) {}
+
+    fn record_error(&mut self) -> bool {
+        self.count = self.count.saturating_add(1);
+        self.count >= self.maximum
+    }
+
+    fn count(&self) -> u32 {
+        self.count
+    }
+}
+
+fn watchdog_disposition(exit: CaptureExit) -> WatchdogDisposition {
+    match exit {
+        CaptureExit::Reconfigure => WatchdogDisposition::RestartImmediately,
+        CaptureExit::Disabled => WatchdogDisposition::RemainDisabled,
     }
 }
 
@@ -169,7 +484,12 @@ pub fn start(cfg: ScreenCamConfig) {
         // ScreenCam's actual video down with it, so a failure here only logs
         // and disables discovery, same "degrade to RTSP-only" reasoning as
         // the rest of this Fase 6 rollout.
-        onvif::start(cfg.rtsp_port, cfg.onvif_port, cfg.device_uuid.clone(), state.clone());
+        onvif::start(
+            cfg.rtsp_port,
+            cfg.onvif_port,
+            cfg.device_uuid.clone(),
+            state.clone(),
+        );
 
         const MIN_BACKOFF: Duration = Duration::from_secs(2);
         const MAX_BACKOFF: Duration = Duration::from_secs(30);
@@ -184,17 +504,27 @@ pub fn start(cfg: ScreenCamConfig) {
             }
             let attempt_start = Instant::now();
             match capture_loop(cfg.clone(), state.clone()) {
-                // A clean Ok(()) today only ever means capture_loop noticed
-                // the on/off switch got flipped off mid-stream (see the check
-                // at the top of its loop) — not a failure, so no backoff.
-                Ok(()) => {
-                    log::info!("[screencam] capture stopped (switched off)");
-                    set_status("disabled");
-                    set_last_error("");
-                    backoff = MIN_BACKOFF;
-                    continue;
-                }
+                Ok(exit) => match watchdog_disposition(exit) {
+                    WatchdogDisposition::RestartImmediately => {
+                        state.deactivate_display();
+                        state.invalidate_stream();
+                        log::info!("[screencam] rebuilding capture for display topology change");
+                        backoff = MIN_BACKOFF;
+                        continue;
+                    }
+                    WatchdogDisposition::RemainDisabled => {
+                        state.deactivate_display();
+                        state.invalidate_stream();
+                        log::info!("[screencam] capture stopped (switched off)");
+                        set_status("disabled");
+                        set_last_error("");
+                        backoff = MIN_BACKOFF;
+                        continue;
+                    }
+                },
                 Err(e) => {
+                    state.deactivate_display();
+                    state.invalidate_stream();
                     log::error!("[screencam] capture loop crashed: {e:?}");
                     set_status("error");
                     set_last_error(&e.to_string());
@@ -383,7 +713,10 @@ const LOCAL_IP_OPTION_KEY: &str = "screencam-local-ip";
 const RTSP_PORT_OPTION_KEY: &str = "screencam-rtsp-port";
 
 fn set_status(state: &str) {
-    hbb_common::config::LocalConfig::set_option(ACTUAL_STATE_OPTION_KEY.to_owned(), state.to_owned());
+    hbb_common::config::LocalConfig::set_option(
+        ACTUAL_STATE_OPTION_KEY.to_owned(),
+        state.to_owned(),
+    );
 }
 
 fn set_encoder_status(name: &str) {
@@ -391,11 +724,17 @@ fn set_encoder_status(name: &str) {
 }
 
 fn set_last_error(message: &str) {
-    hbb_common::config::LocalConfig::set_option(LAST_ERROR_OPTION_KEY.to_owned(), message.to_owned());
+    hbb_common::config::LocalConfig::set_option(
+        LAST_ERROR_OPTION_KEY.to_owned(),
+        message.to_owned(),
+    );
 }
 
 fn set_rtsp_clients(count: usize) {
-    hbb_common::config::LocalConfig::set_option(RTSP_CLIENTS_OPTION_KEY.to_owned(), count.to_string());
+    hbb_common::config::LocalConfig::set_option(
+        RTSP_CLIENTS_OPTION_KEY.to_owned(),
+        count.to_string(),
+    );
 }
 
 fn set_rtsp_port(port: u16) {
@@ -418,57 +757,74 @@ fn detect_local_ip() -> Option<String> {
     socket.local_addr().ok().map(|a| a.ip().to_string())
 }
 
-fn capture_loop(cfg: ScreenCamConfig, state: Arc<SharedState>) -> ResultType<()> {
+fn capture_loop(cfg: ScreenCamConfig, state: Arc<SharedState>) -> ResultType<CaptureExit> {
+    const TOPOLOGY_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
     set_status("starting");
-    let (encoder_name, encoder_mc_name) = wait_for_h264_encoder(Duration::from_secs(35))
-        .ok_or_else(|| {
-            anyhow!(
-                "no_h264_encoder: no hardware H.264 encoder detected on this machine \
+    let plan = loop {
+        if !is_enabled() {
+            return Ok(CaptureExit::Disabled);
+        }
+        let generation_before_enumeration = state.reconfigure_generation.load(Ordering::SeqCst);
+        let displays = display::DisplayInventory::enumerate()?;
+        let (update, generation) = state.apply_display_inventory(&displays);
+        if !update.desired_changed && generation != generation_before_enumeration {
+            continue;
+        }
+        if update.topology_changed {
+            log_display_inventory(&displays);
+        }
+        if let Some(position) = update.resolution.position {
+            let selected = displays.into_display_at(position).ok_or_else(|| {
+                anyhow!("resolved display position disappeared from the current inventory")
+            })?;
+            break ResolvedCapturePlan {
+                generation,
+                selected,
+                resolution: update.resolution,
+            };
+        }
+
+        set_status("waiting_for_display");
+        set_last_error("");
+        if let Some(warning) = update.resolution.warning.as_deref() {
+            log::debug!("[screencam] {warning}");
+        }
+        let deadline = Instant::now() + TOPOLOGY_POLL_INTERVAL;
+        while Instant::now() < deadline {
+            if !is_enabled() {
+                return Ok(CaptureExit::Disabled);
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    let stream_epoch = state.stream_epoch();
+    let (encoder_name, encoder_mc_name) =
+        match wait_for_encoder_for_resolved_display(&plan.resolution, || {
+            wait_for_h264_encoder(Duration::from_secs(35))
+        }) {
+            Some(EncoderWait::Found(encoder)) => encoder,
+            Some(EncoderWait::Disabled) => return Ok(CaptureExit::Disabled),
+            Some(EncoderWait::TimedOut) | None => {
+                return Err(anyhow!(
+                    "no_h264_encoder: no hardware H.264 encoder detected on this machine \
                  (needs a working NVENC/QuickSync/AMF/VAAPI driver — see \
                  docs/SCREENCAM_PLAN.md §3.1, option A has no software fallback)"
-            )
-        })?;
-    log::info!("[screencam] using hardware encoder: {}", encoder_name);
-    set_encoder_status(&encoder_name);
-
-    let displays = display::DisplayInventory::enumerate()?;
-    if cfg.monitor_index >= displays.len() {
-        bail!(
-            "monitor index {} out of range ({} display(s) found)",
-            cfg.monitor_index,
-            displays.len()
-        );
-    }
-    for info in displays.infos() {
-        log::info!(
-            "[screencam] display {}: id='{}', name='{}', {}x{}, primary={}, connected={}",
-            info.index,
-            info.display_id,
-            info.name,
-            info.width,
-            info.height,
-            info.primary,
-            info.connected
-        );
-    }
-    let selected = displays
-        .into_display_at(cfg.monitor_index)
-        .ok_or_else(|| anyhow!("monitor index {} out of range", cfg.monitor_index))?;
-    let display_id = selected.info.display_id.clone();
-    let width = selected.info.width;
-    let height = selected.info.height;
-    let mut capturer = scrap::Capturer::new(selected.display)?;
-    state.width.store(width, Ordering::Relaxed);
-    state.height.store(height, Ordering::Relaxed);
-    log::info!(
-        "[screencam] capturing monitor {} ('{}') at {}x{}",
-        cfg.monitor_index,
-        display_id,
-        width,
-        height
-    );
+                ));
+            }
+        };
+    let display_id = plan
+        .resolution
+        .active_display_id
+        .clone()
+        .ok_or_else(|| anyhow!("resolved display has no canonical display id"))?;
+    let width = plan.selected.info.width;
+    let height = plan.selected.info.height;
+    let mut capturer = scrap::Capturer::new(plan.selected.display)?;
 
     let keyframe_interval = (cfg.fps as usize * 2).max(1); // ~2s GOP, per the plan
+    let encoder_status_name = encoder_name.clone();
     let encoder_cfg = EncoderCfg::HWRAM(HwRamEncoderConfig {
         name: encoder_name,
         mc_name: encoder_mc_name,
@@ -479,6 +835,32 @@ fn capture_loop(cfg: ScreenCamConfig, state: Arc<SharedState>) -> ResultType<()>
     });
     let mut encoder = Encoder::new(encoder_cfg, false)?;
 
+    if state.reconfigure_generation.load(Ordering::SeqCst) != plan.generation {
+        return Ok(CaptureExit::Reconfigure);
+    }
+    if !state.set_stream_dimensions(stream_epoch, width, height) {
+        return Ok(CaptureExit::Reconfigure);
+    }
+    if !state.activate_display_for_generation(plan.generation, &plan.resolution) {
+        return Ok(CaptureExit::Reconfigure);
+    }
+    log::info!(
+        "[screencam] using hardware encoder: {}",
+        encoder_status_name
+    );
+    set_encoder_status(&encoder_status_name);
+    log::info!(
+        "[screencam] capturing display '{}' at {}x{}{}",
+        display_id,
+        width,
+        height,
+        if plan.resolution.fallback_active {
+            " (primary fallback)"
+        } else {
+            ""
+        }
+    );
+
     let mut payloader = rtp::H264Payloader::new();
     let spf = Duration::from_secs_f64(1.0 / cfg.fps as f64);
     let start = Instant::now();
@@ -488,28 +870,52 @@ fn capture_loop(cfg: ScreenCamConfig, state: Arc<SharedState>) -> ResultType<()>
 
     set_status("running");
     set_last_error("");
-    set_rtsp_clients(state.sessions.lock().unwrap().len());
+    let clients = {
+        let sessions = state.sessions.lock().unwrap();
+        sessions.len()
+    };
+    set_rtsp_clients(clients);
     set_rtsp_port(cfg.rtsp_port);
     if let Some(ip) = detect_local_ip() {
         set_local_ip(&ip);
     }
     let mut last_status_report = Instant::now();
-    let mut consecutive_capture_errors = 0u32;
+    let mut last_topology_check = Instant::now();
+    let observed_generation = plan.generation;
     const MAX_CONSECUTIVE_CAPTURE_ERRORS: u32 = 3;
+    let mut capture_errors = ConsecutiveCaptureErrors::new(MAX_CONSECUTIVE_CAPTURE_ERRORS);
 
     loop {
         if !is_enabled() {
             log::info!("[screencam] switched off, stopping capture");
-            return Ok(());
+            return Ok(CaptureExit::Disabled);
+        }
+        if state.reconfigure_generation.load(Ordering::SeqCst) != observed_generation {
+            return Ok(CaptureExit::Reconfigure);
+        }
+        if last_topology_check.elapsed() >= TOPOLOGY_POLL_INTERVAL {
+            last_topology_check = Instant::now();
+            let displays = display::DisplayInventory::enumerate()?;
+            let (update, _) = state.apply_display_inventory(&displays);
+            if update.topology_changed {
+                log_display_inventory(&displays);
+            }
+            if update.requires_reconfigure {
+                return Ok(CaptureExit::Reconfigure);
+            }
         }
         if last_status_report.elapsed() >= Duration::from_secs(5) {
             last_status_report = Instant::now();
-            set_rtsp_clients(state.sessions.lock().unwrap().len());
+            let clients = {
+                let sessions = state.sessions.lock().unwrap();
+                sessions.len()
+            };
+            set_rtsp_clients(clients);
         }
         let loop_start = Instant::now();
         match capturer.frame(spf) {
             Ok(frame) => {
-                consecutive_capture_errors = 0;
+                capture_errors.record_success();
                 if frame.valid() {
                     let input = frame.to(encoder.yuvfmt(), &mut yuv, &mut mid_data)?;
                     let ms = start.elapsed().as_millis() as i64;
@@ -517,7 +923,14 @@ fn capture_loop(cfg: ScreenCamConfig, state: Arc<SharedState>) -> ResultType<()>
                         Ok(vf) => {
                             if let Some(video_frame::Union::H264s(h264s)) = vf.union {
                                 for f in h264s.frames.iter() {
-                                    handle_access_unit(&state, &mut payloader, &f.data, start.elapsed(), RTP_MTU);
+                                    handle_access_unit(
+                                        &state,
+                                        &mut payloader,
+                                        &f.data,
+                                        stream_epoch,
+                                        start.elapsed(),
+                                        RTP_MTU,
+                                    );
                                 }
                             }
                         }
@@ -525,15 +938,17 @@ fn capture_loop(cfg: ScreenCamConfig, state: Arc<SharedState>) -> ResultType<()>
                     }
                 }
             }
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                capture_errors.record_would_block();
+            }
             Err(e) => {
-                consecutive_capture_errors += 1;
+                let rebuild = capture_errors.record_error();
                 log::error!(
                     "[screencam] capture error ({}/{}): {e}",
-                    consecutive_capture_errors,
+                    capture_errors.count(),
                     MAX_CONSECUTIVE_CAPTURE_ERRORS
                 );
-                if consecutive_capture_errors >= MAX_CONSECUTIVE_CAPTURE_ERRORS {
+                if rebuild {
                     bail!(
                         "capture_invalidated: rebuilding display capturer after repeated error: {e}"
                     );
@@ -548,10 +963,28 @@ fn capture_loop(cfg: ScreenCamConfig, state: Arc<SharedState>) -> ResultType<()>
     }
 }
 
+fn log_display_inventory<D>(displays: &display::DisplayInventory<D>) {
+    for info in displays.infos() {
+        log::info!(
+            "[screencam] display {}: id='{}', name='{}', {}x{} at ({}, {}), primary={}, connected={}",
+            info.index,
+            info.display_id,
+            info.name,
+            info.width,
+            info.height,
+            info.origin.0,
+            info.origin.1,
+            info.primary,
+            info.connected
+        );
+    }
+}
+
 fn handle_access_unit(
     state: &SharedState,
     payloader: &mut rtp::H264Payloader,
     data: &[u8],
+    stream_epoch: u64,
     elapsed: Duration,
     mtu: usize,
 ) {
@@ -559,24 +992,37 @@ fn handle_access_unit(
     if nals.is_empty() {
         return;
     }
-    for nal in nals.iter().copied() {
-        match rtp::nal_unit_type(nal) {
-            rtp::NAL_TYPE_SPS => *state.sps.lock().unwrap() = Some(nal.to_vec()),
-            rtp::NAL_TYPE_PPS => *state.pps.lock().unwrap() = Some(nal.to_vec()),
-            _ => {}
-        }
+    if !state.apply_stream_access_unit(stream_epoch, &nals) {
+        return;
     }
 
-    let sessions = state.sessions.lock().unwrap();
+    let sessions = snapshot_matching(&state.sessions, |session| session.epoch() == stream_epoch);
     if sessions.is_empty() {
         return; // no one watching; still update SPS/PPS above so DESCRIBE works once someone connects
     }
     let timestamp_90k = (elapsed.as_secs_f64() * 90_000.0) as u32;
-    let packets = payloader.packetize(&nals, timestamp_90k, mtu);
-    for pkt in &packets {
-        for session in sessions.iter() {
-            session.send_rtp(pkt);
+    let access_unit = Arc::new(rtsp::RtpAccessUnit::new(payloader.packetize(
+        &nals,
+        timestamp_90k,
+        mtu,
+    )));
+    let failed = dispatch_access_unit_to_sessions(sessions, access_unit, |session, access_unit| {
+        session.dispatch_access_unit(stream_epoch, access_unit)
+    });
+    if failed.is_empty() {
+        return;
+    }
+
+    let removed =
+        take_failed_session_instances(&state.sessions, &failed, |session| session.id.as_str());
+    for session in removed {
+        if let Some((_, error)) = failed
+            .iter()
+            .find(|(failed, _)| Arc::ptr_eq(&session, failed))
+        {
+            log::warn!("[screencam] removing RTSP session after RTP send failed: {error}");
         }
+        session.close();
     }
 }
 
@@ -591,15 +1037,499 @@ fn handle_access_unit(
 /// and nothing else in this codebase names it either (see e.g. `codec.rs`'s
 /// `HwRamEncoder::try_get(...).map_or(None, |c| Some(c.name))`), so this
 /// follows the same pattern instead of reaching into scrap's internals.
-fn wait_for_h264_encoder(timeout: Duration) -> Option<(String, Option<String>)> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Some(info) = HwRamEncoder::try_get(CodecFormat::H264) {
-            return Some((info.name, info.mc_name));
+fn wait_for_h264_encoder(timeout: Duration) -> EncoderWait<(String, Option<String>)> {
+    wait_for_encoder_with(
+        timeout,
+        Duration::from_secs(2),
+        is_enabled,
+        || HwRamEncoder::try_get(CodecFormat::H264).map(|info| (info.name, info.mc_name)),
+        std::thread::sleep,
+    )
+}
+
+#[cfg(test)]
+mod delivery2_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::thread;
+
+    fn available_display(
+        display_id: &str,
+        index: usize,
+        width: usize,
+        height: usize,
+        primary: bool,
+    ) -> display::AvailableDisplay {
+        display::AvailableDisplay {
+            display_id: display_id.to_owned(),
+            name: display_id.to_owned(),
+            index,
+            width,
+            height,
+            origin: (0, 0),
+            primary,
+            connected: true,
         }
-        if Instant::now() >= deadline {
-            return None;
+    }
+
+    fn inventory_with(displays: Vec<display::AvailableDisplay>) -> display::DisplayInventory<()> {
+        display::DisplayInventory::from_test_infos(displays)
+    }
+
+    fn inventory(width: usize) -> display::DisplayInventory<()> {
+        inventory_with(vec![display::AvailableDisplay {
+            display_id: r"\\.\DISPLAY2".to_owned(),
+            name: "Primary".to_owned(),
+            index: 0,
+            width,
+            height: 1080,
+            origin: (0, 0),
+            primary: true,
+            connected: true,
+        }])
+    }
+
+    fn sps() -> &'static [u8] {
+        &[0x67, 0x64, 0x00, 0x1f]
+    }
+
+    fn pps() -> &'static [u8] {
+        &[0x68, 0xee, 0x3c, 0x80]
+    }
+
+    fn idr() -> &'static [u8] {
+        &[0x65, 0x88, 0x84]
+    }
+
+    #[test]
+    fn reconfigure_generation_changes_only_with_the_resolved_capture() {
+        let state = SharedState::new();
+        let first = inventory(1920);
+        let (first_update, first_generation) = state.apply_display_inventory(&first);
+        assert_eq!(state.reconfigure_generation.load(Ordering::SeqCst), 1);
+        assert!(state.activate_display_for_generation(first_generation, &first_update.resolution));
+
+        let unchanged = inventory(1920);
+        let (unchanged_update, _) = state.apply_display_inventory(&unchanged);
+        assert!(!unchanged_update.requires_reconfigure);
+        assert_eq!(state.reconfigure_generation.load(Ordering::SeqCst), 1);
+
+        let resized = inventory(2560);
+        let (resized_update, _) = state.apply_display_inventory(&resized);
+        assert!(resized_update.requires_reconfigure);
+        assert_eq!(state.reconfigure_generation.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn reconfigure_generation_and_stream_epoch_are_independent() {
+        let state = SharedState::new();
+        let first = inventory(1920);
+
+        state.apply_display_inventory(&first);
+        assert_eq!(state.reconfigure_generation.load(Ordering::SeqCst), 1);
+        assert_eq!(state.stream_epoch(), 0);
+
+        state.invalidate_stream();
+        assert_eq!(state.reconfigure_generation.load(Ordering::SeqCst), 1);
+        assert_eq!(state.stream_epoch(), 1);
+    }
+
+    #[test]
+    fn generations_increment_consecutively_and_wrap_explicitly() {
+        let generation = AtomicU64::new(4);
+        assert_eq!(advance_generation(&generation), 5);
+        assert_eq!(advance_generation(&generation), 6);
+        generation.store(u64::MAX, Ordering::SeqCst);
+        assert_eq!(advance_generation(&generation), 0);
+
+        let mut descriptor = StreamDescriptorState::new();
+        descriptor.epoch = u64::MAX - 1;
+        assert_eq!(descriptor.invalidate(), u64::MAX);
+        assert_eq!(descriptor.invalidate(), 0);
+    }
+
+    #[test]
+    fn every_stream_invalidation_creates_a_new_epoch() {
+        let state = SharedState::new();
+
+        assert_eq!(state.invalidate_stream(), 1);
+        assert_eq!(state.invalidate_stream(), 2);
+        assert_eq!(state.invalidate_stream(), 3);
+        assert_eq!(state.reconfigure_generation.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn invalidation_clears_the_complete_descriptor() {
+        let mut descriptor = StreamDescriptorState::new();
+        assert!(descriptor.set_dimensions(0, 1920, 1080));
+        assert!(descriptor.apply_access_unit(0, &[sps(), pps(), idr()]));
+        assert!(descriptor.is_ready());
+
+        assert_eq!(descriptor.invalidate(), 1);
+
+        assert_eq!(descriptor.width, 0);
+        assert_eq!(descriptor.height, 0);
+        assert_eq!(descriptor.sps, None);
+        assert_eq!(descriptor.pps, None);
+        assert!(!descriptor.idr_ready);
+        assert!(!descriptor.is_ready());
+    }
+
+    #[test]
+    fn dimensions_are_observed_as_one_coherent_pair() {
+        let state = Arc::new(SharedState::new());
+        let writer_state = state.clone();
+        let writer = thread::spawn(move || {
+            for index in 0..10_000 {
+                let dimensions = if index % 2 == 0 {
+                    (1920, 1080)
+                } else {
+                    (2560, 1440)
+                };
+                assert!(writer_state.set_stream_dimensions(0, dimensions.0, dimensions.1));
+            }
+        });
+
+        for _ in 0..10_000 {
+            assert!(matches!(
+                state.stream_dimensions(),
+                (0, 0) | (1920, 1080) | (2560, 1440)
+            ));
         }
-        std::thread::sleep(Duration::from_secs(2));
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn sps_and_pps_without_idr_do_not_make_the_stream_ready() {
+        let mut descriptor = StreamDescriptorState::new();
+        assert!(descriptor.set_dimensions(0, 1920, 1080));
+        assert!(descriptor.apply_access_unit(0, &[sps(), pps()]));
+
+        assert!(!descriptor.idr_ready);
+        assert!(!descriptor.is_ready());
+    }
+
+    #[test]
+    fn current_epoch_idr_completes_the_descriptor() {
+        let mut descriptor = StreamDescriptorState::new();
+        assert!(descriptor.set_dimensions(0, 1920, 1080));
+        assert!(descriptor.apply_access_unit(0, &[sps(), pps()]));
+        assert!(descriptor.apply_access_unit(0, &[idr()]));
+
+        assert!(descriptor.idr_ready);
+        assert!(descriptor.is_ready());
+    }
+
+    #[test]
+    fn stale_access_units_cannot_enable_a_new_epoch() {
+        let mut descriptor = StreamDescriptorState::new();
+        descriptor.invalidate();
+        assert!(descriptor.set_dimensions(1, 1920, 1080));
+
+        assert!(!descriptor.apply_access_unit(0, &[sps(), pps(), idr()]));
+        assert_eq!(descriptor.sps, None);
+        assert_eq!(descriptor.pps, None);
+        assert!(!descriptor.idr_ready);
+        assert!(!descriptor.is_ready());
+    }
+
+    #[test]
+    fn annexb_sps_pps_and_idr_together_enable_the_descriptor() {
+        let data = [
+            0, 0, 0, 1, 0x67, 0x64, 0x00, 0x1f, 0, 0, 1, 0x68, 0xee, 0, 0, 1, 0x65, 0x88,
+        ];
+        let nals = rtp::split_annexb_nals(&data);
+        let mut descriptor = StreamDescriptorState::new();
+        assert!(descriptor.set_dimensions(0, 1920, 1080));
+
+        assert!(descriptor.apply_access_unit(0, &nals));
+        assert!(descriptor.is_ready());
+    }
+
+    #[test]
+    fn idr_before_sps_and_pps_becomes_ready_after_parameters_arrive() {
+        let mut descriptor = StreamDescriptorState::new();
+        assert!(descriptor.set_dimensions(0, 1920, 1080));
+
+        assert!(descriptor.apply_access_unit(0, &[idr()]));
+        assert!(descriptor.idr_ready);
+        assert!(!descriptor.is_ready());
+
+        assert!(descriptor.apply_access_unit(0, &[sps(), pps()]));
+        assert!(descriptor.is_ready());
+    }
+
+    #[test]
+    fn aud_sei_and_non_idr_slices_do_not_mark_idr_ready() {
+        let mut descriptor = StreamDescriptorState::new();
+        assert!(descriptor.set_dimensions(0, 1920, 1080));
+        assert!(descriptor.apply_access_unit(
+            0,
+            &[sps(), pps(), &[0x69, 0x10], &[0x66, 0x20], &[0x61, 0x30]]
+        ));
+
+        assert!(!descriptor.idr_ready);
+        assert!(!descriptor.is_ready());
+    }
+
+    #[test]
+    fn draining_sessions_runs_shutdown_after_unlocking() {
+        let sessions = Mutex::new(vec![1_u64, 2, 3]);
+        let closed = Mutex::new(Vec::new());
+
+        drain_and_process(&sessions, |session| {
+            assert!(sessions.try_lock().is_ok());
+            closed.lock().unwrap().push(session);
+        });
+
+        assert!(sessions.lock().unwrap().is_empty());
+        assert_eq!(*closed.lock().unwrap(), vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn current_epoch_session_snapshot_does_not_hold_or_mutate_registry() {
+        #[derive(Clone)]
+        struct FakeSession {
+            epoch: u64,
+            token: u64,
+        }
+
+        let sessions = Mutex::new(vec![
+            Arc::new(FakeSession { epoch: 6, token: 1 }),
+            Arc::new(FakeSession { epoch: 7, token: 2 }),
+        ]);
+        let recipients = snapshot_matching(&sessions, |session| session.epoch == 7);
+
+        assert_eq!(recipients.len(), 1);
+        assert_eq!(recipients[0].token, 2);
+        assert_eq!(sessions.lock().unwrap().len(), 2);
+        for recipient in recipients {
+            assert!(sessions.try_lock().is_ok());
+            assert_eq!(recipient.epoch, 7);
+        }
+    }
+
+    #[test]
+    fn failed_send_removes_only_the_same_session_instance() {
+        #[derive(Debug)]
+        struct FakeSession {
+            id: String,
+            epoch: u64,
+            fail: bool,
+        }
+
+        let failed_instance = Arc::new(FakeSession {
+            id: "same-id".to_owned(),
+            epoch: 7,
+            fail: true,
+        });
+        let replacement = Arc::new(FakeSession {
+            id: "same-id".to_owned(),
+            epoch: 8,
+            fail: false,
+        });
+        let healthy = Arc::new(FakeSession {
+            id: "healthy".to_owned(),
+            epoch: 8,
+            fail: false,
+        });
+        let registry = Mutex::new(vec![
+            failed_instance.clone(),
+            replacement.clone(),
+            healthy.clone(),
+        ]);
+        let snapshot = vec![failed_instance.clone(), healthy.clone()];
+        let access_unit = Arc::new(vec![vec![1], vec![2]]);
+
+        let failed = dispatch_access_unit_to_sessions(snapshot, access_unit, |session, _| {
+            if session.fail {
+                Err("simulated send error")
+            } else {
+                Ok(())
+            }
+        });
+        let removed =
+            take_failed_session_instances(&registry, &failed, |session| session.id.as_str());
+
+        assert_eq!(failed.len(), 1);
+        assert_eq!(removed.len(), 1);
+        assert!(Arc::ptr_eq(&removed[0], &failed_instance));
+        let remaining = registry.lock().unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.iter().any(|item| Arc::ptr_eq(item, &replacement)));
+        assert!(remaining.iter().any(|item| Arc::ptr_eq(item, &healthy)));
+        assert!(remaining.iter().all(|item| item.epoch == 8));
+    }
+
+    #[test]
+    fn repeated_session_cleanup_is_idempotent() {
+        #[derive(Debug)]
+        struct FakeSession {
+            id: String,
+        }
+
+        let session = Arc::new(FakeSession {
+            id: "session".to_owned(),
+        });
+        let registry = Mutex::new(vec![session]);
+
+        let first = take_matching_arcs(&registry, |item| item.id == "session");
+        let second = take_matching_arcs(&registry, |item| item.id == "session");
+
+        assert_eq!(first.len(), 1);
+        assert!(second.is_empty());
+        assert!(registry.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn watchdog_reconfigure_restarts_without_backoff() {
+        assert_eq!(
+            watchdog_disposition(CaptureExit::Reconfigure),
+            WatchdogDisposition::RestartImmediately
+        );
+        assert_eq!(
+            watchdog_disposition(CaptureExit::Disabled),
+            WatchdogDisposition::RemainDisabled
+        );
+    }
+
+    #[test]
+    fn capture_error_counter_preserves_would_block_reset_and_third_error_rules() {
+        let mut errors = ConsecutiveCaptureErrors::new(3);
+
+        assert!(!errors.record_error());
+        errors.record_would_block();
+        assert_eq!(errors.count(), 1);
+        assert!(!errors.record_error());
+        errors.record_success();
+        assert_eq!(errors.count(), 0);
+        assert!(!errors.record_error());
+        assert!(!errors.record_error());
+        assert!(errors.record_error());
+        assert_eq!(errors.count(), 3);
+    }
+
+    #[test]
+    fn encoder_wait_stops_when_screencam_is_disabled() {
+        use std::cell::Cell;
+
+        let enabled = Cell::new(true);
+        let probes = Cell::new(0);
+        let sleeps = Cell::new(0);
+        let result = wait_for_encoder_with(
+            Duration::from_secs(35),
+            Duration::from_secs(2),
+            || enabled.get(),
+            || {
+                probes.set(probes.get() + 1);
+                None::<()>
+            },
+            |_| {
+                sleeps.set(sleeps.get() + 1);
+                enabled.set(false);
+            },
+        );
+
+        assert_eq!(result, EncoderWait::Disabled);
+        assert_eq!(probes.get(), 1);
+        assert_eq!(sleeps.get(), 1);
+    }
+
+    #[test]
+    fn absent_display_does_not_probe_encoder() {
+        let inventory = inventory_with(Vec::new());
+        let resolution = inventory.resolve(None, true);
+        let calls = AtomicUsize::new(0);
+
+        let encoder = wait_for_encoder_for_resolved_display(&resolution, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            "encoder"
+        });
+
+        assert_eq!(encoder, None);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn returning_display_allows_encoder_creation() {
+        let absent = inventory_with(Vec::new());
+        let present = inventory_with(vec![available_display(
+            r"\\.\DISPLAY3",
+            0,
+            1920,
+            1080,
+            true,
+        )]);
+        let calls = AtomicUsize::new(0);
+
+        let absent_resolution = absent.resolve(None, true);
+        assert_eq!(
+            wait_for_encoder_for_resolved_display(&absent_resolution, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                "encoder"
+            }),
+            None
+        );
+
+        let present_resolution = present.resolve(None, true);
+        assert_eq!(
+            wait_for_encoder_for_resolved_display(&present_resolution, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                "encoder"
+            }),
+            Some("encoder")
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn encoder_creation_failure_does_not_publish_an_active_display() {
+        let state = SharedState::new();
+        let present = inventory(1920);
+        let (update, _) = state.apply_display_inventory(&present);
+        let encoder_result: std::result::Result<(), &str> = Err("simulated encoder failure");
+
+        assert!(update.resolution.position.is_some());
+        assert!(encoder_result.is_err());
+        let runtime = state.display_snapshot();
+        assert_eq!(runtime.active_display_id, None);
+        assert!(!runtime.fallback_active);
+        assert_eq!(runtime.available_displays.len(), 1);
+    }
+
+    #[test]
+    fn generation_change_during_construction_rejects_the_stale_plan() {
+        let state = SharedState::new();
+        let initial = inventory(1920);
+        let (initial_update, plan_generation) = state.apply_display_inventory(&initial);
+
+        let changed = inventory(2560);
+        let (_, changed_generation) = state.apply_display_inventory(&changed);
+
+        assert_ne!(plan_generation, changed_generation);
+        assert!(!state.activate_display_for_generation(plan_generation, &initial_update.resolution));
+        assert_eq!(state.display_snapshot().active_display_id, None);
+    }
+
+    #[test]
+    fn runtime_snapshot_changes_atomically_from_active_to_absent() {
+        let state = SharedState::new();
+        let present = inventory(1920);
+        let (active, generation) = state.apply_display_inventory(&present);
+        assert!(state.activate_display_for_generation(generation, &active.resolution));
+        let active_snapshot = state.display_snapshot();
+        assert_eq!(
+            active_snapshot.active_display_id.as_deref(),
+            Some(r"\\.\DISPLAY2")
+        );
+
+        let absent = inventory_with(Vec::new());
+        let (update, _) = state.apply_display_inventory(&absent);
+        assert!(update.requires_reconfigure);
+        let absent_snapshot = state.display_snapshot();
+        assert_eq!(absent_snapshot.active_display_id, None);
+        assert!(!absent_snapshot.fallback_active);
+        assert!(absent_snapshot.display_warning.is_some());
+        assert!(absent_snapshot.available_displays.is_empty());
     }
 }

@@ -22,7 +22,10 @@ pub fn split_annexb_nals(data: &[u8]) -> Vec<&[u8]> {
     }
     let mut nals = Vec::with_capacity(starts.len());
     for (w, &begin) in starts.iter().enumerate() {
-        let mut end = starts.get(w + 1).map(|&next| next - 3).unwrap_or(data.len());
+        let mut end = starts
+            .get(w + 1)
+            .map(|&next| next - 3)
+            .unwrap_or(data.len());
         // A 4-byte start code (00 00 00 01) shows up here as one extra trailing
         // zero byte on the previous NAL — trim it regardless of which start
         // code length was used.
@@ -43,6 +46,14 @@ pub fn nal_unit_type(nal: &[u8]) -> u8 {
 
 pub const NAL_TYPE_SPS: u8 = 7;
 pub const NAL_TYPE_PPS: u8 = 8;
+pub const NAL_TYPE_IDR: u8 = 5;
+
+/// An IDR slice needs data after its one-byte NAL header. ScreenCam calls
+/// this only for complete Annex-B access units returned by the encoder,
+/// before any RTP fragmentation happens.
+pub fn is_complete_idr_nal(nal: &[u8]) -> bool {
+    nal.len() > 1 && nal_unit_type(nal) == NAL_TYPE_IDR
+}
 
 const RTP_VERSION_BYTE: u8 = 0x80; // V=2, P=0, X=0, CC=0
 const RTP_PAYLOAD_TYPE_H264: u8 = 96; // dynamic payload type, negotiated via SDP
@@ -52,6 +63,54 @@ const FU_A_TYPE: u8 = 28;
 pub struct H264Payloader {
     seq: u16,
     ssrc: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_three_byte_start_codes_and_multiple_nals() {
+        let data = [
+            0, 0, 1, 0x67, 0x64, 0, 0, 1, 0x68, 0xee, 0, 0, 1, 0x65, 0x88,
+        ];
+
+        assert_eq!(
+            split_annexb_nals(&data),
+            vec![&[0x67, 0x64][..], &[0x68, 0xee][..], &[0x65, 0x88][..]]
+        );
+    }
+
+    #[test]
+    fn splits_four_byte_start_codes() {
+        let data = [0, 0, 0, 1, 0x67, 0x64, 0, 0, 0, 1, 0x65, 0x88];
+
+        assert_eq!(
+            split_annexb_nals(&data),
+            vec![&[0x67, 0x64][..], &[0x65, 0x88][..]]
+        );
+    }
+
+    #[test]
+    fn incomplete_annexb_data_does_not_produce_an_idr() {
+        for data in [&[][..], &[0][..], &[0, 0][..], &[0, 0, 1][..]] {
+            assert!(split_annexb_nals(data).is_empty());
+        }
+        let header_only = split_annexb_nals(&[0, 0, 1, 0x65]);
+        assert_eq!(header_only.len(), 1);
+        assert!(!is_complete_idr_nal(header_only[0]));
+    }
+
+    #[test]
+    fn only_complete_type_five_nals_are_idr() {
+        assert!(is_complete_idr_nal(&[0x65, 0x88]));
+        assert!(!is_complete_idr_nal(&[0x65]));
+        assert!(!is_complete_idr_nal(&[0x67, 0x64]));
+        assert!(!is_complete_idr_nal(&[0x68, 0xee]));
+        assert!(!is_complete_idr_nal(&[0x66, 0x01])); // SEI
+        assert!(!is_complete_idr_nal(&[0x69, 0x10])); // AUD
+        assert!(!is_complete_idr_nal(&[0x61, 0x20])); // non-IDR slice
+    }
 }
 
 impl H264Payloader {

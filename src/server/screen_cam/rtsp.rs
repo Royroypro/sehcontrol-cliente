@@ -15,19 +15,44 @@
 // connection close, it will not corrupt other sessions.
 
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::{Arc, Mutex};
+use std::io::{self, BufRead, BufReader, Read, Write};
+use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use hbb_common::{anyhow::anyhow, bail, log, ResultType};
 
 use super::auth;
 use super::SharedState;
 
-pub enum Transport {
+const RTSP_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+const TCP_ACCESS_UNIT_QUEUE_CAPACITY: usize = 2;
+const TCP_WRITER_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const UDP_WOULD_BLOCK_LIMIT: u8 = 3;
+
+pub(super) struct RtpAccessUnit {
+    packets: Vec<Vec<u8>>,
+}
+
+impl RtpAccessUnit {
+    pub(super) fn new(packets: Vec<Vec<u8>>) -> Self {
+        Self { packets }
+    }
+}
+
+enum WriterMessage {
+    AccessUnit {
+        epoch: u64,
+        access_unit: Arc<RtpAccessUnit>,
+    },
+    Close,
+}
+
+enum Transport {
     Tcp {
-        stream: Arc<Mutex<TcpStream>>,
-        rtp_channel: u8,
+        sender: SyncSender<WriterMessage>,
     },
     Udp {
         rtp_socket: UdpSocket,
@@ -40,29 +65,274 @@ pub enum Transport {
 
 pub struct Session {
     pub id: String,
-    pub transport: Transport,
+    transport: Transport,
+    shutdown_stream: Arc<TcpStream>,
+    epoch: u64,
+    closed: AtomicBool,
+    udp_would_block_count: AtomicU8,
 }
 
 impl Session {
-    /// Best-effort send; a broken pipe just means the client went away and
-    /// will be pruned the next time its connection thread notices EOF.
-    pub fn send_rtp(&self, packet: &[u8]) {
+    pub(super) fn dispatch_access_unit(
+        &self,
+        epoch: u64,
+        access_unit: Arc<RtpAccessUnit>,
+    ) -> io::Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "RTSP session is closed",
+            ));
+        }
+        if epoch != self.epoch {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "RTP access unit epoch does not match RTSP session",
+            ));
+        }
+
         match &self.transport {
             Transport::Udp { rtp_socket, .. } => {
-                let _ = rtp_socket.send(packet);
+                self.dispatch_udp_access_unit_with(&access_unit, |packet| rtp_socket.send(packet))
             }
-            Transport::Tcp { stream, rtp_channel } => {
-                let mut framed = Vec::with_capacity(4 + packet.len());
-                framed.push(b'$');
-                framed.push(*rtp_channel);
-                framed.extend_from_slice(&(packet.len() as u16).to_be_bytes());
-                framed.extend_from_slice(packet);
-                if let Ok(mut s) = stream.lock() {
-                    let _ = s.write_all(&framed);
-                }
-            }
+            Transport::Tcp { sender } => sender
+                .try_send(WriterMessage::AccessUnit { epoch, access_unit })
+                .map_err(map_tcp_queue_error),
         }
     }
+
+    /// Forces the client to reconnect and issue a fresh DESCRIBE/SETUP after
+    /// the capture source or its H.264 parameter sets change.
+    pub fn close(&self) {
+        if self
+            .closed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            if let Transport::Tcp { sender } = &self.transport {
+                let _ = sender.try_send(WriterMessage::Close);
+            }
+            // This clone is independent from the writer's serialization mutex,
+            // so shutdown can interrupt a blocked write immediately.
+            let _ = self.shutdown_stream.shutdown(Shutdown::Both);
+        }
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
+    fn dispatch_udp_access_unit_with(
+        &self,
+        access_unit: &RtpAccessUnit,
+        send: impl FnMut(&[u8]) -> io::Result<usize>,
+    ) -> io::Result<()> {
+        match send_udp_access_unit(access_unit, send) {
+            Ok(()) => {
+                self.udp_would_block_count.store(0, Ordering::Release);
+                Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                let previous = self.udp_would_block_count.fetch_update(
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                    |count| Some(count.saturating_add(1)),
+                );
+                let count = match previous {
+                    Ok(previous) | Err(previous) => previous.saturating_add(1),
+                };
+                if count >= UDP_WOULD_BLOCK_LIMIT {
+                    Err(error)
+                } else {
+                    // UDP cannot resume a partially sent access unit. Drop this
+                    // one for this session and let the next successful unit
+                    // reset the consecutive-pressure counter.
+                    Ok(())
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn map_tcp_queue_error(error: TrySendError<WriterMessage>) -> io::Error {
+    match error {
+        TrySendError::Full(_) => io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "RTSP interleaved RTP queue is full",
+        ),
+        TrySendError::Disconnected(_) => io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "RTSP interleaved RTP writer stopped",
+        ),
+    }
+}
+
+fn send_udp_access_unit(
+    access_unit: &RtpAccessUnit,
+    mut send: impl FnMut(&[u8]) -> io::Result<usize>,
+) -> io::Result<()> {
+    for packet in &access_unit.packets {
+        if send(packet)? != packet.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "partial RTP datagram send",
+            ));
+        }
+    }
+    Ok(())
+}
+
+struct TcpWriterStart {
+    receiver: Receiver<WriterMessage>,
+    writer: Box<dyn AccessUnitWriter>,
+}
+
+trait AccessUnitWriter: Send {
+    fn write_access_unit(
+        &mut self,
+        access_unit: &RtpAccessUnit,
+        should_continue: &mut dyn FnMut() -> bool,
+    ) -> io::Result<()>;
+}
+
+struct TcpInterleavedWriter {
+    stream: Arc<Mutex<TcpStream>>,
+    rtp_channel: u8,
+}
+
+impl AccessUnitWriter for TcpInterleavedWriter {
+    fn write_access_unit(
+        &mut self,
+        access_unit: &RtpAccessUnit,
+        should_continue: &mut dyn FnMut() -> bool,
+    ) -> io::Result<()> {
+        write_interleaved_access_unit(&self.stream, self.rtp_channel, access_unit, should_continue)
+    }
+}
+
+fn start_tcp_writer(
+    start: TcpWriterStart,
+    session: Weak<Session>,
+    state: Weak<SharedState>,
+) -> io::Result<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("screencam-rtsp-writer".to_owned())
+        .spawn(move || tcp_writer_loop(start, session, state))
+}
+
+fn tcp_writer_loop(mut start: TcpWriterStart, session: Weak<Session>, state: Weak<SharedState>) {
+    loop {
+        let message = match start.receiver.recv_timeout(TCP_WRITER_POLL_INTERVAL) {
+            Ok(message) => message,
+            Err(RecvTimeoutError::Timeout) => {
+                if session
+                    .upgrade()
+                    .map_or(true, |session| session.closed.load(Ordering::Acquire))
+                {
+                    break;
+                }
+                continue;
+            }
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
+
+        let (epoch, access_unit) = match message {
+            WriterMessage::AccessUnit { epoch, access_unit } => (epoch, access_unit),
+            WriterMessage::Close => break,
+        };
+        let Some(current_session) = session.upgrade() else {
+            break;
+        };
+        let Some(current_state) = state.upgrade() else {
+            current_session.close();
+            break;
+        };
+        if current_session.closed.load(Ordering::Acquire)
+            || epoch != current_session.epoch
+            || current_state.stream_epoch() != epoch
+        {
+            retire_writer_session(&current_state, &current_session, None);
+            break;
+        }
+
+        if let Err(error) = start.writer.write_access_unit(&access_unit, &mut || {
+            !current_session.closed.load(Ordering::Acquire) && current_state.stream_epoch() == epoch
+        }) {
+            retire_writer_session(&current_state, &current_session, Some(&error));
+            break;
+        }
+    }
+}
+
+fn write_interleaved_access_unit(
+    stream: &Arc<Mutex<TcpStream>>,
+    rtp_channel: u8,
+    access_unit: &RtpAccessUnit,
+    mut should_continue: impl FnMut() -> bool,
+) -> io::Result<()> {
+    let mut stream = stream
+        .lock()
+        .map_err(|_| io::Error::new(io::ErrorKind::Other, "RTSP stream lock poisoned"))?;
+    for packet in &access_unit.packets {
+        if !should_continue() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "RTSP stream epoch changed",
+            ));
+        }
+        let packet_len = u16::try_from(packet.len()).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "RTP packet exceeds RTSP interleaved frame limit",
+            )
+        })?;
+        let packet_len = packet_len.to_be_bytes();
+        let framed_header = [b'$', rtp_channel, packet_len[0], packet_len[1]];
+        stream.write_all(&framed_header)?;
+        // The packet allocation is shared across all sessions; write_all only
+        // borrows it and does not make a per-session payload copy.
+        stream.write_all(packet)?;
+    }
+    Ok(())
+}
+
+fn retire_writer_session(state: &SharedState, session: &Arc<Session>, error: Option<&io::Error>) {
+    let removed = super::take_matching_arcs(&state.sessions, |registered| {
+        registered.id == session.id && Arc::ptr_eq(registered, session)
+    });
+    if !removed.is_empty() {
+        if let Some(error) = error {
+            log::warn!("[screencam] removing RTSP session after TCP writer failed: {error}");
+        }
+        set_rtsp_client_count(state);
+    }
+    drop(removed);
+    // The failing writer owns this exact session even when a newer connection
+    // has already replaced it in the registry. Never close the replacement.
+    session.close();
+}
+
+fn set_rtsp_client_count(state: &SharedState) {
+    super::set_rtsp_clients(state.sessions.lock().unwrap().len());
+}
+
+fn register_session_replacing_same_id(
+    state: &SharedState,
+    new_session: Arc<Session>,
+) -> Vec<Arc<Session>> {
+    let mut replaced = Vec::new();
+    let mut sessions = state.sessions.lock().unwrap();
+    sessions.retain(|current| {
+        if current.id == new_session.id {
+            replaced.push(current.clone());
+            false
+        } else {
+            true
+        }
+    });
+    sessions.push(new_session);
+    replaced
 }
 
 struct RtspRequest {
@@ -93,12 +363,70 @@ pub fn start_listener(port: u16, state: Arc<SharedState>) -> ResultType<()> {
 }
 
 fn handle_connection(stream: TcpStream, state: Arc<SharedState>) -> ResultType<()> {
+    let mut session_id = None;
+    let mut registered_sessions = Vec::new();
+    let result = handle_connection_inner(
+        stream,
+        state.clone(),
+        &mut session_id,
+        &mut registered_sessions,
+    );
+    finish_connection(result, &state, &registered_sessions)
+}
+
+fn finish_connection<T, E>(
+    result: std::result::Result<T, E>,
+    state: &SharedState,
+    registered_sessions: &[Arc<Session>],
+) -> std::result::Result<T, E> {
+    finish_with_cleanup(result, || {
+        cleanup_registered_sessions(state, registered_sessions)
+    })
+}
+
+fn finish_with_cleanup<T, E>(
+    result: std::result::Result<T, E>,
+    cleanup: impl FnOnce(),
+) -> std::result::Result<T, E> {
+    cleanup();
+    result
+}
+
+fn cleanup_registered_sessions(state: &SharedState, registered_sessions: &[Arc<Session>]) {
+    let removed = super::take_matching_arcs(&state.sessions, |current| {
+        registered_sessions
+            .iter()
+            .any(|registered| current.id == registered.id && Arc::ptr_eq(current, registered))
+    });
+    drop(removed);
+
+    // Close every exact session owned by this connection even if stream
+    // invalidation or RTP-send cleanup already removed it from the registry.
+    // shutdown is idempotent and does not acquire the sessions mutex.
+    for session in registered_sessions {
+        session.close();
+    }
+}
+
+fn configure_write_timeout(stream: &TcpStream, timeout: Duration) -> io::Result<()> {
+    stream.set_write_timeout(Some(timeout))
+}
+
+fn handle_connection_inner(
+    stream: TcpStream,
+    state: Arc<SharedState>,
+    session_id: &mut Option<String>,
+    registered_sessions: &mut Vec<Arc<Session>>,
+) -> ResultType<()> {
     stream.set_nodelay(true).ok();
     let peer_addr = stream.peer_addr()?;
-    let write_half = Arc::new(Mutex::new(stream.try_clone()?));
+    let shutdown_stream = Arc::new(stream.try_clone()?);
+    let write_stream = stream.try_clone()?;
+    configure_write_timeout(&write_stream, RTSP_WRITE_TIMEOUT)?;
+    let write_half = Arc::new(Mutex::new(write_stream));
     let mut reader = BufReader::new(stream);
 
-    let mut session_id: Option<String> = None;
+    let mut described_epoch: Option<u64> = None;
     let challenge = auth::Challenge::new();
 
     loop {
@@ -145,32 +473,65 @@ fn handle_connection(stream: TcpStream, state: Arc<SharedState>) -> ResultType<(
                     None,
                 )?;
             }
-            "DESCRIBE" => match build_sdp(&state, peer_addr) {
-                Some(sdp) => {
-                    write_response(
-                        &write_half,
-                        "200 OK",
-                        &cseq,
-                        &[("Content-Type", "application/sdp")],
-                        Some(sdp.as_bytes()),
-                    )?;
+            "DESCRIBE" => {
+                match build_sdp(&state, peer_addr) {
+                    Some((epoch, sdp)) => {
+                        write_response(
+                            &write_half,
+                            "200 OK",
+                            &cseq,
+                            &[("Content-Type", "application/sdp")],
+                            Some(sdp.as_bytes()),
+                        )?;
+                        described_epoch = Some(epoch);
+                    }
+                    _ => {
+                        // This epoch does not yet have dimensions, SPS, PPS
+                        // and a confirmed IDR.
+                        write_response(&write_half, "503 Service Unavailable", &cseq, &[], None)?;
+                    }
                 }
-                None => {
-                    // Encoder hasn't produced a keyframe (SPS/PPS) yet.
-                    write_response(&write_half, "503 Service Unavailable", &cseq, &[], None)?;
-                }
-            },
+            }
             "SETUP" => {
                 let transport_hdr = req.headers.get("transport").cloned().unwrap_or_default();
                 match setup_transport(&transport_hdr, peer_addr, &write_half) {
-                    Ok((transport, resp_transport_hdr)) => {
+                    Ok((transport, resp_transport_hdr, writer_start)) => {
                         let id = session_id
-                            .get_or_insert_with(|| format!("{:016X}", hbb_common::rand::random::<u64>()))
+                            .get_or_insert_with(|| {
+                                format!("{:016X}", hbb_common::rand::random::<u64>())
+                            })
                             .clone();
-                        state.sessions.lock().unwrap().push(Session {
+                        // Keep the descriptor lock until registration is complete.
+                        // invalidate_stream takes these locks in the same order, so
+                        // it cannot miss a session registered for the old epoch.
+                        let descriptor = state.stream_descriptor.lock().unwrap();
+                        let current_epoch = descriptor.epoch;
+                        if !epoch_allows_setup(described_epoch, current_epoch) {
+                            drop(descriptor);
+                            write_response(
+                                &write_half,
+                                "503 Service Unavailable",
+                                &cseq,
+                                &[],
+                                None,
+                            )?;
+                            continue;
+                        }
+                        let registered_session = Arc::new(Session {
                             id: id.clone(),
                             transport,
+                            shutdown_stream: shutdown_stream.clone(),
+                            epoch: current_epoch,
+                            closed: AtomicBool::new(false),
+                            udp_would_block_count: AtomicU8::new(0),
                         });
+                        let replaced =
+                            register_session_replacing_same_id(&state, registered_session.clone());
+                        drop(descriptor);
+                        for replaced_session in replaced {
+                            replaced_session.close();
+                        }
+                        registered_sessions.push(registered_session.clone());
                         write_response(
                             &write_half,
                             "200 OK",
@@ -178,6 +539,16 @@ fn handle_connection(stream: TcpStream, state: Arc<SharedState>) -> ResultType<(
                             &[("Transport", &resp_transport_hdr), ("Session", &id)],
                             None,
                         )?;
+                        if let Some(writer_start) = writer_start {
+                            // The SETUP response is on the wire before the writer
+                            // can emit interleaved RTP on the same connection.
+                            start_tcp_writer(
+                                writer_start,
+                                Arc::downgrade(&registered_session),
+                                Arc::downgrade(&state),
+                            )?;
+                        }
+                        set_rtsp_client_count(&state);
                     }
                     Err(e) => {
                         log::warn!("[screencam] SETUP failed: {e:?}");
@@ -200,9 +571,6 @@ fn handle_connection(stream: TcpStream, state: Arc<SharedState>) -> ResultType<(
                 write_response(&write_half, "200 OK", &cseq, &[], None)?;
             }
             "TEARDOWN" => {
-                if let Some(id) = &session_id {
-                    state.sessions.lock().unwrap().retain(|s| &s.id != id);
-                }
                 write_response(&write_half, "200 OK", &cseq, &[], None)?;
                 break;
             }
@@ -213,25 +581,35 @@ fn handle_connection(stream: TcpStream, state: Arc<SharedState>) -> ResultType<(
         }
     }
 
-    if let Some(id) = &session_id {
-        state.sessions.lock().unwrap().retain(|s| &s.id != id);
-    }
     Ok(())
+}
+
+fn epoch_allows_setup(described_epoch: Option<u64>, current_epoch: u64) -> bool {
+    described_epoch == Some(current_epoch)
 }
 
 fn setup_transport(
     transport_hdr: &str,
     peer_addr: SocketAddr,
     write_half: &Arc<Mutex<TcpStream>>,
-) -> ResultType<(Transport, String)> {
+) -> ResultType<(Transport, String, Option<TcpWriterStart>)> {
     if transport_hdr.contains("TCP") || transport_hdr.contains("interleaved") {
         // TCP interleaved: RTP shares this same connection, channel 0 (RTCP
         // would be channel 1, unused here — see module docs).
-        let transport = Transport::Tcp {
-            stream: write_half.clone(),
-            rtp_channel: 0,
+        let (sender, receiver) = mpsc::sync_channel(TCP_ACCESS_UNIT_QUEUE_CAPACITY);
+        let transport = Transport::Tcp { sender };
+        let writer_start = TcpWriterStart {
+            receiver,
+            writer: Box::new(TcpInterleavedWriter {
+                stream: write_half.clone(),
+                rtp_channel: 0,
+            }),
         };
-        Ok((transport, "RTP/AVP/TCP;unicast;interleaved=0-1".to_owned()))
+        Ok((
+            transport,
+            "RTP/AVP/TCP;unicast;interleaved=0-1".to_owned(),
+            Some(writer_start),
+        ))
     } else {
         let client_ports = extract_param(transport_hdr, "client_port=")
             .ok_or_else(|| anyhow!("missing client_port in Transport header"))?;
@@ -239,6 +617,7 @@ fn setup_transport(
 
         let rtp_socket = UdpSocket::bind("0.0.0.0:0")?;
         rtp_socket.connect((peer_addr.ip(), rtp_port))?;
+        rtp_socket.set_nonblocking(true)?;
         let rtcp_socket = UdpSocket::bind("0.0.0.0:0")?;
         rtcp_socket.connect((peer_addr.ip(), rtcp_port))?;
 
@@ -254,6 +633,7 @@ fn setup_transport(
                 _rtcp_socket: rtcp_socket,
             },
             resp,
+            None,
         ))
     }
 }
@@ -303,7 +683,10 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> ResultType<Option<RtspRequ
     // We don't expect/accept a body for any method we support (no ANNOUNCE),
     // but consume Content-Length if a client sends one anyway so the stream
     // stays in sync for the next request.
-    if let Some(len) = headers.get("content-length").and_then(|v| v.parse::<usize>().ok()) {
+    if let Some(len) = headers
+        .get("content-length")
+        .and_then(|v| v.parse::<usize>().ok())
+    {
         let mut buf = vec![0u8; len];
         reader.read_exact(&mut buf)?;
     }
@@ -311,7 +694,11 @@ fn read_request(reader: &mut BufReader<TcpStream>) -> ResultType<Option<RtspRequ
     if method.is_empty() {
         bail!("empty request line");
     }
-    Ok(Some(RtspRequest { method, uri, headers }))
+    Ok(Some(RtspRequest {
+        method,
+        uri,
+        headers,
+    }))
 }
 
 fn write_response(
@@ -337,10 +724,19 @@ fn write_response(
     Ok(())
 }
 
-fn build_sdp(state: &SharedState, peer_addr: SocketAddr) -> Option<String> {
-    let sps = state.sps.lock().unwrap().clone()?;
-    let pps = state.pps.lock().unwrap().clone()?;
+fn build_sdp(state: &SharedState, peer_addr: SocketAddr) -> Option<(u64, String)> {
     let local_ip = local_ip_for_peer(peer_addr).unwrap_or_else(|| "0.0.0.0".to_owned());
+    build_sdp_for_ip(state, &local_ip)
+}
+
+fn build_sdp_for_ip(state: &SharedState, local_ip: &str) -> Option<(u64, String)> {
+    let descriptor = state.stream_descriptor();
+    if !descriptor.is_ready() {
+        return None;
+    }
+    let epoch = descriptor.epoch;
+    let sps = descriptor.sps?;
+    let pps = descriptor.pps?;
 
     let profile_level_id = if sps.len() >= 3 {
         format!("{:02X}{:02X}{:02X}", sps[0], sps[1], sps[2])
@@ -350,7 +746,9 @@ fn build_sdp(state: &SharedState, peer_addr: SocketAddr) -> Option<String> {
     let sps_b64 = base64_encode(&sps);
     let pps_b64 = base64_encode(&pps);
 
-    Some(format!(
+    Some((
+        epoch,
+        format!(
         "v=0\r\n\
          o=- 0 0 IN IP4 {ip}\r\n\
          s=Sehcontrol ScreenCam\r\n\
@@ -365,6 +763,7 @@ fn build_sdp(state: &SharedState, peer_addr: SocketAddr) -> Option<String> {
         plid = profile_level_id,
         sps = sps_b64,
         pps = pps_b64,
+    ),
     ))
 }
 
@@ -398,4 +797,917 @@ fn base64_encode(data: &[u8]) -> String {
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Instant;
+
+    const TEST_WRITE_TIMEOUT: Duration = Duration::from_millis(250);
+
+    fn tcp_session(
+        id: &str,
+    ) -> (
+        Arc<Session>,
+        TcpStream,
+        Receiver<WriterMessage>,
+        Arc<Mutex<TcpStream>>,
+    ) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let write_stream = server.try_clone().unwrap();
+        configure_write_timeout(&write_stream, TEST_WRITE_TIMEOUT).unwrap();
+        let write_stream = Arc::new(Mutex::new(write_stream));
+        let (sender, receiver) = mpsc::sync_channel(TCP_ACCESS_UNIT_QUEUE_CAPACITY);
+        let session = Arc::new(Session {
+            id: id.to_owned(),
+            transport: Transport::Tcp { sender },
+            shutdown_stream: Arc::new(server.try_clone().unwrap()),
+            epoch: 0,
+            closed: AtomicBool::new(false),
+            udp_would_block_count: AtomicU8::new(0),
+        });
+        (session, peer, receiver, write_stream)
+    }
+
+    fn access_unit(packets: &[&[u8]]) -> Arc<RtpAccessUnit> {
+        Arc::new(RtpAccessUnit::new(
+            packets.iter().map(|packet| packet.to_vec()).collect(),
+        ))
+    }
+
+    fn queued_access_unit(message: WriterMessage) -> Arc<RtpAccessUnit> {
+        match message {
+            WriterMessage::AccessUnit { access_unit, .. } => access_unit,
+            WriterMessage::Close => panic!("expected an access unit"),
+        }
+    }
+
+    fn start_test_writer(
+        state: &Arc<SharedState>,
+        session: &Arc<Session>,
+        receiver: Receiver<WriterMessage>,
+        stream: Arc<Mutex<TcpStream>>,
+    ) -> thread::JoinHandle<()> {
+        start_test_writer_with(
+            state,
+            session,
+            receiver,
+            Box::new(TcpInterleavedWriter {
+                stream,
+                rtp_channel: 0,
+            }),
+        )
+    }
+
+    fn start_test_writer_with(
+        state: &Arc<SharedState>,
+        session: &Arc<Session>,
+        receiver: Receiver<WriterMessage>,
+        writer: Box<dyn AccessUnitWriter>,
+    ) -> thread::JoinHandle<()> {
+        start_tcp_writer(
+            TcpWriterStart { receiver, writer },
+            Arc::downgrade(session),
+            Arc::downgrade(state),
+        )
+        .unwrap()
+    }
+
+    struct ErrorWriter {
+        kind: io::ErrorKind,
+    }
+
+    impl AccessUnitWriter for ErrorWriter {
+        fn write_access_unit(
+            &mut self,
+            _access_unit: &RtpAccessUnit,
+            _should_continue: &mut dyn FnMut() -> bool,
+        ) -> io::Result<()> {
+            Err(io::Error::new(self.kind, "injected writer failure"))
+        }
+    }
+
+    struct GatedErrorWriter {
+        kind: io::ErrorKind,
+        started: mpsc::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    impl AccessUnitWriter for GatedErrorWriter {
+        fn write_access_unit(
+            &mut self,
+            _access_unit: &RtpAccessUnit,
+            _should_continue: &mut dyn FnMut() -> bool,
+        ) -> io::Result<()> {
+            self.started.send(()).unwrap();
+            self.release.recv().unwrap();
+            Err(io::Error::new(self.kind, "injected writer failure"))
+        }
+    }
+
+    struct PausingPacketWriter {
+        written: mpsc::Sender<Vec<u8>>,
+        first_written: mpsc::Sender<()>,
+        resume: mpsc::Receiver<()>,
+    }
+
+    impl AccessUnitWriter for PausingPacketWriter {
+        fn write_access_unit(
+            &mut self,
+            access_unit: &RtpAccessUnit,
+            should_continue: &mut dyn FnMut() -> bool,
+        ) -> io::Result<()> {
+            for (index, packet) in access_unit.packets.iter().enumerate() {
+                if !should_continue() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "injected epoch change",
+                    ));
+                }
+                self.written.send(packet.clone()).unwrap();
+                if index == 0 {
+                    self.first_written.send(()).unwrap();
+                    self.resume.recv().unwrap();
+                }
+            }
+            Ok(())
+        }
+    }
+
+    struct DropNotifyingWriter {
+        calls: Arc<AtomicUsize>,
+        dropped: Option<mpsc::Sender<()>>,
+    }
+
+    impl AccessUnitWriter for DropNotifyingWriter {
+        fn write_access_unit(
+            &mut self,
+            _access_unit: &RtpAccessUnit,
+            _should_continue: &mut dyn FnMut() -> bool,
+        ) -> io::Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    impl Drop for DropNotifyingWriter {
+        fn drop(&mut self) {
+            if let Some(dropped) = self.dropped.take() {
+                let _ = dropped.send(());
+            }
+        }
+    }
+
+    fn early_read_failure() -> std::result::Result<(), &'static str> {
+        std::result::Result::<(), _>::Err("read failed")?;
+        Ok(())
+    }
+
+    #[test]
+    fn setup_accepts_only_the_epoch_returned_by_current_describe() {
+        assert!(epoch_allows_setup(Some(7), 7));
+        assert!(!epoch_allows_setup(Some(6), 7));
+        assert!(!epoch_allows_setup(None, 7));
+    }
+
+    #[test]
+    fn old_describe_is_rejected_after_stream_invalidation() {
+        let state = SharedState::new();
+        assert!(state.set_stream_dimensions(0, 1920, 1080));
+        assert!(state.apply_stream_access_unit(
+            0,
+            &[&[0x67, 0x64, 0x00, 0x1f], &[0x68, 0xee], &[0x65, 0x88]]
+        ));
+        let (described_epoch, old_sdp) =
+            build_sdp_for_ip(&state, "127.0.0.1").expect("current stream must describe");
+        assert!(old_sdp.contains("sprop-parameter-sets="));
+
+        assert_eq!(state.invalidate_stream(), described_epoch + 1);
+        assert!(!epoch_allows_setup(
+            Some(described_epoch),
+            state.stream_epoch()
+        ));
+        assert!(build_sdp_for_ip(&state, "127.0.0.1").is_none());
+
+        let new_epoch = state.stream_epoch();
+        assert!(state.set_stream_dimensions(new_epoch, 2560, 1440));
+        assert!(state.apply_stream_access_unit(
+            new_epoch,
+            &[&[0x67, 0x64, 0x00, 0x20], &[0x68, 0xef], &[0x65, 0x99]]
+        ));
+        let (new_described_epoch, new_sdp) =
+            build_sdp_for_ip(&state, "127.0.0.1").expect("new stream must describe");
+
+        assert_eq!(new_described_epoch, new_epoch);
+        assert!(epoch_allows_setup(
+            Some(new_described_epoch),
+            state.stream_epoch()
+        ));
+        assert_ne!(old_sdp, new_sdp);
+    }
+
+    #[test]
+    fn invalidation_removes_old_sdp_until_the_new_epoch_is_ready() {
+        let state = SharedState::new();
+        assert!(state.set_stream_dimensions(0, 1920, 1080));
+        assert!(state.apply_stream_access_unit(
+            0,
+            &[&[0x67, 0x64, 0x00, 0x1f], &[0x68, 0xee], &[0x65, 0x88]]
+        ));
+        assert!(state.stream_descriptor().is_ready());
+
+        state.invalidate_stream();
+
+        let descriptor = state.stream_descriptor();
+        assert_eq!(descriptor.epoch, 1);
+        assert!(!descriptor.is_ready());
+        assert_eq!(descriptor.sps, None);
+        assert_eq!(descriptor.pps, None);
+        assert!(!descriptor.idr_ready);
+    }
+
+    #[test]
+    fn cleanup_runs_and_preserves_the_original_early_error() {
+        let state = SharedState::new();
+        let (session, _peer, _receiver, _stream) = tcp_session("registered");
+        state.sessions.lock().unwrap().push(session.clone());
+
+        let result = finish_connection(early_read_failure(), &state, &[session.clone()]);
+
+        assert_eq!(result, Err("read failed"));
+        assert!(state.sessions.lock().unwrap().is_empty());
+        assert!(session
+            .dispatch_access_unit(0, access_unit(&[&[1]]))
+            .is_err());
+    }
+
+    #[test]
+    fn old_connection_cleanup_preserves_a_replacement_with_the_same_id() {
+        let state = SharedState::new();
+        let (old, _old_peer, _old_receiver, _old_stream) = tcp_session("same-id");
+        let (replacement, _replacement_peer, replacement_receiver, _replacement_stream) =
+            tcp_session("same-id");
+        state
+            .sessions
+            .lock()
+            .unwrap()
+            .extend([old.clone(), replacement.clone()]);
+
+        let first = finish_connection(Ok::<_, ()>(()), &state, &[old.clone()]);
+
+        assert_eq!(first, Ok(()));
+        let remaining = state.sessions.lock().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert!(Arc::ptr_eq(&remaining[0], &replacement));
+        drop(remaining);
+        assert!(old.dispatch_access_unit(0, access_unit(&[&[1]])).is_err());
+        let replacement_access_unit = access_unit(&[&[1]]);
+        assert!(replacement
+            .dispatch_access_unit(0, replacement_access_unit.clone())
+            .is_ok());
+        assert!(Arc::ptr_eq(
+            &queued_access_unit(replacement_receiver.try_recv().unwrap()),
+            &replacement_access_unit
+        ));
+
+        let second = finish_connection(Ok::<_, ()>(()), &state, &[old]);
+        assert_eq!(second, Ok(()));
+        let remaining = state.sessions.lock().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert!(Arc::ptr_eq(&remaining[0], &replacement));
+        drop(remaining);
+        replacement.close();
+    }
+
+    #[test]
+    fn repeated_setup_replaces_and_closes_the_old_writer_session() {
+        let state = Arc::new(SharedState::new());
+        let (old, _old_peer, old_receiver, old_stream) = tcp_session("same-id");
+        assert!(register_session_replacing_same_id(&state, old.clone()).is_empty());
+        let old_writer = start_test_writer(&state, &old, old_receiver, old_stream);
+        let (replacement, _new_peer, replacement_receiver, _new_stream) = tcp_session("same-id");
+
+        let replaced = register_session_replacing_same_id(&state, replacement.clone());
+        assert_eq!(replaced.len(), 1);
+        assert!(Arc::ptr_eq(&replaced[0], &old));
+        for session in replaced {
+            session.close();
+        }
+        old_writer.join().unwrap();
+
+        let registered = state.sessions.lock().unwrap();
+        assert_eq!(registered.len(), 1);
+        assert!(Arc::ptr_eq(&registered[0], &replacement));
+        drop(registered);
+        assert!(old.dispatch_access_unit(0, access_unit(&[&[1]])).is_err());
+
+        assert_eq!(
+            finish_connection(Ok::<_, ()>(()), &state, &[old.clone()]),
+            Ok(())
+        );
+        assert_eq!(finish_connection(Ok::<_, ()>(()), &state, &[old]), Ok(()));
+        let registered = state.sessions.lock().unwrap();
+        assert_eq!(registered.len(), 1);
+        assert!(Arc::ptr_eq(&registered[0], &replacement));
+        drop(registered);
+
+        let batch = access_unit(&[&[2]]);
+        assert!(replacement.dispatch_access_unit(0, batch.clone()).is_ok());
+        assert!(Arc::ptr_eq(
+            &queued_access_unit(replacement_receiver.try_recv().unwrap()),
+            &batch
+        ));
+        replacement.close();
+    }
+
+    #[test]
+    fn tcp_write_timeout_is_configured() {
+        let (session, _peer, _receiver, stream) = tcp_session("timeout");
+        let timeout = stream.lock().unwrap().write_timeout().unwrap();
+
+        assert_eq!(timeout, Some(TEST_WRITE_TIMEOUT));
+        session.close();
+    }
+
+    #[test]
+    fn close_does_not_wait_for_the_tcp_write_mutex() {
+        let (session, _peer, _receiver, write_stream) = tcp_session("interrupt");
+        let write_guard = write_stream.lock().unwrap();
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let closing_session = session.clone();
+        let closer = thread::spawn(move || {
+            closing_session.close();
+            closed_tx.send(()).unwrap();
+        });
+
+        closed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("shutdown must not wait for the write mutex");
+        drop(write_guard);
+        closer.join().unwrap();
+        assert!(session
+            .dispatch_access_unit(0, access_unit(&[&[1]]))
+            .is_err());
+    }
+
+    #[test]
+    fn disconnected_tcp_queue_propagates_and_removes_the_failed_session() {
+        let state = SharedState::new();
+        let (session, _peer, receiver, _stream) = tcp_session("failed");
+        state.sessions.lock().unwrap().push(session.clone());
+        drop(receiver);
+        let access_unit = access_unit(&[&[1, 2, 3]]);
+
+        let failed = super::super::dispatch_access_unit_to_sessions(
+            vec![session.clone()],
+            access_unit,
+            |session, access_unit| session.dispatch_access_unit(0, access_unit),
+        );
+        let removed =
+            super::super::take_failed_session_instances(&state.sessions, &failed, |session| {
+                session.id.as_str()
+            });
+
+        assert_eq!(failed.len(), 1);
+        assert_eq!(removed.len(), 1);
+        assert!(Arc::ptr_eq(&removed[0], &session));
+        assert!(state.sessions.lock().unwrap().is_empty());
+        for session in removed {
+            session.close();
+        }
+    }
+
+    #[test]
+    fn sender_drop_terminates_a_waiting_writer_without_processing_messages() {
+        let state = Arc::new(SharedState::new());
+        let (session, _peer, receiver, _stream) = tcp_session("sender-drop");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let writer = start_test_writer_with(
+            &state,
+            &session,
+            receiver,
+            Box::new(DropNotifyingWriter {
+                calls: calls.clone(),
+                dropped: Some(dropped_tx),
+            }),
+        );
+
+        drop(session);
+        dropped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("dropping the last sender must terminate the writer");
+        writer.join().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn close_discards_queued_messages_and_terminates_the_writer() {
+        let state = Arc::new(SharedState::new());
+        let (session, _peer, receiver, _stream) = tcp_session("closed");
+        state.sessions.lock().unwrap().push(session.clone());
+        assert!(session
+            .dispatch_access_unit(0, access_unit(&[&[1, 2, 3]]))
+            .is_ok());
+        session.close();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (dropped_tx, dropped_rx) = mpsc::channel();
+        let writer = start_test_writer_with(
+            &state,
+            &session,
+            receiver,
+            Box::new(DropNotifyingWriter {
+                calls: calls.clone(),
+                dropped: Some(dropped_tx),
+            }),
+        );
+
+        dropped_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("close must terminate the writer");
+        writer.join().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(session
+            .dispatch_access_unit(0, access_unit(&[&[4]]))
+            .is_err());
+    }
+
+    #[test]
+    fn active_writer_client_disconnect_error_removes_and_closes_the_session() {
+        let state = Arc::new(SharedState::new());
+        let (session, _peer, receiver, _stream) = tcp_session("disconnected-client");
+        state.sessions.lock().unwrap().push(session.clone());
+        let writer = start_test_writer_with(
+            &state,
+            &session,
+            receiver,
+            Box::new(ErrorWriter {
+                kind: io::ErrorKind::ConnectionReset,
+            }),
+        );
+
+        assert!(session
+            .dispatch_access_unit(0, access_unit(&[&[1]]))
+            .is_ok());
+        writer.join().unwrap();
+
+        assert!(state.sessions.lock().unwrap().is_empty());
+        assert!(session
+            .dispatch_access_unit(0, access_unit(&[&[2]]))
+            .is_err());
+    }
+
+    #[test]
+    fn bounded_queue_is_nonblocking_and_counts_whole_access_units() {
+        let (session, _peer, receiver, _stream) = tcp_session("bounded");
+        let first = access_unit(&[&[1], &[2]]);
+        let second = access_unit(&[&[3]]);
+        let third = access_unit(&[&[4]]);
+
+        assert!(session.dispatch_access_unit(0, first.clone()).is_ok());
+        assert!(session.dispatch_access_unit(0, second.clone()).is_ok());
+        let started = Instant::now();
+        let error = session
+            .dispatch_access_unit(0, third)
+            .expect_err("the third access unit must exceed capacity");
+
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(started.elapsed() < Duration::from_millis(50));
+        assert!(Arc::ptr_eq(
+            &queued_access_unit(receiver.try_recv().unwrap()),
+            &first
+        ));
+        assert!(Arc::ptr_eq(
+            &queued_access_unit(receiver.try_recv().unwrap()),
+            &second
+        ));
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn dispatch_shares_one_batch_between_tcp_sessions_without_payload_copies() {
+        let (first, _first_peer, first_receiver, _first_stream) = tcp_session("first");
+        let (second, _second_peer, second_receiver, _second_stream) = tcp_session("second");
+        let batch = access_unit(&[&[1, 2, 3], &[4, 5]]);
+
+        let failed = super::super::dispatch_access_unit_to_sessions(
+            vec![first, second],
+            batch.clone(),
+            |session, access_unit| session.dispatch_access_unit(0, access_unit),
+        );
+
+        assert!(failed.is_empty());
+        let first_batch = queued_access_unit(first_receiver.try_recv().unwrap());
+        let second_batch = queued_access_unit(second_receiver.try_recv().unwrap());
+        assert!(Arc::ptr_eq(&first_batch, &batch));
+        assert!(Arc::ptr_eq(&second_batch, &batch));
+        assert!(Arc::ptr_eq(&first_batch, &second_batch));
+    }
+
+    #[test]
+    fn full_tcp_session_does_not_delay_healthy_session_or_later_access_units() {
+        let state = SharedState::new();
+        let (slow, _slow_peer, _slow_receiver, _slow_stream) = tcp_session("slow");
+        let (healthy, _healthy_peer, healthy_receiver, _healthy_stream) = tcp_session("healthy");
+        state
+            .sessions
+            .lock()
+            .unwrap()
+            .extend([slow.clone(), healthy.clone()]);
+        assert!(slow.dispatch_access_unit(0, access_unit(&[&[0]])).is_ok());
+        assert!(slow.dispatch_access_unit(0, access_unit(&[&[1]])).is_ok());
+
+        let current = access_unit(&[&[2]]);
+        let started = Instant::now();
+        let failed = super::super::dispatch_access_unit_to_sessions(
+            vec![slow.clone(), healthy.clone()],
+            current.clone(),
+            |session, access_unit| session.dispatch_access_unit(0, access_unit),
+        );
+        assert!(started.elapsed() < Duration::from_millis(50));
+        assert_eq!(failed.len(), 1);
+        assert!(Arc::ptr_eq(&failed[0].0, &slow));
+        let removed =
+            super::super::take_failed_session_instances(&state.sessions, &failed, |session| {
+                session.id.as_str()
+            });
+        for session in removed {
+            session.close();
+        }
+        assert!(Arc::ptr_eq(
+            &queued_access_unit(healthy_receiver.try_recv().unwrap()),
+            &current
+        ));
+
+        let next = access_unit(&[&[3]]);
+        let failed = super::super::dispatch_access_unit_to_sessions(
+            vec![healthy],
+            next.clone(),
+            |session, access_unit| session.dispatch_access_unit(0, access_unit),
+        );
+        assert!(failed.is_empty());
+        assert!(Arc::ptr_eq(
+            &queued_access_unit(healthy_receiver.try_recv().unwrap()),
+            &next
+        ));
+    }
+
+    #[test]
+    fn production_access_unit_path_continues_after_a_slow_tcp_session() {
+        let state = SharedState::new();
+        let (slow, _slow_peer, _slow_receiver, _slow_stream) = tcp_session("slow");
+        let (healthy, _healthy_peer, healthy_receiver, _healthy_stream) = tcp_session("healthy");
+        state
+            .sessions
+            .lock()
+            .unwrap()
+            .extend([slow.clone(), healthy]);
+        assert!(slow.dispatch_access_unit(0, access_unit(&[&[0]])).is_ok());
+        assert!(slow.dispatch_access_unit(0, access_unit(&[&[1]])).is_ok());
+        let mut payloader = super::super::rtp::H264Payloader::new();
+
+        super::super::handle_access_unit(
+            &state,
+            &mut payloader,
+            &[
+                0, 0, 0, 1, 0x67, 0x64, 0, 0x1f, 0, 0, 1, 0x68, 0xee, 0, 0, 1, 0x65, 0x88,
+            ],
+            0,
+            Duration::from_millis(1),
+            1200,
+        );
+        assert_eq!(state.sessions.lock().unwrap().len(), 1);
+        let first = queued_access_unit(healthy_receiver.try_recv().unwrap());
+        assert!(!first.packets.is_empty());
+
+        super::super::handle_access_unit(
+            &state,
+            &mut payloader,
+            &[0, 0, 1, 0x61, 0x20],
+            0,
+            Duration::from_millis(2),
+            1200,
+        );
+        let second = queued_access_unit(healthy_receiver.try_recv().unwrap());
+        assert!(!second.packets.is_empty());
+    }
+
+    #[test]
+    fn tcp_writer_preserves_packet_order_within_an_access_unit() {
+        let state = Arc::new(SharedState::new());
+        let (session, mut peer, receiver, stream) = tcp_session("ordered");
+        state.sessions.lock().unwrap().push(session.clone());
+        let writer = start_test_writer(&state, &session, receiver, stream);
+        peer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+
+        assert!(session
+            .dispatch_access_unit(0, access_unit(&[&[1, 2], &[3, 4, 5]]))
+            .is_ok());
+        let mut received = [0u8; 13];
+        peer.read_exact(&mut received).unwrap();
+        assert_eq!(received, [b'$', 0, 0, 2, 1, 2, b'$', 0, 0, 3, 3, 4, 5]);
+
+        session.close();
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn stale_epoch_is_not_written_and_invalidation_wakes_writer() {
+        let state = Arc::new(SharedState::new());
+        let (session, mut peer, receiver, stream) = tcp_session("stale");
+        state.sessions.lock().unwrap().push(session.clone());
+        assert!(session
+            .dispatch_access_unit(0, access_unit(&[&[1, 2, 3]]))
+            .is_ok());
+        assert_eq!(state.invalidate_stream(), 1);
+
+        let started = Instant::now();
+        let writer = start_test_writer(&state, &session, receiver, stream);
+        writer.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        peer.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let mut byte = [0u8; 1];
+        match peer.read(&mut byte) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::ConnectionReset
+                ) => {}
+            other => panic!("stale access unit reached the client: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalidation_during_access_unit_stops_remaining_packets() {
+        let state = Arc::new(SharedState::new());
+        let (session, _peer, receiver, _stream) = tcp_session("mid-epoch");
+        state.sessions.lock().unwrap().push(session.clone());
+        let (written_tx, written_rx) = mpsc::channel();
+        let (first_tx, first_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let writer = start_test_writer_with(
+            &state,
+            &session,
+            receiver,
+            Box::new(PausingPacketWriter {
+                written: written_tx,
+                first_written: first_tx,
+                resume: resume_rx,
+            }),
+        );
+
+        assert!(session
+            .dispatch_access_unit(0, access_unit(&[&[1], &[2], &[3]]))
+            .is_ok());
+        first_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("writer must process the first packet");
+        assert_eq!(state.invalidate_stream(), 1);
+        resume_tx.send(()).unwrap();
+        writer.join().unwrap();
+
+        let written = written_rx.try_iter().collect::<Vec<_>>();
+        assert_eq!(written, vec![vec![1]]);
+        assert!(state.sessions.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn disabled_cleanup_does_not_wait_for_a_writer_blocked_on_tcp_serialization() {
+        let state = Arc::new(SharedState::new());
+        let (session, _peer, receiver, stream) = tcp_session("blocked");
+        state.sessions.lock().unwrap().push(session.clone());
+        let stream_guard = stream.lock().unwrap();
+        let writer = start_test_writer(&state, &session, receiver, stream.clone());
+        assert!(session
+            .dispatch_access_unit(0, access_unit(&[&[1, 2, 3]]))
+            .is_ok());
+        thread::sleep(Duration::from_millis(10));
+
+        let started = Instant::now();
+        assert_eq!(
+            super::super::watchdog_disposition(super::super::CaptureExit::Disabled),
+            super::super::WatchdogDisposition::RemainDisabled
+        );
+        assert_eq!(state.invalidate_stream(), 1);
+        assert!(started.elapsed() < Duration::from_millis(50));
+        drop(stream_guard);
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn writer_timeout_cleanup_preserves_same_id_replacement_and_is_idempotent() {
+        let state = Arc::new(SharedState::new());
+        let (old, _old_peer, old_receiver, _old_stream) = tcp_session("same-id");
+        assert!(register_session_replacing_same_id(&state, old.clone()).is_empty());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let old_writer = start_test_writer_with(
+            &state,
+            &old,
+            old_receiver,
+            Box::new(GatedErrorWriter {
+                kind: io::ErrorKind::TimedOut,
+                started: started_tx,
+                release: release_rx,
+            }),
+        );
+        assert!(old.dispatch_access_unit(0, access_unit(&[&[1]])).is_ok());
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("old writer must enter the injected write");
+
+        let (replacement, _new_peer, replacement_receiver, _new_stream) = tcp_session("same-id");
+        let replaced = register_session_replacing_same_id(&state, replacement.clone());
+        assert_eq!(replaced.len(), 1);
+        assert!(Arc::ptr_eq(&replaced[0], &old));
+        for session in replaced {
+            session.close();
+        }
+        release_tx.send(()).unwrap();
+        old_writer.join().unwrap();
+
+        let remaining = state.sessions.lock().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert!(Arc::ptr_eq(&remaining[0], &replacement));
+        drop(remaining);
+        assert!(old.dispatch_access_unit(0, access_unit(&[&[1]])).is_err());
+        assert_eq!(
+            finish_connection(Ok::<_, ()>(()), &state, &[old.clone()]),
+            Ok(())
+        );
+        assert_eq!(finish_connection(Ok::<_, ()>(()), &state, &[old]), Ok(()));
+        let replacement_batch = access_unit(&[&[2]]);
+        assert!(replacement
+            .dispatch_access_unit(0, replacement_batch.clone())
+            .is_ok());
+        assert!(Arc::ptr_eq(
+            &queued_access_unit(replacement_receiver.try_recv().unwrap()),
+            &replacement_batch
+        ));
+        replacement.close();
+    }
+
+    #[test]
+    fn udp_would_block_and_errors_return_immediately() {
+        let batch = RtpAccessUnit::new(vec![vec![1], vec![2]]);
+        let started = Instant::now();
+        let would_block = send_udp_access_unit(&batch, |_| {
+            Err(io::Error::new(io::ErrorKind::WouldBlock, "busy"))
+        })
+        .unwrap_err();
+        assert_eq!(would_block.kind(), io::ErrorKind::WouldBlock);
+        assert!(started.elapsed() < Duration::from_millis(50));
+
+        let mut calls = 0;
+        let error = send_udp_access_unit(&batch, |_| {
+            calls += 1;
+            if calls == 2 {
+                Err(io::Error::new(io::ErrorKind::ConnectionRefused, "down"))
+            } else {
+                Ok(1)
+            }
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionRefused);
+        assert_eq!(calls, 2);
+    }
+
+    #[test]
+    fn udp_would_block_requires_three_consecutive_access_units() {
+        let (session, _peer, _receiver, _stream) = tcp_session("udp-pressure");
+        let batch = RtpAccessUnit::new(vec![vec![1]]);
+        let would_block = || Err(io::Error::new(io::ErrorKind::WouldBlock, "busy"));
+
+        assert!(session
+            .dispatch_udp_access_unit_with(&batch, |_| would_block())
+            .is_ok());
+        assert!(session
+            .dispatch_udp_access_unit_with(&batch, |_| would_block())
+            .is_ok());
+        let error = session
+            .dispatch_udp_access_unit_with(&batch, |_| would_block())
+            .expect_err("the third consecutive WouldBlock must retire the session");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn successful_udp_access_unit_resets_would_block_counter() {
+        let (session, _peer, _receiver, _stream) = tcp_session("udp-reset");
+        let batch = RtpAccessUnit::new(vec![vec![1]]);
+
+        for _ in 0..2 {
+            assert!(session
+                .dispatch_udp_access_unit_with(&batch, |_| {
+                    Err(io::Error::new(io::ErrorKind::WouldBlock, "busy"))
+                })
+                .is_ok());
+        }
+        assert!(session
+            .dispatch_udp_access_unit_with(&batch, |packet| Ok(packet.len()))
+            .is_ok());
+        for _ in 0..2 {
+            assert!(session
+                .dispatch_udp_access_unit_with(&batch, |_| {
+                    Err(io::Error::new(io::ErrorKind::WouldBlock, "busy"))
+                })
+                .is_ok());
+        }
+    }
+
+    #[test]
+    fn replacement_does_not_inherit_udp_would_block_counter() {
+        let state = SharedState::new();
+        let (old, _old_peer, _old_receiver, _old_stream) = tcp_session("same-id");
+        let batch = RtpAccessUnit::new(vec![vec![1]]);
+        for _ in 0..2 {
+            assert!(old
+                .dispatch_udp_access_unit_with(&batch, |_| {
+                    Err(io::Error::new(io::ErrorKind::WouldBlock, "busy"))
+                })
+                .is_ok());
+        }
+        assert!(register_session_replacing_same_id(&state, old.clone()).is_empty());
+        let (replacement, _new_peer, _new_receiver, _new_stream) = tcp_session("same-id");
+        let replaced = register_session_replacing_same_id(&state, replacement.clone());
+        for session in replaced {
+            session.close();
+        }
+
+        for _ in 0..2 {
+            assert!(replacement
+                .dispatch_udp_access_unit_with(&batch, |_| {
+                    Err(io::Error::new(io::ErrorKind::WouldBlock, "busy"))
+                })
+                .is_ok());
+        }
+        assert_eq!(state.sessions.lock().unwrap().len(), 1);
+        replacement.close();
+    }
+
+    #[test]
+    fn third_udp_would_block_removes_only_slow_session_and_healthy_continues() {
+        let state = SharedState::new();
+        let (slow, _slow_peer, _slow_receiver, _slow_stream) = tcp_session("slow-udp");
+        let (healthy, _healthy_peer, _healthy_receiver, _healthy_stream) =
+            tcp_session("healthy-udp");
+        state
+            .sessions
+            .lock()
+            .unwrap()
+            .extend([slow.clone(), healthy.clone()]);
+        let batch = access_unit(&[&[1], &[2]]);
+        let mut healthy_packets = 0usize;
+
+        for attempt in 1..=3 {
+            let failed = super::super::dispatch_access_unit_to_sessions(
+                vec![slow.clone(), healthy.clone()],
+                batch.clone(),
+                |session, access_unit| {
+                    if std::ptr::eq(session, slow.as_ref()) {
+                        session.dispatch_udp_access_unit_with(&access_unit, |_| {
+                            Err(io::Error::new(io::ErrorKind::WouldBlock, "busy"))
+                        })
+                    } else {
+                        session.dispatch_udp_access_unit_with(&access_unit, |packet| {
+                            healthy_packets += 1;
+                            Ok(packet.len())
+                        })
+                    }
+                },
+            );
+            if attempt < UDP_WOULD_BLOCK_LIMIT {
+                assert!(failed.is_empty());
+            } else {
+                assert_eq!(failed.len(), 1);
+                assert!(Arc::ptr_eq(&failed[0].0, &slow));
+                let removed = super::super::take_failed_session_instances(
+                    &state.sessions,
+                    &failed,
+                    |session| session.id.as_str(),
+                );
+                assert_eq!(removed.len(), 1);
+                assert!(Arc::ptr_eq(&removed[0], &slow));
+                for session in removed {
+                    session.close();
+                }
+            }
+        }
+
+        assert_eq!(healthy_packets, 6);
+        let remaining = state.sessions.lock().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert!(Arc::ptr_eq(&remaining[0], &healthy));
+        drop(remaining);
+        healthy.close();
+    }
 }

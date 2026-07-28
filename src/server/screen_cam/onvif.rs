@@ -8,8 +8,8 @@
 //   - GetProfiles, GetStreamUri (media_service)
 //
 // Explicitly NOT implemented yet (see docs/SCREENCAM_PLAN.md for what's
-// deferred and why): WS-Security/auth on these SOAP calls (matches RTSP
-// having no auth either), PTZ/Events/Imaging/Analytics services, WS-Discovery
+// deferred and why): WS-Security/auth on these SOAP calls (RTSP authentication
+// is handled separately), PTZ/Events/Imaging/Analytics services, WS-Discovery
 // "Hello" announcements on startup (only Probes are answered — sufficient
 // for any NVR that actively searches, which is the common case; a purely
 // passive listener wouldn't notice this device until it probes).
@@ -21,7 +21,6 @@
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 #[cfg(windows)]
@@ -381,9 +380,7 @@ fn handle_soap_connection(
         if body.contains("GetStreamUri") {
             ("200 OK", build_get_stream_uri(&local_ip, rtsp_port))
         } else if body.contains("GetProfiles") {
-            let width = state.width.load(Ordering::Relaxed);
-            let height = state.height.load(Ordering::Relaxed);
-            ("200 OK", build_get_profiles(width, height))
+            build_get_profiles_response(state)
         } else {
             (
                 "500 Internal Server Error",
@@ -401,6 +398,16 @@ fn handle_soap_connection(
     );
     write_half.write_all(http_response.as_bytes())?;
     Ok(())
+}
+
+fn build_get_profiles_response(state: &SharedState) -> (&'static str, String) {
+    match state.onvif_resolution() {
+        Some((width, height)) => ("200 OK", build_get_profiles(width, height)),
+        None => (
+            "503 Service Unavailable",
+            build_soap_fault("Video profile is not ready"),
+        ),
+    }
 }
 
 fn build_get_device_information(device_uuid: &str) -> String {
@@ -477,14 +484,9 @@ fn build_get_system_date_and_time() -> String {
 const PROFILE_TOKEN: &str = "profile_1";
 
 fn build_get_profiles(width: usize, height: usize) -> String {
-    // A monitor's real resolution isn't known until capture actually starts
-    // (see SharedState::width/height in mod.rs) — fall back to a placeholder
-    // so a client asking before then still gets a well-formed profile.
-    let (width, height) = if width == 0 || height == 0 {
-        (1920, 1080)
-    } else {
-        (width, height)
-    };
+    // Dimensions come either from the ready descriptor or from the last
+    // descriptor that reached SPS/PPS/IDR readiness. No invented resolution
+    // is advertised before the first stream has been confirmed.
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <SOAP-ENV:Envelope xmlns:SOAP-ENV="http://www.w3.org/2003/05/soap-envelope" xmlns:trt="http://www.onvif.org/ver10/media/wsdl" xmlns:tt="http://www.onvif.org/ver10/schema">
@@ -545,4 +547,57 @@ fn build_soap_fault(reason: &str) -> String {
 </SOAP-ENV:Envelope>"#,
         reason = reason,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_epoch_ready(state: &SharedState, width: usize, height: usize) {
+        let epoch = state.stream_epoch();
+        assert!(state.set_stream_dimensions(epoch, width, height));
+        assert!(
+            state.apply_stream_access_unit(epoch, &[&[0x67, 0x64], &[0x68, 0xee], &[0x65, 0x88]])
+        );
+    }
+
+    #[test]
+    fn startup_without_confirmed_resolution_returns_a_controlled_fault() {
+        let state = SharedState::new();
+
+        let (status, body) = build_get_profiles_response(&state);
+
+        assert_eq!(status, "503 Service Unavailable");
+        assert!(body.contains("Video profile is not ready"));
+        assert!(!body.contains("1920"));
+        assert!(!body.contains("1080"));
+    }
+
+    #[test]
+    fn reconstruction_uses_the_last_confirmed_resolution() {
+        let state = SharedState::new();
+        make_epoch_ready(&state, 1600, 900);
+        state.invalidate_stream();
+
+        let (status, body) = build_get_profiles_response(&state);
+
+        assert_eq!(status, "200 OK");
+        assert!(body.contains("<tt:Width>1600</tt:Width>"));
+        assert!(body.contains("<tt:Height>900</tt:Height>"));
+    }
+
+    #[test]
+    fn newly_confirmed_resolution_replaces_the_previous_one() {
+        let state = SharedState::new();
+        make_epoch_ready(&state, 1600, 900);
+        state.invalidate_stream();
+        make_epoch_ready(&state, 2560, 1440);
+
+        let (status, body) = build_get_profiles_response(&state);
+
+        assert_eq!(status, "200 OK");
+        assert!(body.contains("<tt:Width>2560</tt:Width>"));
+        assert!(body.contains("<tt:Height>1440</tt:Height>"));
+        assert!(!body.contains("<tt:Width>1600</tt:Width>"));
+    }
 }

@@ -25,6 +25,8 @@ pub(super) struct AvailableDisplay {
     pub index: usize,
     pub width: usize,
     pub height: usize,
+    /// Desktop coordinates used only to detect topology changes.
+    pub origin: (i32, i32),
     /// True only when Windows confirms `DISPLAY_DEVICE_PRIMARY_DEVICE`.
     ///
     /// False can also mean that GDI metadata was unavailable for this output.
@@ -49,6 +51,7 @@ struct DisplayCandidate<D> {
     display_id: String,
     width: usize,
     height: usize,
+    origin: (i32, i32),
     scrap_online: bool,
     display: D,
 }
@@ -63,6 +66,7 @@ impl DisplayInventory<Display> {
                     display_id: display.name(),
                     width: display.width(),
                     height: display.height(),
+                    origin: display.origin(),
                     scrap_online: display.is_online(),
                     display,
                 })
@@ -73,10 +77,6 @@ impl DisplayInventory<Display> {
 }
 
 impl<D> DisplayInventory<D> {
-    pub fn len(&self) -> usize {
-        self.displays.len()
-    }
-
     pub fn infos(&self) -> impl Iterator<Item = &AvailableDisplay> {
         self.displays.iter().map(|entry| &entry.info)
     }
@@ -90,6 +90,36 @@ impl<D> DisplayInventory<D> {
 
     pub fn into_display_at(self, index: usize) -> Option<CapturableDisplay<D>> {
         self.displays.into_iter().nth(index)
+    }
+
+    pub(super) fn resolve(
+        &self,
+        selected_display_id: Option<&str>,
+        fallback_to_primary: bool,
+    ) -> DisplayResolution {
+        resolve_display(self.infos(), selected_display_id, fallback_to_primary)
+    }
+
+    pub(super) fn topology_fingerprint(&self) -> TopologyFingerprint {
+        topology_fingerprint(self.infos())
+    }
+}
+
+#[cfg(test)]
+impl DisplayInventory<()> {
+    pub(super) fn from_test_infos(infos: Vec<AvailableDisplay>) -> Self {
+        let positions_by_id = infos
+            .iter()
+            .enumerate()
+            .map(|(position, info)| (canonical_display_id(&info.display_id), position))
+            .collect();
+        Self {
+            displays: infos
+                .into_iter()
+                .map(|info| CapturableDisplay { info, display: () })
+                .collect(),
+            positions_by_id,
+        }
     }
 }
 
@@ -126,6 +156,7 @@ fn build_inventory<D>(
                 index,
                 width: candidate.width,
                 height: candidate.height,
+                origin: candidate.origin,
                 scrap_online: candidate.scrap_online,
             },
             metadata,
@@ -152,6 +183,7 @@ struct DisplayFacts {
     index: usize,
     width: usize,
     height: usize,
+    origin: (i32, i32),
     scrap_online: bool,
 }
 
@@ -178,11 +210,237 @@ fn build_available_display(
         index: facts.index,
         width: facts.width,
         height: facts.height,
+        origin: facts.origin,
         primary: metadata.map(|metadata| metadata.primary).unwrap_or(false),
         connected: metadata
             .map(|metadata| metadata.attached_to_desktop && facts.scrap_online)
             .unwrap_or(facts.scrap_online),
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct DisplayResolution {
+    pub position: Option<usize>,
+    pub active_display_id: Option<String>,
+    pub fallback_active: bool,
+    pub warning: Option<String>,
+    pub(super) capture_fingerprint: Option<CaptureFingerprint>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct CaptureFingerprint {
+    display_id: String,
+    width: usize,
+    height: usize,
+    origin: (i32, i32),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DisplayFingerprint {
+    display_id: String,
+    index: usize,
+    width: usize,
+    height: usize,
+    primary: bool,
+    connected: bool,
+    origin: (i32, i32),
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(super) struct TopologyFingerprint(Vec<DisplayFingerprint>);
+
+pub(super) struct DisplaySelectionState {
+    runtime: DisplayRuntimeState,
+    fallback_to_primary: bool,
+    topology_fingerprint: Option<TopologyFingerprint>,
+    desired_capture: Option<CaptureFingerprint>,
+    active_capture: Option<CaptureFingerprint>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct DisplayRuntimeState {
+    pub available_displays: Vec<AvailableDisplay>,
+    pub selected_display_id: Option<String>,
+    pub active_display_id: Option<String>,
+    pub fallback_active: bool,
+    pub display_warning: Option<String>,
+}
+
+pub(super) struct DisplayStateUpdate {
+    pub resolution: DisplayResolution,
+    pub desired_changed: bool,
+    pub topology_changed: bool,
+    pub requires_reconfigure: bool,
+}
+
+impl DisplaySelectionState {
+    pub fn new(selected_display_id: Option<String>, fallback_to_primary: bool) -> Self {
+        Self {
+            runtime: DisplayRuntimeState {
+                available_displays: Vec::new(),
+                selected_display_id,
+                active_display_id: None,
+                fallback_active: false,
+                display_warning: None,
+            },
+            fallback_to_primary,
+            topology_fingerprint: None,
+            desired_capture: None,
+            active_capture: None,
+        }
+    }
+
+    pub fn apply<D>(&mut self, inventory: &DisplayInventory<D>) -> DisplayStateUpdate {
+        let resolution = inventory.resolve(
+            self.runtime.selected_display_id.as_deref(),
+            self.fallback_to_primary,
+        );
+        let topology_fingerprint = inventory.topology_fingerprint();
+        let topology_changed = self
+            .topology_fingerprint
+            .as_ref()
+            .map(|current| current != &topology_fingerprint)
+            .unwrap_or(true);
+        let desired_changed = self.desired_capture != resolution.capture_fingerprint;
+        let requires_reconfigure =
+            self.active_capture.is_some() && self.active_capture != resolution.capture_fingerprint;
+
+        self.runtime.available_displays = inventory.infos().cloned().collect();
+        if requires_reconfigure {
+            self.runtime.active_display_id = None;
+            self.runtime.fallback_active = false;
+            if resolution.warning.is_some() {
+                self.runtime.display_warning = resolution.warning.clone();
+            }
+        } else if self.active_capture.is_none() {
+            self.runtime.active_display_id = None;
+            self.runtime.fallback_active = false;
+            if resolution.capture_fingerprint.is_none() || resolution.warning.is_some() {
+                self.runtime.display_warning = resolution.warning.clone();
+            }
+        }
+        self.topology_fingerprint = Some(topology_fingerprint);
+        self.desired_capture = resolution.capture_fingerprint.clone();
+
+        DisplayStateUpdate {
+            resolution,
+            desired_changed,
+            topology_changed,
+            requires_reconfigure,
+        }
+    }
+
+    pub fn activate(&mut self, resolution: &DisplayResolution) {
+        self.runtime.active_display_id = resolution.active_display_id.clone();
+        self.runtime.fallback_active = resolution.fallback_active;
+        self.runtime.display_warning = resolution.warning.clone();
+        self.active_capture = resolution.capture_fingerprint.clone();
+    }
+
+    pub fn deactivate(&mut self) {
+        self.runtime.active_display_id = None;
+        self.runtime.fallback_active = false;
+        self.active_capture = None;
+    }
+
+    #[cfg(test)]
+    pub fn snapshot(&self) -> DisplayRuntimeState {
+        self.runtime.clone()
+    }
+}
+
+fn resolve_display<'a>(
+    displays: impl IntoIterator<Item = &'a AvailableDisplay>,
+    selected_display_id: Option<&str>,
+    fallback_to_primary: bool,
+) -> DisplayResolution {
+    let displays = displays.into_iter().collect::<Vec<_>>();
+    let selected = selected_display_id.and_then(|display_id| {
+        displays.iter().copied().find(|display| {
+            display.connected && display.display_id.eq_ignore_ascii_case(display_id)
+        })
+    });
+    let primary = displays
+        .iter()
+        .copied()
+        .find(|display| display.connected && display.primary);
+
+    let (active, fallback_active, warning) = match selected_display_id {
+        Some(_) => match selected {
+            Some(display) => (Some(display), false, None),
+            None if fallback_to_primary => match primary {
+                Some(display) => (
+                    Some(display),
+                    true,
+                    Some(
+                        "selected display is unavailable; temporarily using the primary display"
+                            .to_owned(),
+                    ),
+                ),
+                None => (
+                    None,
+                    false,
+                    Some(
+                        "selected display is unavailable and no primary display is available"
+                            .to_owned(),
+                    ),
+                ),
+            },
+            None => (
+                None,
+                false,
+                Some("selected display is unavailable; waiting for it to return".to_owned()),
+            ),
+        },
+        None => match primary {
+            Some(display) => (Some(display), false, None),
+            None => (
+                None,
+                false,
+                Some("no primary Windows display is available".to_owned()),
+            ),
+        },
+    };
+
+    DisplayResolution {
+        position: active.map(|display| display.index),
+        active_display_id: active.map(|display| display.display_id.clone()),
+        fallback_active,
+        warning,
+        capture_fingerprint: active.map(capture_fingerprint),
+    }
+}
+
+fn capture_fingerprint(display: &AvailableDisplay) -> CaptureFingerprint {
+    CaptureFingerprint {
+        display_id: canonical_display_id(&display.display_id),
+        width: display.width,
+        height: display.height,
+        origin: display.origin,
+    }
+}
+
+fn topology_fingerprint<'a>(
+    displays: impl IntoIterator<Item = &'a AvailableDisplay>,
+) -> TopologyFingerprint {
+    let mut entries = displays
+        .into_iter()
+        .map(|display| DisplayFingerprint {
+            display_id: canonical_display_id(&display.display_id),
+            index: display.index,
+            width: display.width,
+            height: display.height,
+            primary: display.primary,
+            connected: display.connected,
+            origin: display.origin,
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        left.display_id
+            .cmp(&right.display_id)
+            .then_with(|| left.index.cmp(&right.index))
+    });
+    TopologyFingerprint(entries)
 }
 
 fn validate_display_id(display_id: &str) -> io::Result<()> {
@@ -369,6 +627,7 @@ mod tests {
             display_id: display_id.to_owned(),
             width,
             height,
+            origin: (0, 0),
             scrap_online: online,
             display: FakeDisplay { token },
         }
@@ -398,6 +657,18 @@ mod tests {
             validate_display_id(display_id).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    fn assert_consistent_runtime(runtime: &DisplayRuntimeState) {
+        if runtime.fallback_active {
+            assert!(runtime.active_display_id.is_some());
+        }
+        if let Some(active_display_id) = runtime.active_display_id.as_deref() {
+            assert!(runtime
+                .available_displays
+                .iter()
+                .any(|display| display.display_id.eq_ignore_ascii_case(active_display_id)));
+        }
     }
 
     #[test]
@@ -593,6 +864,490 @@ mod tests {
         assert_eq!(selected.info.index, 1);
         assert_eq!(selected.info.display_id, r"\\.\DISPLAY1");
         assert_eq!(selected.display, FakeDisplay { token: 10 });
+    }
+
+    #[test]
+    fn resolves_an_existing_selection() {
+        let inventory = inventory(
+            vec![
+                candidate(r"\\.\DISPLAY1", 1, 1920, 1080, true),
+                candidate(r"\\.\DISPLAY2", 2, 1280, 720, true),
+            ],
+            &[
+                (r"\\.\DISPLAY1", metadata("Primary", true, true)),
+                (r"\\.\DISPLAY2", metadata("Selected", false, true)),
+            ],
+        )
+        .unwrap();
+
+        let resolution = inventory.resolve(Some(r"\\.\DISPLAY2"), true);
+
+        assert_eq!(resolution.position, Some(1));
+        assert_eq!(
+            resolution.active_display_id.as_deref(),
+            Some(r"\\.\DISPLAY2")
+        );
+        assert!(!resolution.fallback_active);
+        assert_eq!(resolution.warning, None);
+    }
+
+    #[test]
+    fn selection_is_case_insensitive_and_reports_the_enumerated_id() {
+        let inventory = inventory(
+            vec![candidate(r"\\.\Display7", 7, 1920, 1080, true)],
+            &[(r"\\.\DISPLAY7", metadata("Selected", false, true))],
+        )
+        .unwrap();
+
+        let resolution = inventory.resolve(Some(r"\\.\dIsPlAy7"), false);
+
+        assert_eq!(
+            resolution.active_display_id.as_deref(),
+            Some(r"\\.\Display7")
+        );
+    }
+
+    #[test]
+    fn no_selection_uses_the_windows_primary() {
+        let inventory = inventory(
+            vec![
+                candidate(r"\\.\DISPLAY1", 1, 1920, 1080, true),
+                candidate(r"\\.\DISPLAY2", 2, 1920, 1080, true),
+            ],
+            &[
+                (r"\\.\DISPLAY1", metadata("Secondary", false, true)),
+                (r"\\.\DISPLAY2", metadata("Primary", true, true)),
+            ],
+        )
+        .unwrap();
+
+        let resolution = inventory.resolve(None, true);
+
+        assert_eq!(
+            resolution.active_display_id.as_deref(),
+            Some(r"\\.\DISPLAY2")
+        );
+        assert!(!resolution.fallback_active);
+    }
+
+    #[test]
+    fn primary_selection_does_not_assume_index_zero() {
+        let inventory = inventory(
+            vec![
+                candidate(r"\\.\DISPLAY8", 8, 1920, 1080, true),
+                candidate(r"\\.\DISPLAY3", 3, 2560, 1440, true),
+            ],
+            &[
+                (r"\\.\DISPLAY8", metadata("Secondary", false, true)),
+                (r"\\.\DISPLAY3", metadata("Primary", true, true)),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(inventory.resolve(None, true).position, Some(1));
+    }
+
+    #[test]
+    fn missing_selection_falls_back_to_primary_when_enabled() {
+        let inventory = inventory(
+            vec![candidate(r"\\.\DISPLAY4", 4, 1920, 1080, true)],
+            &[(r"\\.\DISPLAY4", metadata("Primary", true, true))],
+        )
+        .unwrap();
+
+        let mut state = DisplaySelectionState::new(Some(r"\\.\DISPLAY9".to_owned()), true);
+        let resolution = state.apply(&inventory).resolution;
+
+        assert_eq!(
+            resolution.active_display_id.as_deref(),
+            Some(r"\\.\DISPLAY4")
+        );
+        assert!(resolution.fallback_active);
+        assert!(resolution
+            .warning
+            .as_deref()
+            .unwrap()
+            .contains("temporarily"));
+        let pending = state.snapshot();
+        assert_eq!(
+            pending.selected_display_id.as_deref(),
+            Some(r"\\.\DISPLAY9")
+        );
+        assert_eq!(pending.active_display_id, None);
+        assert!(!pending.fallback_active);
+        assert_eq!(pending.display_warning, resolution.warning);
+        assert_eq!(pending.available_displays.len(), 1);
+        assert_consistent_runtime(&pending);
+
+        state.activate(&resolution);
+        let active = state.snapshot();
+        assert_eq!(active.active_display_id.as_deref(), Some(r"\\.\DISPLAY4"));
+        assert!(active.fallback_active);
+        assert_eq!(active.display_warning, resolution.warning);
+        assert_consistent_runtime(&active);
+    }
+
+    #[test]
+    fn missing_selection_waits_when_fallback_is_disabled() {
+        let inventory = inventory(
+            vec![candidate(r"\\.\DISPLAY4", 4, 1920, 1080, true)],
+            &[(r"\\.\DISPLAY4", metadata("Primary", true, true))],
+        )
+        .unwrap();
+
+        let mut state = DisplaySelectionState::new(Some(r"\\.\DISPLAY9".to_owned()), false);
+        let resolution = state.apply(&inventory).resolution;
+
+        assert_eq!(resolution.position, None);
+        assert_eq!(resolution.active_display_id, None);
+        assert!(!resolution.fallback_active);
+        assert!(resolution.warning.as_deref().unwrap().contains("waiting"));
+        let runtime = state.snapshot();
+        assert_eq!(runtime.active_display_id, None);
+        assert!(!runtime.fallback_active);
+        assert_consistent_runtime(&runtime);
+    }
+
+    #[test]
+    fn missing_selection_without_fallback_activates_when_it_returns() {
+        let missing = inventory(
+            vec![candidate(r"\\.\DISPLAY1", 1, 1920, 1080, true)],
+            &[(r"\\.\DISPLAY1", metadata("Primary", true, true))],
+        )
+        .unwrap();
+        let restored = inventory(
+            vec![
+                candidate(r"\\.\DISPLAY1", 1, 1920, 1080, true),
+                candidate(r"\\.\DISPLAY9", 9, 2560, 1440, true),
+            ],
+            &[
+                (r"\\.\DISPLAY1", metadata("Primary", true, true)),
+                (r"\\.\DISPLAY9", metadata("Selected", false, true)),
+            ],
+        )
+        .unwrap();
+        let mut state = DisplaySelectionState::new(Some(r"\\.\DISPLAY9".to_owned()), false);
+
+        let missing = state.apply(&missing);
+        assert_eq!(missing.resolution.position, None);
+        let waiting = state.snapshot();
+        assert_eq!(waiting.active_display_id, None);
+        assert!(waiting.display_warning.is_some());
+        assert_consistent_runtime(&waiting);
+
+        let restored = state.apply(&restored);
+        let pending = state.snapshot();
+        assert_eq!(pending.active_display_id, None);
+        assert!(!pending.fallback_active);
+        assert!(pending.display_warning.is_some());
+        assert_consistent_runtime(&pending);
+
+        state.activate(&restored.resolution);
+        let active = state.snapshot();
+        assert_eq!(active.active_display_id.as_deref(), Some(r"\\.\DISPLAY9"));
+        assert!(!active.fallback_active);
+        assert_eq!(active.display_warning, None);
+        assert_consistent_runtime(&active);
+    }
+
+    #[test]
+    fn selected_display_is_resolved_again_when_it_returns() {
+        let fallback_inventory = inventory(
+            vec![candidate(r"\\.\DISPLAY1", 1, 1920, 1080, true)],
+            &[(r"\\.\DISPLAY1", metadata("Primary", true, true))],
+        )
+        .unwrap();
+        let restored_inventory = inventory(
+            vec![
+                candidate(r"\\.\DISPLAY1", 1, 1920, 1080, true),
+                candidate(r"\\.\DISPLAY5", 5, 2560, 1440, true),
+            ],
+            &[
+                (r"\\.\DISPLAY1", metadata("Primary", true, true)),
+                (r"\\.\DISPLAY5", metadata("Selected", false, true)),
+            ],
+        )
+        .unwrap();
+
+        let mut state = DisplaySelectionState::new(Some(r"\\.\DISPLAY5".to_owned()), true);
+        let fallback = state.apply(&fallback_inventory);
+        assert!(fallback.resolution.fallback_active);
+        state.activate(&fallback.resolution);
+        assert_eq!(
+            state.snapshot().active_display_id.as_deref(),
+            Some(r"\\.\DISPLAY1")
+        );
+
+        let restored = state.apply(&restored_inventory);
+        assert!(restored.requires_reconfigure);
+        let rebuilding = state.snapshot();
+        assert_eq!(rebuilding.active_display_id, None);
+        assert!(!rebuilding.fallback_active);
+        assert!(rebuilding.display_warning.is_some());
+        assert_consistent_runtime(&rebuilding);
+        assert_eq!(
+            restored.resolution.active_display_id.as_deref(),
+            Some(r"\\.\DISPLAY5")
+        );
+        assert!(!restored.resolution.fallback_active);
+        assert_eq!(restored.resolution.warning, None);
+
+        state.activate(&restored.resolution);
+        let active = state.snapshot();
+        assert_eq!(active.active_display_id.as_deref(), Some(r"\\.\DISPLAY5"));
+        assert!(!active.fallback_active);
+        assert_eq!(active.display_warning, None);
+        assert_consistent_runtime(&active);
+    }
+
+    #[test]
+    fn selection_by_id_survives_an_index_change() {
+        let before = inventory(
+            vec![candidate(r"\\.\DISPLAY5", 5, 1920, 1080, true)],
+            &[(r"\\.\DISPLAY5", metadata("Selected", false, true))],
+        )
+        .unwrap();
+        let after = inventory(
+            vec![
+                candidate(r"\\.\DISPLAY1", 1, 1280, 720, true),
+                candidate(r"\\.\DISPLAY5", 5, 1920, 1080, true),
+            ],
+            &[
+                (r"\\.\DISPLAY1", metadata("Other", true, true)),
+                (r"\\.\DISPLAY5", metadata("Selected", false, true)),
+            ],
+        )
+        .unwrap();
+
+        let mut state = DisplaySelectionState::new(Some(r"\\.\DISPLAY5".to_owned()), false);
+        let before = state.apply(&before);
+        state.activate(&before.resolution);
+        let after = state.apply(&after);
+
+        assert_eq!(before.resolution.position, Some(0));
+        assert_eq!(after.resolution.position, Some(1));
+        assert_eq!(
+            before.resolution.active_display_id,
+            after.resolution.active_display_id
+        );
+        assert_eq!(
+            before.resolution.capture_fingerprint,
+            after.resolution.capture_fingerprint
+        );
+        assert!(!after.requires_reconfigure);
+        assert_eq!(
+            state.snapshot().active_display_id.as_deref(),
+            Some(r"\\.\DISPLAY5")
+        );
+    }
+
+    #[test]
+    fn active_resolution_change_changes_the_capture_fingerprint() {
+        let before = inventory(
+            vec![candidate(r"\\.\DISPLAY2", 2, 1920, 1080, true)],
+            &[(r"\\.\DISPLAY2", metadata("Selected", false, true))],
+        )
+        .unwrap();
+        let after = inventory(
+            vec![candidate(r"\\.\DISPLAY2", 2, 2560, 1440, true)],
+            &[(r"\\.\DISPLAY2", metadata("Selected", false, true))],
+        )
+        .unwrap();
+
+        let mut state = DisplaySelectionState::new(Some(r"\\.\DISPLAY2".to_owned()), false);
+        let before = state.apply(&before);
+        state.activate(&before.resolution);
+        let after = state.apply(&after);
+
+        assert_ne!(
+            before.resolution.capture_fingerprint,
+            after.resolution.capture_fingerprint
+        );
+        assert!(after.requires_reconfigure);
+    }
+
+    #[test]
+    fn irrelevant_change_on_another_display_keeps_the_capture_fingerprint() {
+        let before = inventory(
+            vec![
+                candidate(r"\\.\DISPLAY1", 1, 1920, 1080, true),
+                candidate(r"\\.\DISPLAY2", 2, 1280, 720, true),
+            ],
+            &[
+                (r"\\.\DISPLAY1", metadata("Selected", true, true)),
+                (r"\\.\DISPLAY2", metadata("Other", false, true)),
+            ],
+        )
+        .unwrap();
+        let after = inventory(
+            vec![
+                candidate(r"\\.\DISPLAY1", 1, 1920, 1080, true),
+                candidate(r"\\.\DISPLAY2", 2, 2560, 1440, true),
+            ],
+            &[
+                (r"\\.\DISPLAY1", metadata("Selected", true, true)),
+                (r"\\.\DISPLAY2", metadata("Other", false, true)),
+            ],
+        )
+        .unwrap();
+
+        let mut state = DisplaySelectionState::new(Some(r"\\.\DISPLAY1".to_owned()), false);
+        let before = state.apply(&before);
+        state.activate(&before.resolution);
+        let after = state.apply(&after);
+
+        assert!(after.topology_changed);
+        assert_eq!(
+            before.resolution.capture_fingerprint,
+            after.resolution.capture_fingerprint
+        );
+        assert!(!after.requires_reconfigure);
+    }
+
+    #[test]
+    fn disconnected_active_display_is_unavailable() {
+        let connected = inventory(
+            vec![candidate(r"\\.\DISPLAY2", 2, 1920, 1080, true)],
+            &[(r"\\.\DISPLAY2", metadata("Selected", true, true))],
+        )
+        .unwrap();
+        let disconnected = inventory(
+            vec![candidate(r"\\.\DISPLAY2", 2, 1920, 1080, false)],
+            &[(r"\\.\DISPLAY2", metadata("Selected", true, true))],
+        )
+        .unwrap();
+        let mut state = DisplaySelectionState::new(Some(r"\\.\DISPLAY2".to_owned()), false);
+        let connected = state.apply(&connected);
+        state.activate(&connected.resolution);
+
+        let disconnected = state.apply(&disconnected);
+
+        assert_eq!(disconnected.resolution.active_display_id, None);
+        assert!(disconnected.resolution.capture_fingerprint.is_none());
+        assert!(disconnected.requires_reconfigure);
+        state.deactivate();
+        assert_eq!(state.snapshot().active_display_id, None);
+    }
+
+    #[test]
+    fn topology_without_a_primary_waits_when_there_is_no_selection() {
+        let inventory = inventory(
+            vec![candidate(r"\\.\DISPLAY2", 2, 1920, 1080, true)],
+            &[(r"\\.\DISPLAY2", metadata("Secondary", false, true))],
+        )
+        .unwrap();
+
+        let resolution = inventory.resolve(None, true);
+
+        assert_eq!(resolution.active_display_id, None);
+        assert!(resolution
+            .warning
+            .as_deref()
+            .unwrap()
+            .contains("no primary"));
+    }
+
+    #[test]
+    fn relevant_primary_change_reconfigures_default_selection() {
+        let before = inventory(
+            vec![
+                candidate(r"\\.\DISPLAY1", 1, 1920, 1080, true),
+                candidate(r"\\.\DISPLAY2", 2, 1920, 1080, true),
+            ],
+            &[
+                (r"\\.\DISPLAY1", metadata("Old primary", true, true)),
+                (r"\\.\DISPLAY2", metadata("New primary", false, true)),
+            ],
+        )
+        .unwrap();
+        let after = inventory(
+            vec![
+                candidate(r"\\.\DISPLAY1", 1, 1920, 1080, true),
+                candidate(r"\\.\DISPLAY2", 2, 1920, 1080, true),
+            ],
+            &[
+                (r"\\.\DISPLAY1", metadata("Old primary", false, true)),
+                (r"\\.\DISPLAY2", metadata("New primary", true, true)),
+            ],
+        )
+        .unwrap();
+        let mut state = DisplaySelectionState::new(None, true);
+        let before = state.apply(&before);
+        state.activate(&before.resolution);
+
+        let after = state.apply(&after);
+
+        assert!(after.requires_reconfigure);
+        assert_eq!(
+            after.resolution.active_display_id.as_deref(),
+            Some(r"\\.\DISPLAY2")
+        );
+    }
+
+    #[test]
+    fn empty_topology_has_no_active_display() {
+        let inventory = inventory(Vec::new(), &[]).unwrap();
+
+        let resolution = inventory.resolve(None, true);
+
+        assert_eq!(resolution.position, None);
+        assert_eq!(resolution.active_display_id, None);
+        assert!(!resolution.fallback_active);
+    }
+
+    #[test]
+    fn topology_fingerprint_covers_every_required_field() {
+        let base = AvailableDisplay {
+            display_id: r"\\.\DISPLAY1".to_owned(),
+            name: "Monitor".to_owned(),
+            index: 0,
+            width: 1920,
+            height: 1080,
+            origin: (0, 0),
+            primary: true,
+            connected: true,
+        };
+        let fingerprint = topology_fingerprint([&base]);
+        let mut variants = Vec::new();
+        let mut changed = base.clone();
+        changed.display_id = r"\\.\DISPLAY2".to_owned();
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.index = 1;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.width = 1280;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.height = 720;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.primary = false;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.connected = false;
+        variants.push(changed);
+        let mut changed = base.clone();
+        changed.origin = (100, 50);
+        variants.push(changed);
+
+        for changed in variants {
+            assert_ne!(fingerprint, topology_fingerprint([&changed]));
+        }
+    }
+
+    #[test]
+    fn fallback_state_and_warning_are_cleared_for_an_available_selection() {
+        let inventory = inventory(
+            vec![candidate(r"\\.\DISPLAY6", 6, 1920, 1080, true)],
+            &[(r"\\.\DISPLAY6", metadata("Selected", true, true))],
+        )
+        .unwrap();
+
+        let resolution = inventory.resolve(Some(r"\\.\DISPLAY6"), true);
+
+        assert!(!resolution.fallback_active);
+        assert_eq!(resolution.warning, None);
     }
 
     #[test]
