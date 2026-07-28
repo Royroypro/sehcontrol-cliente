@@ -1200,6 +1200,24 @@ pub fn main_http_request(url: String, method: String, body: Option<String>, head
 }
 
 pub fn main_get_local_option(key: String) -> SyncReturn<String> {
+    // ScreenCam runs inside the --server process, which can use a different
+    // Windows profile (LocalService). Read its screencam-* values through
+    // the authenticated main IPC instead of this Flutter process's profile.
+    if key.starts_with("screencam-") {
+        match crate::ipc::get_config(&key) {
+            Ok(Some(value)) => return SyncReturn(value),
+            Ok(None) => {
+                log::warn!("[screencam] daemon returned no value for {}", key);
+            }
+            Err(err) => {
+                log::warn!(
+                    "[screencam] failed to read {} from daemon via IPC: {}",
+                    key,
+                    err
+                );
+            }
+        }
+    }
     SyncReturn(get_local_option(key))
 }
 
@@ -1243,7 +1261,29 @@ pub fn main_set_env(key: String, value: Option<String>) -> SyncReturn<()> {
 pub fn main_set_local_option(key: String, value: String) {
     let is_texture_render_key = key.eq(config::keys::OPTION_TEXTURE_RENDER);
     let is_d3d_render_key = key.eq(config::keys::OPTION_ALLOW_D3D_RENDER);
-    set_local_option(key, value.clone());
+
+    // These policy values must be written by the --server process so that
+    // ScreenCam reads them from the same LocalConfig/profile it owns.
+    let is_screen_cam_policy = matches!(
+        key.as_str(),
+        "screencam-licensed"
+            | "screencam-desired-state"
+            | "screencam-mode"
+            | "screencam-rtsp-user"
+            | "screencam-rtsp-pass"
+    );
+
+    if is_screen_cam_policy {
+        if let Err(err) = crate::ipc::set_config(&key, value.clone()) {
+            log::error!(
+                "[screencam] failed to write {} to daemon via IPC: {}",
+                key,
+                err
+            );
+        }
+    } else {
+        set_local_option(key, value.clone());
+    }
     let is_render_target =
         |session: &crate::flutter::FlutterSession| session.is_default() || session.is_view_camera();
     if is_texture_render_key {
@@ -3050,8 +3090,7 @@ pub fn main_set_common(_key: String, _value: String) {
 
 pub fn session_set_common(session_id: SessionID, key: String, value: String) {
     if let Some(s) = sessions::get_session_by_session_id(&session_id) {
-        if key == "continue-insecure-connection"
-        {
+        if key == "continue-insecure-connection" {
             s.continue_insecure_connection(value == "Y");
             return;
         }

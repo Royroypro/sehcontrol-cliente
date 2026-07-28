@@ -81,6 +81,75 @@ impl InfoUploaded {
     }
 }
 
+/// Mirrors `UserModel._readScreenCamStatus` in `flutter/lib/models/user_model.dart`
+/// exactly (same keys, same "omit empty" rules, same `actual_state` collapsed
+/// to `running`/`stopped` for the server's documented contract — see
+/// docs/SCREENCAM_PLAN.md section 12, point 2) — but for Windows/desktop,
+/// which the Dart version never reaches: `UserModel._startHeartbeat` early-
+/// returns unless `isAndroid`, since Android needs a Dart-driven heartbeat as
+/// a fallback for when its background service isn't reliably alive, while
+/// desktop's `--server` process (where this function also runs) already has
+/// this native heartbeat loop. Without this, screen_cam status silently
+/// never reached the panel for any Windows client (found 27/07, alongside
+/// the LocalConfig cross-process staleness bug — see screen_cam/mod.rs).
+///
+/// Reads `LocalConfig::get_option` directly, not `get_option_from_file`:
+/// this runs in the exact same `--server` process as `screen_cam::mod.rs`
+/// (both started from `start_server`'s `is_server` branch in src/server.rs),
+/// so there's no cross-process staleness to work around here — the cached
+/// copy is already correct.
+#[cfg(all(windows, feature = "screencam"))]
+fn screen_cam_status() -> Option<Value> {
+    let raw_state = LocalConfig::get_option("screencam-actual-state");
+    if raw_state.is_empty() {
+        return None;
+    }
+    let actual_state = if raw_state == "running" { "running" } else { "stopped" };
+    let mut v = serde_json::Map::new();
+    v.insert("actual_state".to_owned(), json!(actual_state));
+    let encoder = LocalConfig::get_option("screencam-encoder");
+    if !encoder.is_empty() {
+        v.insert("encoder".to_owned(), json!(encoder));
+    }
+    let last_error = LocalConfig::get_option("screencam-last-error");
+    v.insert(
+        "last_error".to_owned(),
+        if last_error.is_empty() { Value::Null } else { json!(last_error) },
+    );
+    if let Ok(rtsp_clients) = LocalConfig::get_option("screencam-rtsp-clients").parse::<i64>() {
+        v.insert("rtsp_clients".to_owned(), json!(rtsp_clients));
+    }
+    let local_ip = LocalConfig::get_option("screencam-local-ip");
+    if !local_ip.is_empty() {
+        v.insert("local_ip".to_owned(), json!(local_ip));
+    }
+    if let Ok(rtsp_port) = LocalConfig::get_option("screencam-rtsp-port").parse::<i64>() {
+        v.insert("rtsp_port".to_owned(), json!(rtsp_port));
+    }
+    // Lets the panel confirm the credentials it issued actually reached this
+    // device, without ever echoing them back: a device reporting
+    // `auth_enabled: false` while the panel thinks it sent a user is a
+    // misconfiguration the admin needs to see. Only the username is reported,
+    // never the password.
+    //
+    // Unlike every key above, this one is written by the *UI* process (Dart's
+    // `_persistScreenCamPolicy`), not by screen_cam in this process — so the
+    // cached `get_option` would never observe a credential rotation and the
+    // panel would be told "no auth" forever. Same cross-process staleness the
+    // module doc above describes, hence the from-file read here.
+    let rtsp_user = LocalConfig::get_option_from_file("screencam-rtsp-user");
+    v.insert("auth_enabled".to_owned(), json!(!rtsp_user.is_empty()));
+    if !rtsp_user.is_empty() {
+        v.insert("rtsp_user".to_owned(), json!(rtsp_user));
+    }
+    Some(Value::Object(v))
+}
+
+#[cfg(not(all(windows, feature = "screencam")))]
+fn screen_cam_status() -> Option<Value> {
+    None
+}
+
 #[cfg(not(any(target_os = "ios")))]
 #[tokio::main(flavor = "current_thread")]
 async fn start_hbbs_sync_async() {
@@ -241,6 +310,9 @@ async fn start_hbbs_sync_async() {
                 }
                 let modified_at = LocalConfig::get_option("strategy_timestamp").parse::<i64>().unwrap_or(0);
                 v["modified_at"] = json!(modified_at);
+                if let Some(screen_cam) = screen_cam_status() {
+                    v["screen_cam"] = screen_cam;
+                }
                 if let Ok(s) = crate::post_request(url.clone(), v.to_string(), "").await {
                     if let Ok(mut rsp) = serde_json::from_str::<HashMap::<&str, Value>>(&s) {
                         if rsp.remove("sysinfo").is_some() {

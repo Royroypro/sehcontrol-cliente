@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:get/get.dart';
 import 'package:url_launcher/url_launcher.dart';
 
 import '../../common.dart';
@@ -14,8 +15,6 @@ class SupportSidebarBlock extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    const whatsapp = '51948793154'; // sin +
-
     return Padding(
       padding: const EdgeInsets.fromLTRB(10, 8, 10, 12),
       child: Column(
@@ -28,13 +27,22 @@ class SupportSidebarBlock extends StatelessWidget {
                   .labelMedium
                   ?.copyWith(fontWeight: FontWeight.w600)),
           const SizedBox(height: 8),
-          _MiniLink(
-            icon: Icons.chat,
-            iconColor: const Color(0xFF25D366),
-            title: 'WhatsApp',
-            subtitle: '+$whatsapp',
-            onTap: () => _open('https://wa.me/$whatsapp'),
-          ),
+          // Server-configured (UserModel.whatsappNumber, from
+          // /api/client-policy's `whatsapp_number`) so the admin can change
+          // the support number without a client release. Hidden entirely
+          // rather than falling back to a hardcoded number when it isn't
+          // configured — a wrong/stale number is worse than no button.
+          Obx(() {
+            final whatsapp = gFFI.userModel.whatsappNumber.value;
+            if (whatsapp.isEmpty) return const SizedBox.shrink();
+            return _MiniLink(
+              icon: Icons.chat,
+              iconColor: const Color(0xFF25D366),
+              title: 'WhatsApp',
+              subtitle: '+$whatsapp',
+              onTap: () => _open('https://wa.me/$whatsapp'),
+            );
+          }),
           const SizedBox(height: 6),
           _MiniLink(
             icon: Icons.public,

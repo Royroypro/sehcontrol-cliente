@@ -3925,21 +3925,92 @@ Widget buildPresetPasswordWarningMobile() {
 
 /// Non-blocking warning banner shown when the membership panel reports the
 /// current plan expiring soon. Cosmetic only — see
-/// [showMembershipBlockedDialog] for the actual blocking case.
-Widget buildMembershipBanner() {
+/// [showMembershipBlockedDialog] for the actual blocking case (a full-screen
+/// overlay already dominates the UI once truly blocked, so this banner only
+/// covers the "still working, but about to expire" window).
+///
+/// Includes a one-tap "Contactar por WhatsApp" button using the
+/// server-configured `UserModel.whatsappNumber` (`/api/client-policy`'s
+/// `whatsapp_number`) — same number as the "Soporte" sidebar link
+/// (support_sidebar.dart), deliberately server-driven so support staff can
+/// change it without a client release. Hidden when not configured, same
+/// "don't show a wrong number" reasoning as the sidebar link.
+Widget buildMembershipBanner(BuildContext context) {
   return Obx(() {
     final daysLeft = gFFI.userModel.membershipDaysLeft.value;
     final blocked = gFFI.userModel.membershipBlocked.value;
     if (blocked || daysLeft == null || daysLeft > 7) {
-      return SizedBox.shrink();
+      return const SizedBox.shrink();
     }
     final message = gFFI.userModel.membershipMessage.value;
+    final text =
+        message.isNotEmpty ? message : translate('membership_expiring_tip');
+    final whatsapp = gFFI.userModel.whatsappNumber.value;
+    final whatsappDigits = whatsapp.replaceAll(RegExp(r'[^0-9]'), '');
+    final whatsappPhone =
+        whatsappDigits.length == 9 ? '51$whatsappDigits' : whatsappDigits;
+    final planName = gFFI.userModel.membershipPlanName.value;
+    final renewalMessage = planName.isNotEmpty
+        ? 'Hola, deseo renovar mi licencia de SEHCONTROL. Mi plan actual es $planName.'
+        : 'Hola, deseo renovar mi licencia de SEHCONTROL.';
+
+    // Same box shape/size as the neighboring "Secure Connection"/"Install"
+    // cards (width 240, padding 16, surfaceContainerHighest bg, radius 13)
+    // so the three sit consistently in the header row; only the accent
+    // color changes to signal urgency.
     return Container(
-      color: Colors.orange,
-      child: Text(
-        message.isNotEmpty ? message : translate('membership_expiring_tip'),
-        style: TextStyle(color: Colors.white),
-      ).paddingAll(8),
+      width: 240,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(13),
+        border: Border.all(color: Colors.orange, width: 1.2),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.warning_amber_rounded,
+                  color: Colors.orange, size: 18),
+              const SizedBox(width: 6),
+              Text(translate('Warning'),
+                  style: const TextStyle(fontWeight: FontWeight.w600)),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Text(
+            text,
+            style: Theme.of(context).textTheme.bodySmall,
+          ),
+          if (whatsappPhone.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton.icon(
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: const Color(0xFF25D366),
+                  foregroundColor: Colors.white,
+                  padding: const EdgeInsets.symmetric(vertical: 10),
+                  minimumSize: Size.zero,
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+                icon: const Icon(Icons.chat, size: 16),
+                label: Text(translate('Contact via WhatsApp'),
+                    style: const TextStyle(fontSize: 12)),
+                onPressed: () => launchUrl(
+                  Uri.https(
+                    'wa.me',
+                    '/$whatsappPhone',
+                    {'text': renewalMessage},
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ],
+      ),
     );
   });
 }
@@ -3984,10 +4055,11 @@ Widget buildMembershipPlanCard() {
       final y = expiresAt.year.toString().padLeft(4, '0');
       final m = expiresAt.month.toString().padLeft(2, '0');
       final d = expiresAt.day.toString().padLeft(2, '0');
-      expiresLabel = '$y-$m-$d';
+      expiresLabel = '$d/$m/$y';
     }
-    final devicesLabel =
-        (deviceCount != null && maxDevices != null) ? '$deviceCount / $maxDevices' : '-';
+    final devicesLabel = (deviceCount != null && maxDevices != null)
+        ? '$deviceCount / $maxDevices'
+        : '-';
 
     return Container(
       margin: const EdgeInsets.symmetric(vertical: 8),

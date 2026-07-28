@@ -30,7 +30,7 @@ default = ["use_dasp"]
 hwcodec = ["scrap/hwcodec"]
 vram = ["scrap/vram"]
 # Sehcontrol ScreenCam (docs/SCREENCAM_PLAN.md). Hardware-only by design
-# (plan section 7, option A) — depends on hwcodec, no software H.264 path.
+# (plan section 7, option A) Ã¢â‚¬â€ depends on hwcodec, no software H.264 path.
 screencam = ["hwcodec"]
 mediacodec = ["scrap/mediacodec"]
 plugin_framework = []
@@ -57,6 +57,10 @@ serde_repr = "0.1"
 cfg-if = "1.0"
 lazy_static = "1.4"
 sha2 = "0.10"
+# RTSP Digest auth (RFC 2617) is MD5-only in practice — every NVR/VLC that
+# offers Digest over RTSP uses algorithm=MD5, so sha2 above can't cover it.
+# Already in Cargo.lock via stun/turn, so this adds no new download.
+md-5 = "0.10"
 repng = "0.2"
 parity-tokio-ipc = { git = "https://github.com/rustdesk-org/parity-tokio-ipc" }
 magnum-opus = { git = "https://github.com/rustdesk-org/magnum-opus" }
@@ -134,6 +138,9 @@ windows = { version = "0.61", features = [
     "Win32_System_Memory",
     "Win32_System_Pipes",
     "Win32_System_Threading",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_Ndis",
     "Win32_UI_Shell",
 ] }
 winreg = "0.11"
@@ -220,7 +227,7 @@ libxdo-sys = { path = "libs/libxdo-sys-stub" }
 libsodium-sys = { path = "libs/libsodium-sys-patched" }
 
 [package.metadata.winres]
-LegalCopyright = "Copyright © 2026 Sehcontrol. All rights reserved."
+LegalCopyright = "Copyright Ã‚Â© 2026 Sehcontrol. All rights reserved."
 CompanyName = "Sehcontrol"
 ProductName = "Sehcontrol"
 FileDescription = "Sehcontrol Remote Desktop"

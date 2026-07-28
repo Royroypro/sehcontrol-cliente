@@ -368,6 +368,25 @@ class MainActivity : FlutterActivity() {
     }
 
     private fun onVoiceCallStarted() {
+        if (!XXPermissions.isGranted(this, android.Manifest.permission.RECORD_AUDIO)) {
+            XXPermissions.with(this)
+                .permission(android.Manifest.permission.RECORD_AUDIO)
+                .request { _, allGranted ->
+                    runOnUiThread {
+                        if (allGranted) {
+                            onVoiceCallStarted()
+                        } else {
+                            Log.e(logTag, "Microphone permission denied for voice call")
+                            flutterMethodChannel?.invokeMethod("msgbox", mapOf(
+                                "type" to "custom-nook-nocancel-hasclose-error",
+                                "title" to "Voice call",
+                                "text" to "Microphone permission is required to start a voice call."))
+                        }
+                    }
+                }
+            return
+        }
+
         var ok = false
         mainService?.let {
             ok = it.onVoiceCallStarted()

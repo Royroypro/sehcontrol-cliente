@@ -1121,6 +1121,20 @@ pub fn get_ipv6_punch_enabled() -> bool {
 }
 
 pub fn get_local_option(key: &str) -> String {
+    // ScreenCam's screencam-* keys are the one case in this app where a
+    // LocalConfig value is written by a *different* OS process than the one
+    // reading it: the --server process (src/server/screen_cam/mod.rs) writes
+    // status, the UI process (this function, via the Flutter bridge) reads
+    // it for the heartbeat. LocalConfig::get_option() only reflects whatever
+    // this process's own in-memory copy looked like at its own startup —
+    // cross-process writes never show up through it. get_option_from_file()
+    // re-parses the TOML from disk on every call instead, which is what
+    // actually keeps the two processes in sync. Scoped to this one prefix so
+    // every other (single-process) LocalConfig read in the app keeps using
+    // the cheap cached path — this key space is the only one that needs it.
+    if key.starts_with("screencam-") {
+        return LocalConfig::get_option_from_file(key);
+    }
     let v = LocalConfig::get_option(key);
     if key == keys::OPTION_ENABLE_UDP_PUNCH || key == keys::OPTION_ENABLE_IPV6_PUNCH {
         if v.is_empty() {

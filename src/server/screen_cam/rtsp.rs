@@ -3,15 +3,16 @@
 // Supports exactly what a DVR/NVR or VLC needs to pull the single `/live/main`
 // stream this module serves: OPTIONS, DESCRIBE, SETUP (both UDP and TCP
 // interleaved transport), PLAY, GET_PARAMETER (used by many clients as a
-// keep-alive) and TEARDOWN. No ONVIF, no multiple routes, no authentication
-// yet — see docs/SCREENCAM_PLAN.md Fase 1/3 for what's intentionally deferred.
+// keep-alive) and TEARDOWN, plus Basic/Digest authentication when the panel
+// has issued credentials (see auth.rs). No multiple routes — see
+// docs/SCREENCAM_PLAN.md Fase 1/3 for what's intentionally deferred.
 //
 // Known simplifications (tracked in docs/SCREENCAM_PLAN.md, not silently
 // hidden): no RTCP Sender Reports are sent on the UDP path (some strict NVRs
-// may eventually want them); no RTSP authentication yet; a TCP-interleaved
-// session that receives unexpected non-RTSP bytes after PLAY (e.g. a client
-// sending RTCP back over the same socket) will simply have that request
-// parse fail and the connection close, it will not corrupt other sessions.
+// may eventually want them); a TCP-interleaved session that receives
+// unexpected non-RTSP bytes after PLAY (e.g. a client sending RTCP back over
+// the same socket) will simply have that request parse fail and the
+// connection close, it will not corrupt other sessions.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -20,6 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use hbb_common::{anyhow::anyhow, bail, log, ResultType};
 
+use super::auth;
 use super::SharedState;
 
 pub enum Transport {
@@ -97,6 +99,7 @@ fn handle_connection(stream: TcpStream, state: Arc<SharedState>) -> ResultType<(
     let mut reader = BufReader::new(stream);
 
     let mut session_id: Option<String> = None;
+    let challenge = auth::Challenge::new();
 
     loop {
         let req = match read_request(&mut reader)? {
@@ -105,6 +108,29 @@ fn handle_connection(stream: TcpStream, state: Arc<SharedState>) -> ResultType<(
         };
         let cseq = req.headers.get("cseq").cloned().unwrap_or_default();
         log::debug!("[screencam] {} {} from {}", req.method, req.uri, peer_addr);
+
+        // Auth gate. OPTIONS stays open on purpose: clients and NVR probes use
+        // it to discover what this server supports *before* they have been
+        // asked for credentials, and it reveals nothing but a method list.
+        // GET_PARAMETER/TEARDOWN only act on a session the caller already
+        // holds, which it could only have obtained by authenticating.
+        if matches!(req.method.as_str(), "DESCRIBE" | "SETUP" | "PLAY") {
+            let creds = auth::credentials();
+            let authorization = req.headers.get("authorization").map(|s| s.as_str());
+            if creds.is_set() && !challenge.verify(&creds, &req.method, authorization) {
+                // A missing header is just the normal first half of the 401
+                // handshake, not a failure worth surfacing — only a header
+                // that was actually sent and didn't check out is.
+                if authorization.is_some() {
+                    log::warn!("[screencam] rejected RTSP credentials from {peer_addr}");
+                }
+                let headers = challenge.www_authenticate_headers();
+                let header_refs: Vec<(&str, &str)> =
+                    headers.iter().map(|(k, v)| (*k, v.as_str())).collect();
+                write_response(&write_half, "401 Unauthorized", &cseq, &header_refs, None)?;
+                continue;
+            }
+        }
 
         match req.method.as_str() {
             "OPTIONS" => {
@@ -342,7 +368,7 @@ fn build_sdp(state: &SharedState, peer_addr: SocketAddr) -> Option<String> {
     ))
 }
 
-fn local_ip_for_peer(peer_addr: SocketAddr) -> Option<String> {
+pub(super) fn local_ip_for_peer(peer_addr: SocketAddr) -> Option<String> {
     // Standard no-extra-dependency trick: a UDP "connect" doesn't send any
     // packet, it just makes the OS pick which local interface/IP would be
     // used to reach that peer — that's the IP the SDP needs to advertise.

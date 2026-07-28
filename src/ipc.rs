@@ -873,6 +873,8 @@ async fn handle(data: Data, stream: &mut Connection) {
                     value = Some(Config::get_unlock_pin());
                 } else if name == "trusted-devices" {
                     value = Some(Config::get_trusted_devices_json());
+                } else if name.starts_with("screencam-") {
+                    value = Some(get_local_option(name.clone()));
                 } else {
                     value = None;
                 }
@@ -903,6 +905,42 @@ async fn handle(data: Data, stream: &mut Connection) {
                     crate::audio_service::set_voice_call_input_device(Some(value), true);
                 } else if name == "unlock-pin" {
                     Config::set_unlock_pin(&value);
+                } else if name == "screencam-licensed" {
+                    if matches!(value.as_str(), "Y" | "N") {
+                        set_local_option(name.clone(), value);
+                    } else {
+                        updated = false;
+                    }
+                } else if name == "screencam-desired-state" {
+                    if matches!(value.as_str(), "running" | "stopped") {
+                        set_local_option(name.clone(), value);
+                    } else {
+                        updated = false;
+                    }
+                } else if name == "screencam-mode" {
+                    if matches!(value.as_str(), "local" | "managed" | "supervised") {
+                        set_local_option(name.clone(), value);
+                    } else {
+                        updated = false;
+                    }
+                } else if name == "screencam-rtsp-user" {
+                    let valid = value.is_empty()
+                        || (value.len() == 10
+                            && value.starts_with("seh_")
+                            && value[4..].bytes().all(|b| b.is_ascii_hexdigit()));
+                    if valid {
+                        set_local_option(name.clone(), value);
+                    } else {
+                        updated = false;
+                    }
+                } else if name == "screencam-rtsp-pass" {
+                    let valid = value.is_empty()
+                        || (value.len() == 12 && value.bytes().all(|b| b.is_ascii_alphanumeric()));
+                    if valid {
+                        set_local_option(name.clone(), value);
+                    } else {
+                        updated = false;
+                    }
                 } else {
                     return;
                 }
@@ -1706,10 +1744,7 @@ pub fn get_id() -> String {
 
 pub async fn get_rendezvous_server(ms_timeout: u64) -> (String, Vec<String>) {
     if let Ok(Some(v)) = get_config_async("rendezvous_server", ms_timeout).await {
-        let mut urls = v
-            .split(',')
-            .map(|x| x.trim())
-            .filter(|x| !x.is_empty());
+        let mut urls = v.split(',').map(|x| x.trim()).filter(|x| !x.is_empty());
 
         let a = urls.next().unwrap_or_default().to_owned();
         let b: Vec<String> = urls.map(|x| x.to_owned()).collect();
@@ -1721,7 +1756,6 @@ pub async fn get_rendezvous_server(ms_timeout: u64) -> (String, Vec<String>) {
         )
     }
 }
-
 
 async fn get_options_(ms_timeout: u64) -> ResultType<HashMap<String, String>> {
     let mut c = connect(ms_timeout, "").await?;

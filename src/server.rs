@@ -620,7 +620,7 @@ pub async fn start_server(is_server: bool, no_server: bool) {
         // `--server` process) rather than the main window process so it
         // doesn't depend on the UI being open, matching plan section 2.2.
         #[cfg(all(windows, feature = "screencam"))]
-        screen_cam::start(screen_cam::ScreenCamConfig::default());
+        screen_cam::start(screen_cam::ScreenCamConfig::load());
         crate::RendezvousMediator::start_all().await;
     } else {
         match crate::ipc::connect(1000, "").await {

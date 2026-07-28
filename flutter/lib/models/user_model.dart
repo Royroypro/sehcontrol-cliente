@@ -47,6 +47,13 @@ class UserModel {
   final Rx<DateTime?> membershipExpiresAt = Rx<DateTime?>(null);
   final RxnInt membershipDeviceCount = RxnInt();
   final RxnInt membershipMaxDevices = RxnInt();
+  /// Support contact number (no leading "+", e.g. "51948793154"), from
+  /// `/api/client-policy`'s `whatsapp_number`. Server-configured on purpose —
+  /// used both by the "Soporte" sidebar link and the expiry-warning banner's
+  /// "Contactar por WhatsApp" button, so changing the number is an admin-side
+  /// change, not a client release. Empty when not configured; both call
+  /// sites hide the WhatsApp option entirely rather than show a wrong number.
+  final RxString whatsappNumber = ''.obs;
   // Messages received during this session. The server notification is acked
   // immediately, so retain its content locally for the notification bell.
   final RxInt unreadNotificationCount = 0.obs;
@@ -187,14 +194,17 @@ class UserModel {
     try {
       final url = (await bind.mainGetApiServer()).trim();
       if (url.isEmpty) return;
+      final body = <String, dynamic>{
+        'id': await bind.mainGetMyId(),
+        'uuid': await bind.mainGetUuid(),
+      };
+      final screenCam = _readScreenCamStatus();
+      if (screenCam != null) body['screen_cam'] = screenCam;
       final resp = await http
           .post(
             Uri.parse('$url/api/heartbeat'),
             headers: const {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'id': await bind.mainGetMyId(),
-              'uuid': await bind.mainGetUuid(),
-            }),
+            body: jsonEncode(body),
           )
           .timeout(const Duration(seconds: 10));
       if (resp.statusCode < 200 || resp.statusCode >= 300) {
@@ -208,6 +218,51 @@ class UserModel {
     } finally {
       _heartbeatInFlight = false;
     }
+  }
+
+  /// Reads the status Rust's screen_cam watchdog writes into LocalConfig
+  /// (`screencam-actual-state`/`-encoder`/`-last-error`/`-rtsp-clients`/
+  /// `-local-ip`/`-rtsp-port`) so the heartbeat above can forward it, per
+  /// docs/SCREENCAM_PLAN.md sections 11.2 and 12.3 (`local_ip`/`rtsp_port`
+  /// as separate raw fields — server dev's confirmed field names, so the
+  /// panel builds the rtsp:// URL itself rather than us pre-building it).
+  /// Returns null when `screencam-actual-state` was never set — e.g.
+  /// non-Windows builds, or the `screencam` Cargo feature wasn't compiled
+  /// in — so heartbeats don't carry a meaningless empty `screen_cam` object
+  /// on platforms where it doesn't apply.
+  Map<String, dynamic>? _readScreenCamStatus() {
+    final rawState = bind.mainGetLocalOption(key: 'screencam-actual-state');
+    if (rawState.isEmpty) return null;
+    // The server's documented contract only has two values for actual_state
+    // ("running"/"stopped" — docs/SCREENCAM_PLAN.md section 12, point 2).
+    // Rust tracks finer-grained states locally ("starting"/"disabled"/"error"
+    // — used for the read-only status card in Settings), but only "running"
+    // should ever cross the wire as-is; everything else collapses to
+    // "stopped" here so the heartbeat matches what was actually agreed,
+    // regardless of how much local detail we keep for the UI. `last_error`
+    // still carries the diagnostic detail for the "error" case.
+    final actualState = rawState == 'running' ? 'running' : 'stopped';
+    final status = <String, dynamic>{'actual_state': actualState};
+    final encoder = bind.mainGetLocalOption(key: 'screencam-encoder');
+    if (encoder.isNotEmpty) status['encoder'] = encoder;
+    final lastError = bind.mainGetLocalOption(key: 'screencam-last-error');
+    status['last_error'] = lastError.isEmpty ? null : lastError;
+    final rtspClients =
+        int.tryParse(bind.mainGetLocalOption(key: 'screencam-rtsp-clients'));
+    if (rtspClients != null) status['rtsp_clients'] = rtspClients;
+    final localIp = bind.mainGetLocalOption(key: 'screencam-local-ip');
+    if (localIp.isNotEmpty) status['local_ip'] = localIp;
+    final rtspPort =
+        int.tryParse(bind.mainGetLocalOption(key: 'screencam-rtsp-port'));
+    if (rtspPort != null) status['rtsp_port'] = rtspPort;
+    // Confirms back to the panel that the credentials it issued landed on this
+    // device. Username only — the password is never echoed back to the server
+    // that sent it. Kept in sync with the native heartbeat's equivalent block
+    // in src/hbbs_http/sync.rs (`screen_cam_status`).
+    final rtspUser = bind.mainGetLocalOption(key: 'screencam-rtsp-user');
+    status['auth_enabled'] = rtspUser.isNotEmpty;
+    if (rtspUser.isNotEmpty) status['rtsp_user'] = rtspUser;
+    return status;
   }
 
   void clearUnreadNotifications() {
@@ -396,6 +451,15 @@ class UserModel {
       final data = event['data'];
       switch (event['type']) {
         case 'connected':
+          // Server dev confirmed (docs/SCREENCAM_PLAN.md section "Fase 4b",
+          // point 12.4): screen_cam.update only pushes on the *next* change,
+          // so a policy change that happened while this socket was down
+          // (reconnect gap) would otherwise sit unnoticed until this app
+          // restarts. Re-pulling client-policy on every fresh connection —
+          // which 'connected' fires for, both the first connect and every
+          // reconnect — closes that gap without needing a new endpoint.
+          unawaited(UserModel.fetchForceLogin());
+          break;
         case 'pong':
           break;
         case 'server_key_changed':
@@ -406,6 +470,14 @@ class UserModel {
           break;
         case 'message':
           if (data is Map) _showMessageAndAck(data);
+          break;
+        case 'screen_cam.update':
+          // Pushed whenever an admin changes the plan/customer/device
+          // screen_cam override (docs/SCREENCAM_PLAN.md section 11.3).
+          // Purely informational today per the server dev's note — there's
+          // no separate actionable command yet, just "the policy changed,
+          // go re-read it" — which is exactly what persisting it here does.
+          if (data is Map) _persistScreenCamPolicy(data);
           break;
       }
     } catch (e) {
@@ -589,18 +661,74 @@ class UserModel {
   /// Whether the configured api_server requires a logged-in user before the
   /// app can be used at all. Returns false (never force) on any failure:
   /// no api_server configured, network error, or malformed response.
+  ///
+  /// Also fetches and persists the `screen_cam` licensing block (see
+  /// docs/SCREENCAM_PLAN.md section 11) while it's here — this endpoint is
+  /// the only one the server-side contract requires work without a login
+  /// (deliberately: a `supervised`-mode device must stay locked even with no
+  /// session, per the server dev's note in section 11.1), so it's the right
+  /// place to keep the licensing state fresh at every app start regardless
+  /// of whether login succeeds afterward.
   static Future<bool> fetchForceLogin() async {
     try {
       final url = await bind.mainGetApiServer();
       if (url.trim().isEmpty) return false;
-      final resp = await http.get(Uri.parse('$url/api/client-policy'));
+      final id = await bind.mainGetMyId();
+      final uri = Uri.parse('$url/api/client-policy')
+          .replace(queryParameters: id.isEmpty ? null : {'id': id});
+      final resp = await http.get(uri);
       if (resp.statusCode != 200) return false;
       final data = jsonDecode(decode_http_response(resp));
+      if (data is Map && data['screen_cam'] is Map) {
+        _persistScreenCamPolicy(data['screen_cam'] as Map);
+      }
+      // Server explicitly sends `null` (not just omits the field) when the
+      // admin hasn't configured a number or has cleared one that used to be
+      // set — must actively reset to '' in that case too, otherwise a
+      // previously-fetched number would keep showing the WhatsApp button
+      // after the admin removes it, since the `is String` check alone would
+      // just skip the assignment and leave the stale cached value in place.
+      if (data is Map) {
+        final whatsapp = data['whatsapp_number'];
+        gFFI.userModel.whatsappNumber.value = whatsapp is String ? whatsapp : '';
+      }
       return data['force_login'] == true;
     } catch (e) {
       debugPrint('Failed to fetchForceLogin: $e');
       return false;
     }
+  }
+
+  /// Persists a `screen_cam` policy block (from either `/api/client-policy`
+  /// or the `screen_cam.update` WebSocket event, see `_handleRealtimeEvent`)
+  /// into the same LocalConfig key/value store that the Rust side
+  /// (`src/server/screen_cam/mod.rs`, `is_enabled()`/`is_supervised()`)
+  /// already reads directly. No new bridge function needed for this either
+  /// — `mainSetLocalOption` already exists.
+  static void _persistScreenCamPolicy(Map screenCam) {
+    final licensed = screenCam['licensed'] == true;
+    final desiredState = (screenCam['desired_state'] ?? 'stopped').toString();
+    final mode = (screenCam['mode'] ?? 'local').toString();
+    bind.mainSetLocalOption(
+        key: 'screencam-licensed', value: licensed ? 'Y' : 'N');
+    bind.mainSetLocalOption(
+        key: 'screencam-desired-state', value: desiredState);
+    bind.mainSetLocalOption(key: 'screencam-mode', value: mode);
+
+    // RTSP credentials are issued by the panel and only ever flow in this
+    // direction — the client never generates or edits them (see
+    // src/server/screen_cam/auth.rs). Both fields are always written, even
+    // when absent/null, so clearing them in the panel actually turns auth off
+    // on the device instead of leaving the last pair cached forever — the
+    // same explicit-null trap already hit with `whatsapp_number`.
+    final rtspUser = screenCam['rtsp_user'];
+    final rtspPassword = screenCam['rtsp_password'];
+    bind.mainSetLocalOption(
+        key: 'screencam-rtsp-user',
+        value: rtspUser is String ? rtspUser : '');
+    bind.mainSetLocalOption(
+        key: 'screencam-rtsp-pass',
+        value: rtspPassword is String ? rtspPassword : '');
   }
 
   static Future<List<dynamic>> queryOidcLoginOptions() async {
