@@ -22,6 +22,7 @@
 // tested against VLC/an NVR.
 
 mod auth;
+mod display;
 mod onvif;
 mod rtp;
 mod rtsp;
@@ -38,7 +39,7 @@ use hbb_common::{
 use scrap::{
     codec::{Encoder, EncoderApi, EncoderCfg},
     hwcodec::{HwRamEncoder, HwRamEncoderConfig},
-    CodecFormat, Display, TraitCapturer,
+    CodecFormat, TraitCapturer,
 };
 
 use rtsp::Session;
@@ -430,7 +431,7 @@ fn capture_loop(cfg: ScreenCamConfig, state: Arc<SharedState>) -> ResultType<()>
     log::info!("[screencam] using hardware encoder: {}", encoder_name);
     set_encoder_status(&encoder_name);
 
-    let mut displays = Display::all()?;
+    let displays = display::DisplayInventory::enumerate()?;
     if cfg.monitor_index >= displays.len() {
         bail!(
             "monitor index {} out of range ({} display(s) found)",
@@ -438,15 +439,31 @@ fn capture_loop(cfg: ScreenCamConfig, state: Arc<SharedState>) -> ResultType<()>
             displays.len()
         );
     }
-    let display = displays.remove(cfg.monitor_index);
-    let width = display.width() as usize;
-    let height = display.height() as usize;
-    let mut capturer = scrap::Capturer::new(display)?;
+    for info in displays.infos() {
+        log::info!(
+            "[screencam] display {}: id='{}', name='{}', {}x{}, primary={}, connected={}",
+            info.index,
+            info.display_id,
+            info.name,
+            info.width,
+            info.height,
+            info.primary,
+            info.connected
+        );
+    }
+    let selected = displays
+        .into_display_at(cfg.monitor_index)
+        .ok_or_else(|| anyhow!("monitor index {} out of range", cfg.monitor_index))?;
+    let display_id = selected.info.display_id.clone();
+    let width = selected.info.width;
+    let height = selected.info.height;
+    let mut capturer = scrap::Capturer::new(selected.display)?;
     state.width.store(width, Ordering::Relaxed);
     state.height.store(height, Ordering::Relaxed);
     log::info!(
-        "[screencam] capturing monitor {} at {}x{}",
+        "[screencam] capturing monitor {} ('{}') at {}x{}",
         cfg.monitor_index,
+        display_id,
         width,
         height
     );
