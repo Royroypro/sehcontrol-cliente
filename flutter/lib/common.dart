@@ -3954,12 +3954,10 @@ Widget buildMembershipBanner(BuildContext context) {
         ? 'Hola, deseo renovar mi licencia de SEHCONTROL. Mi plan actual es $planName.'
         : 'Hola, deseo renovar mi licencia de SEHCONTROL.';
 
-    // Same box shape/size as the neighboring "Secure Connection"/"Install"
-    // cards (width 240, padding 16, surfaceContainerHighest bg, radius 13)
-    // so the three sit consistently in the header row; only the accent
-    // color changes to signal urgency.
+    // Match the neighboring desktop cards at 240 px, but use the full
+    // available width on mobile so the warning stays readable.
     return Container(
-      width: 240,
+      width: isMobile ? double.infinity : 240,
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         color: Theme.of(context).colorScheme.surfaceContainerHighest,

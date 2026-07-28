@@ -87,6 +87,7 @@ class _ConnectionPageState extends State<ConnectionPage> {
           if (!bind.isCustomClient() && !isIOS)
             Obx(() => _buildUpdateUI(stateGlobal.updateUrl.value)),
           _buildRemoteIDTextField(),
+          buildMembershipBanner(context),
           buildMembershipPlanCard(),
         ])),
         SliverFillRemaining(
