@@ -2344,6 +2344,82 @@ impl LocalConfig {
         }
     }
 
+    /// Updates several local options under one write lock and persists the
+    /// resulting configuration with one file write. If persistence fails, the
+    /// in-memory configuration is restored before the error is returned.
+    ///
+    /// Return value:
+    /// - `Ok(true)`: at least one key changed **and** the new configuration was
+    ///   written to disk. This is the only result that means the requested
+    ///   configuration is actually materialized.
+    /// - `Ok(false)`: nothing changed, so nothing was written. The on-disk file
+    ///   is untouched and still holds whatever it held before. Callers must not
+    ///   read this as "the requested values were stored" — a key rejected by
+    ///   [`is_option_can_save`] and already absent also lands here.
+    /// - `Err(_)`: the write failed. The in-memory configuration has been rolled
+    ///   back in full and the previous file is still valid.
+    ///
+    /// This is designed for ordinary `LocalConfig` options. It deliberately does
+    /// **not** reproduce [`LocalConfig::set_option`]'s special case for
+    /// `OPTION_LANGUAGE` == "default" (which stores an empty string rather than
+    /// removing the key); do not route the language option through here.
+    pub fn set_options_atomic(updates: &[(String, String)]) -> crate::ResultType<bool> {
+        Self::set_options_atomic_to_path(&LOCAL_CONFIG, updates, Config::file_("_local"))
+    }
+
+    fn set_options_atomic_to_path(
+        local_config: &RwLock<LocalConfig>,
+        updates: &[(String, String)],
+        path: PathBuf,
+    ) -> crate::ResultType<bool> {
+        // Resolve the overwrite/default policy *before* taking the LocalConfig
+        // write lock. `is_option_can_save` read-locks OVERWRITE_LOCAL_SETTINGS
+        // and DEFAULT_LOCAL_SETTINGS; acquiring those while already holding
+        // LOCAL_CONFIG would introduce a second lock order for the same pair
+        // that `set_option` establishes in the opposite direction.
+        let plan = updates
+            .iter()
+            .map(|(key, value)| {
+                let can_save = is_option_can_save(
+                    &OVERWRITE_LOCAL_SETTINGS,
+                    key,
+                    &DEFAULT_LOCAL_SETTINGS,
+                    value,
+                );
+                (key, value, can_save)
+            })
+            .collect::<Vec<_>>();
+
+        let mut config = local_config.write().unwrap();
+        let previous = config.clone();
+        let mut changed = false;
+
+        for (key, value, can_save) in plan {
+            if !can_save {
+                changed |= config.options.remove(key).is_some();
+                continue;
+            }
+            let value = (!value.is_empty()).then_some(value);
+            if value != config.options.get(key) {
+                changed = true;
+                if let Some(value) = value {
+                    config.options.insert(key.clone(), value.clone());
+                } else {
+                    config.options.remove(key);
+                }
+            }
+        }
+
+        if !changed {
+            return Ok(false);
+        }
+        if let Err(error) = store_path(path, &*config) {
+            *config = previous;
+            return Err(error);
+        }
+        Ok(true)
+    }
+
     pub fn get_flutter_option(k: &str) -> String {
         get_or(
             &OVERWRITE_LOCAL_SETTINGS,
@@ -4086,6 +4162,219 @@ mod tests {
                 0o600
             );
         }
+    }
+
+    #[test]
+    fn local_config_atomic_update_rolls_back_all_keys_on_persistence_failure() {
+        fn assert_same_config(left: &LocalConfig, right: &LocalConfig) {
+            assert_eq!(left.remote_id, right.remote_id);
+            assert_eq!(left.kb_layout_type, right.kb_layout_type);
+            assert_eq!(left.size, right.size);
+            assert_eq!(left.fav, right.fav);
+            assert_eq!(left.options, right.options);
+            assert_eq!(left.ui_flutter, right.ui_flutter);
+        }
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sehcontrol-local-config-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        // The failure must be provoked on the very destination that was
+        // successfully persisted first, otherwise the test proves nothing about
+        // the file the caller actually depends on.
+        let path = temp_dir.join("local.toml");
+
+        let local_config = RwLock::new(LocalConfig::default());
+        let first = LocalConfig::set_options_atomic_to_path(
+            &local_config,
+            &[
+                (
+                    "screencam-selected-display-id".to_owned(),
+                    r"\\.\DISPLAY1".to_owned(),
+                ),
+                ("screencam-fallback-to-primary".to_owned(), "Y".to_owned()),
+            ],
+            path.clone(),
+        )
+        .unwrap();
+        assert!(first);
+        let persisted_before: LocalConfig = load_path(path.clone());
+        assert_eq!(
+            persisted_before
+                .options
+                .get("screencam-selected-display-id")
+                .map(String::as_str),
+            Some(r"\\.\DISPLAY1")
+        );
+        assert_eq!(
+            persisted_before
+                .options
+                .get("screencam-fallback-to-primary")
+                .map(String::as_str),
+            Some("Y")
+        );
+        let before_failure = local_config.read().unwrap().clone();
+
+        let updates = vec![
+            (
+                "screencam-selected-display-id".to_owned(),
+                r"\\.\DISPLAY2".to_owned(),
+            ),
+            ("screencam-fallback-to-primary".to_owned(), "N".to_owned()),
+        ];
+        let result = {
+            // Windows is the platform this policy actually ships on, and an
+            // exclusive handle makes confy's rename onto `path` fail while the
+            // previous file keeps its content and stays readable afterwards.
+            #[cfg(windows)]
+            let _blocker = {
+                use std::os::windows::fs::OpenOptionsExt;
+                fs::OpenOptions::new()
+                    .read(true)
+                    .share_mode(0)
+                    .open(&path)
+                    .unwrap()
+            };
+            // No portable equivalent keeps the destination both failing and
+            // readable, so elsewhere a read-only parent directory is used; the
+            // previous file still survives untouched.
+            #[cfg(not(windows))]
+            let _blocker = {
+                use std::os::unix::fs::PermissionsExt;
+                struct RestorePermissions(PathBuf, u32);
+                impl Drop for RestorePermissions {
+                    fn drop(&mut self) {
+                        let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(self.1));
+                    }
+                }
+                let mode = fs::metadata(&temp_dir).unwrap().permissions().mode() & 0o777;
+                fs::set_permissions(&temp_dir, fs::Permissions::from_mode(0o555)).unwrap();
+                RestorePermissions(temp_dir.clone(), mode)
+            };
+            LocalConfig::set_options_atomic_to_path(&local_config, &updates, path.clone())
+        };
+
+        assert!(result.is_err());
+        // Full-structure rollback, not just the two policy keys.
+        assert_same_config(&local_config.read().unwrap(), &before_failure);
+        let persisted_after: LocalConfig = load_path(path);
+        assert_same_config(&persisted_after, &persisted_before);
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn local_config_atomic_update_persists_both_policy_keys_together() {
+        let local_config = RwLock::new(LocalConfig::default());
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sehcontrol-local-config-success-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let path = temp_dir.join("local.toml");
+        let updates = vec![
+            (
+                "screencam-selected-display-id".to_owned(),
+                r"\\.\DISPLAY3".to_owned(),
+            ),
+            ("screencam-fallback-to-primary".to_owned(), "N".to_owned()),
+        ];
+        let changed =
+            LocalConfig::set_options_atomic_to_path(&local_config, &updates, path.clone()).unwrap();
+        assert!(changed);
+        let persisted: LocalConfig = load_path(path);
+        assert_eq!(
+            persisted
+                .options
+                .get("screencam-selected-display-id")
+                .map(String::as_str),
+            Some(r"\\.\DISPLAY3")
+        );
+        assert_eq!(
+            persisted
+                .options
+                .get("screencam-fallback-to-primary")
+                .map(String::as_str),
+            Some("N")
+        );
+        fs::remove_dir_all(temp_dir).unwrap();
+    }
+
+    #[test]
+    fn local_config_atomic_update_never_exposes_mixed_policy_keys() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc, Barrier,
+        };
+
+        let local_config = Arc::new(RwLock::new(LocalConfig {
+            options: HashMap::from([
+                (
+                    "screencam-selected-display-id".to_owned(),
+                    r"\\.\DISPLAY1".to_owned(),
+                ),
+                ("screencam-fallback-to-primary".to_owned(), "Y".to_owned()),
+            ]),
+            ..Default::default()
+        }));
+        let temp_dir = std::env::temp_dir().join(format!(
+            "sehcontrol-local-config-observer-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let path = temp_dir.join("local.toml");
+        let start = Arc::new(Barrier::new(2));
+        let finished = Arc::new(AtomicBool::new(false));
+        let writer_config = Arc::clone(&local_config);
+        let writer_start = Arc::clone(&start);
+        let writer_finished = Arc::clone(&finished);
+        let writer = std::thread::spawn(move || {
+            writer_start.wait();
+            let updates = vec![
+                (
+                    "screencam-selected-display-id".to_owned(),
+                    r"\\.\DISPLAY2".to_owned(),
+                ),
+                ("screencam-fallback-to-primary".to_owned(), "N".to_owned()),
+            ];
+            LocalConfig::set_options_atomic_to_path(&writer_config, &updates, path).unwrap();
+            writer_finished.store(true, Ordering::Release);
+        });
+
+        start.wait();
+        while !finished.load(Ordering::Acquire) {
+            let config = local_config.read().unwrap();
+            let selected = config
+                .options
+                .get("screencam-selected-display-id")
+                .map(String::as_str);
+            let fallback = config
+                .options
+                .get("screencam-fallback-to-primary")
+                .map(String::as_str);
+            assert!(
+                (selected == Some(r"\\.\DISPLAY1") && fallback == Some("Y"))
+                    || (selected == Some(r"\\.\DISPLAY2") && fallback == Some("N"))
+            );
+        }
+        writer.join().unwrap();
+        let config = local_config.read().unwrap();
+        assert_eq!(
+            config
+                .options
+                .get("screencam-selected-display-id")
+                .map(String::as_str),
+            Some(r"\\.\DISPLAY2")
+        );
+        assert_eq!(
+            config
+                .options
+                .get("screencam-fallback-to-primary")
+                .map(String::as_str),
+            Some("N")
+        );
+        drop(config);
+        fs::remove_dir_all(temp_dir).unwrap();
     }
 
     #[test]
