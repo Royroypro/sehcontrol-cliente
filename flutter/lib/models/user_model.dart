@@ -12,10 +12,15 @@ import '../common.dart';
 import '../utils/http_service.dart' as http;
 import 'model.dart';
 import 'platform_model.dart';
+import 'screencam_policy.dart';
 
 bool refreshingUser = false;
 const _trustedServerKeyOption = 'trusted-server-key';
 const _trustedServerKeyFingerprintOption = 'trusted-server-key-fingerprint';
+DateTime? _lastUnresolvedScreenCamPolicyWarning;
+DateTime? _lastEmptyScreenCamUuidWarning;
+DateTime? _lastScreenCamPolicyIpcWarning;
+DateTime? _lastScreenCamV2ErrorWarning;
 
 class ServerNotification {
   final String id;
@@ -47,6 +52,7 @@ class UserModel {
   final Rx<DateTime?> membershipExpiresAt = Rx<DateTime?>(null);
   final RxnInt membershipDeviceCount = RxnInt();
   final RxnInt membershipMaxDevices = RxnInt();
+
   /// Support contact number (no leading "+", e.g. "51948793154"), from
   /// `/api/client-policy`'s `whatsapp_number`. Server-configured on purpose —
   /// used both by the "Soporte" sidebar link and the expiry-warning banner's
@@ -472,12 +478,19 @@ class UserModel {
           if (data is Map) _showMessageAndAck(data);
           break;
         case 'screen_cam.update':
-          // Pushed whenever an admin changes the plan/customer/device
-          // screen_cam override (docs/SCREENCAM_PLAN.md section 11.3).
-          // Purely informational today per the server dev's note — there's
-          // no separate actionable command yet, just "the policy changed,
-          // go re-read it" — which is exactly what persisting it here does.
-          if (data is Map) _persistScreenCamPolicy(data);
+          // The event carries the policy block itself and is applied directly,
+          // without re-fetching (docs/SCREENCAM_PLAN.md, Fase 4c) — so no
+          // fetchForceLogin() is triggered here and there is no WS → HTTP → WS
+          // loop to debounce. It may however carry only a subset, so historical
+          // fields go through the strictly-partial persister (an absent field
+          // keeps its stored value) and selection/fallback keep going through
+          // the display persister that owns them.
+          if (data is Map) {
+            unawaited(() async {
+              await _persistScreenCamPolicyHistoryPartial(data);
+              await _persistScreenCamDisplayPolicy(data);
+            }());
+          }
           break;
       }
     } catch (e) {
@@ -670,50 +683,119 @@ class UserModel {
   /// place to keep the licensing state fresh at every app start regardless
   /// of whether login succeeds afterward.
   static Future<bool> fetchForceLogin() async {
+    String? url;
+    Map? v1ScreenCamPolicy;
+    var forceLogin = false;
     try {
-      final url = await bind.mainGetApiServer();
-      if (url.trim().isEmpty) return false;
+      final apiServer = await bind.mainGetApiServer();
+      if (apiServer.trim().isEmpty) return false;
+      url = apiServer;
       final id = await bind.mainGetMyId();
-      final uri = Uri.parse('$url/api/client-policy')
+      final uri = Uri.parse('$apiServer/api/client-policy')
           .replace(queryParameters: id.isEmpty ? null : {'id': id});
       final resp = await http.get(uri);
-      if (resp.statusCode != 200) return false;
-      final data = jsonDecode(decode_http_response(resp));
-      if (data is Map && data['screen_cam'] is Map) {
-        _persistScreenCamPolicy(data['screen_cam'] as Map);
+      if (resp.statusCode == 200) {
+        final data = jsonDecode(decode_http_response(resp));
+        if (data is Map && data['screen_cam'] is Map) {
+          v1ScreenCamPolicy = data['screen_cam'] as Map;
+          await _persistScreenCamPolicyHistory(v1ScreenCamPolicy);
+        }
+        // Server explicitly sends `null` (not just omits the field) when the
+        // admin hasn't configured a number or has cleared one that used to be
+        // set — must actively reset to '' in that case too, otherwise a
+        // previously-fetched number would keep showing the WhatsApp button
+        // after the admin removes it, since the `is String` check alone would
+        // just skip the assignment and leave the stale cached value in place.
+        if (data is Map) {
+          final whatsapp = data['whatsapp_number'];
+          gFFI.userModel.whatsappNumber.value =
+              whatsapp is String ? whatsapp : '';
+        }
+        forceLogin = data is Map && data['force_login'] == true;
       }
-      // Server explicitly sends `null` (not just omits the field) when the
-      // admin hasn't configured a number or has cleared one that used to be
-      // set — must actively reset to '' in that case too, otherwise a
-      // previously-fetched number would keep showing the WhatsApp button
-      // after the admin removes it, since the `is String` check alone would
-      // just skip the assignment and leave the stale cached value in place.
-      if (data is Map) {
-        final whatsapp = data['whatsapp_number'];
-        gFFI.userModel.whatsappNumber.value = whatsapp is String ? whatsapp : '';
-      }
-      return data['force_login'] == true;
     } catch (e) {
       debugPrint('Failed to fetchForceLogin: $e');
-      return false;
+    }
+
+    // V2 identifies the physical client with the same stable, encoded UUID
+    // already used by login and native heartbeats (`mainGetUuid`), rather than
+    // the mutable RustDesk ID. It only governs display selection; V1 remains
+    // the authority for licensing, desired state, mode and credentials.
+    if (url != null && url.trim().isNotEmpty) {
+      final v2Decision = await _fetchScreenCamV2Policy(url);
+      final displayPolicy =
+          resolveScreenCamDisplayPolicy(v1ScreenCamPolicy, v2Decision);
+      if (displayPolicy.isNotEmpty) {
+        await _persistScreenCamDisplayPolicy(displayPolicy);
+      }
+    }
+    return forceLogin;
+  }
+
+  static Future<ScreenCamV2PolicyDecision> _fetchScreenCamV2Policy(
+      String url) async {
+    try {
+      final deviceUid = await bind.mainGetUuid();
+      if (deviceUid.isEmpty) {
+        final now = DateTime.now();
+        if (_lastEmptyScreenCamUuidWarning == null ||
+            now.difference(_lastEmptyScreenCamUuidWarning!) >=
+                const Duration(minutes: 5)) {
+          _lastEmptyScreenCamUuidWarning = now;
+          debugPrint('ScreenCam V2 policy omitted: device UID is unavailable');
+        }
+        return const ScreenCamV2PolicyDecision(unresolved: true);
+      }
+      final uri = Uri.parse('$url/api/v2/client/policy')
+          .replace(queryParameters: {'device_uid': deviceUid});
+      final response = await http.get(uri).timeout(const Duration(seconds: 5));
+      // A 404 is the expected compatibility response from a pre-V2 panel.
+      if (response.statusCode != 200) {
+        return screenCamV2PolicyDecision(response.statusCode, null);
+      }
+      final data = jsonDecode(decode_http_response(response));
+      final decision = screenCamV2PolicyDecision(response.statusCode, data);
+      if (decision.unresolved) {
+        final now = DateTime.now();
+        if (_lastUnresolvedScreenCamPolicyWarning == null ||
+            now.difference(_lastUnresolvedScreenCamPolicyWarning!) >=
+                const Duration(minutes: 5)) {
+          _lastUnresolvedScreenCamPolicyWarning = now;
+          debugPrint(
+              'ScreenCam V2 policy ignored: device UID was not resolved');
+        }
+        return decision;
+      }
+      return decision;
+    } catch (_) {
+      // V2 is additive. Network failures, timeouts and malformed responses
+      // must leave the last valid V1/display policy untouched.
+      final now = DateTime.now();
+      if (_lastScreenCamV2ErrorWarning == null ||
+          now.difference(_lastScreenCamV2ErrorWarning!) >=
+              const Duration(minutes: 5)) {
+        _lastScreenCamV2ErrorWarning = now;
+        debugPrint('ScreenCam V2 policy fetch failed; keeping previous policy');
+      }
+      return const ScreenCamV2PolicyDecision();
     }
   }
 
-  /// Persists a `screen_cam` policy block (from either `/api/client-policy`
-  /// or the `screen_cam.update` WebSocket event, see `_handleRealtimeEvent`)
-  /// into the same LocalConfig key/value store that the Rust side
+  /// Persists the historical fields of a complete V1 `screen_cam` policy into
+  /// the same LocalConfig
+  /// key/value store that the Rust side
   /// (`src/server/screen_cam/mod.rs`, `is_enabled()`/`is_supervised()`)
   /// already reads directly. No new bridge function needed for this either
   /// — `mainSetLocalOption` already exists.
-  static void _persistScreenCamPolicy(Map screenCam) {
+  static Future<void> _persistScreenCamPolicyHistory(Map screenCam) async {
     final licensed = screenCam['licensed'] == true;
     final desiredState = (screenCam['desired_state'] ?? 'stopped').toString();
     final mode = (screenCam['mode'] ?? 'local').toString();
-    bind.mainSetLocalOption(
+    await bind.mainSetLocalOption(
         key: 'screencam-licensed', value: licensed ? 'Y' : 'N');
-    bind.mainSetLocalOption(
+    await bind.mainSetLocalOption(
         key: 'screencam-desired-state', value: desiredState);
-    bind.mainSetLocalOption(key: 'screencam-mode', value: mode);
+    await bind.mainSetLocalOption(key: 'screencam-mode', value: mode);
 
     // RTSP credentials are issued by the panel and only ever flow in this
     // direction — the client never generates or edits them (see
@@ -723,12 +805,43 @@ class UserModel {
     // same explicit-null trap already hit with `whatsapp_number`.
     final rtspUser = screenCam['rtsp_user'];
     final rtspPassword = screenCam['rtsp_password'];
-    bind.mainSetLocalOption(
-        key: 'screencam-rtsp-user',
-        value: rtspUser is String ? rtspUser : '');
-    bind.mainSetLocalOption(
+    await bind.mainSetLocalOption(
+        key: 'screencam-rtsp-user', value: rtspUser is String ? rtspUser : '');
+    await bind.mainSetLocalOption(
         key: 'screencam-rtsp-pass',
         value: rtspPassword is String ? rtspPassword : '');
+  }
+
+  /// Strictly-partial counterpart of [_persistScreenCamPolicyHistory] for the
+  /// WebSocket event, which may carry only a subset of the block. Only keys
+  /// actually present are written, so an absent field never becomes
+  /// `false`/`stopped`/`local` and an absent credential is never wiped. The
+  /// daemon validates every value again before storing it.
+  static Future<void> _persistScreenCamPolicyHistoryPartial(
+      Map screenCam) async {
+    for (final entry in screenCamHistoricalPolicyValues(screenCam).entries) {
+      await bind.mainSetLocalOption(key: entry.key, value: entry.value);
+    }
+  }
+
+  static Future<bool> _persistScreenCamDisplayPolicy(Map screenCam) async {
+    final result = await applyScreenCamDisplayPolicyUpdate(
+      screenCam,
+      (payload) async {
+        return bind.mainApplyScreencamDisplayPolicy(value: payload);
+      },
+    );
+    if (result.attempted && !result.applied) {
+      final now = DateTime.now();
+      if (_lastScreenCamPolicyIpcWarning == null ||
+          now.difference(_lastScreenCamPolicyIpcWarning!) >=
+              const Duration(minutes: 5)) {
+        _lastScreenCamPolicyIpcWarning = now;
+        debugPrint(
+            'ScreenCam display policy was not applied by the service (${result.error ?? 'nack'})');
+      }
+    }
+    return result.applied;
   }
 
   static Future<List<dynamic>> queryOidcLoginOptions() async {

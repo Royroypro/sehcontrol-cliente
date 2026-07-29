@@ -21,6 +21,8 @@ use hbb_common::{
     rendezvous_proto::ConnType,
     ResultType,
 };
+#[cfg(all(windows, feature = "screencam"))]
+use std::sync::atomic::AtomicBool;
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -1304,6 +1306,36 @@ pub fn main_set_local_option(key: String, value: String) {
             }
             session.update_supported_decodings();
         }
+    }
+}
+
+/// Applies the composite ScreenCam display policy through the Windows service
+/// and returns its bounded JSON ACK/NACK. This is deliberately separate from
+/// fire-and-forget local options so Flutter cannot report a send as an apply.
+///
+/// `unsupported` means *this binary* cannot apply the policy at all (a build
+/// without `windows + screencam`, or the web stub). A service that predates the
+/// `screencam-display-policy` request does **not** produce it: that branch
+/// simply never answers, so the client's `next_timeout` elapses and the result
+/// is `ipc_unavailable`, exactly like any other unreachable daemon.
+pub fn main_apply_screencam_display_policy(value: String) -> String {
+    #[cfg(all(windows, feature = "screencam"))]
+    {
+        static IPC_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
+        return match crate::ipc::set_screencam_display_policy_with_ack(value) {
+            Ok(response) => response,
+            Err(_) => {
+                if !IPC_WARNING_EMITTED.swap(true, Ordering::Relaxed) {
+                    log::warn!("[screencam] display policy IPC failed");
+                }
+                r#"{"applied":false,"changed":false,"error":"ipc_unavailable"}"#.to_owned()
+            }
+        };
+    }
+    #[cfg(not(all(windows, feature = "screencam")))]
+    {
+        let _ = value;
+        r#"{"applied":false,"changed":false,"error":"unsupported"}"#.to_owned()
     }
 }
 

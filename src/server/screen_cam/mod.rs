@@ -3,10 +3,8 @@
 // Turns one monitor of this machine into an RTSP source a DVR/NVR (or, for
 // this MVP, VLC) can pull directly: `rtsp://<this-machine-ip>:8554/live/main`.
 // Video never goes through the Sehcontrol panel/server — this module only
-// captures, encodes and serves RTP; the panel-driven licensing, policy and
-// PIN-protected local config described in the plan's Fase 3/4 are not wired
-// up yet on purpose, so this can be validated against VLC and a real NVR
-// first (Fase 1/2 acceptance criteria) before any of that is built on top.
+// captures, encodes and serves RTP. Panel policy is applied through the
+// service IPC; it controls capture selection but never carries video data.
 //
 // Decision from docs/SCREENCAM_PLAN.md §7: option A — hardware H.264 only,
 // no software fallback. A machine with no hardware H.264 encoder (no GPU, or
@@ -28,7 +26,7 @@ mod rtp;
 mod rtsp;
 
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use hbb_common::{
@@ -45,6 +43,25 @@ use scrap::{
 };
 
 use rtsp::Session;
+
+const SELECTED_DISPLAY_ID_OPTION_KEY: &str = "screencam-selected-display-id";
+const FALLBACK_TO_PRIMARY_OPTION_KEY: &str = "screencam-fallback-to-primary";
+const DISPLAY_POLICY_RECONCILIATION_TIMEOUT: Duration = Duration::from_millis(500);
+static INVALID_FALLBACK_WARNING_EMITTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static INVALID_STORED_SELECTION_WARNING_EMITTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static POLICY_NOT_PERSISTED_WARNING_EMITTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+lazy_static::lazy_static! {
+    /// The service owns the live ScreenCam state. IPC and the heartbeat only
+    /// borrow it briefly, so neither retains the capture loop after shutdown.
+    static ref LIVE_STATE: Mutex<Option<Weak<SharedState>>> = Mutex::new(None);
+    static ref LIVE_STATE_RECONCILED: Condvar = Condvar::new();
+    /// Serializes persistence plus publication with startup reconciliation.
+    static ref DISPLAY_POLICY_UPDATE: Mutex<()> = Mutex::new(());
+}
 
 /// Persisted alongside the rest of Sehcontrol's local config (see [`load`](Self::load)),
 /// since there's no admin panel or in-app settings page wired up for this yet
@@ -193,11 +210,22 @@ pub struct SharedState {
 
 impl SharedState {
     fn new() -> Self {
+        let (selected_display_id, fallback_to_primary) = load_display_policy();
+        Self::new_with_display_policy(selected_display_id, fallback_to_primary)
+    }
+
+    fn new_with_display_policy(
+        selected_display_id: Option<String>,
+        fallback_to_primary: bool,
+    ) -> Self {
         Self {
             sessions: Mutex::new(Vec::new()),
             stream_descriptor: Mutex::new(StreamDescriptorState::new()),
             last_confirmed_resolution: Mutex::new(None),
-            display_selection: Mutex::new(display::DisplaySelectionState::new(None, true)),
+            display_selection: Mutex::new(display::DisplaySelectionState::new(
+                selected_display_id,
+                fallback_to_primary,
+            )),
             reconfigure_generation: AtomicU64::new(0),
         }
     }
@@ -232,9 +260,48 @@ impl SharedState {
         self.display_selection.lock().unwrap().deactivate();
     }
 
-    #[cfg(test)]
     fn display_snapshot(&self) -> display::DisplayRuntimeState {
         self.display_selection.lock().unwrap().snapshot()
+    }
+
+    #[cfg(test)]
+    fn apply_display_policy(
+        &self,
+        selected_display_id: Option<&str>,
+        fallback_to_primary: Option<bool>,
+    ) -> bool {
+        let mut selection = self.display_selection.lock().unwrap();
+        let requires_reconfigure =
+            selection.update_policy(selected_display_id, fallback_to_primary);
+        if requires_reconfigure {
+            advance_generation(&self.reconfigure_generation);
+        }
+        requires_reconfigure
+    }
+
+    fn reconcile_display_policy(
+        &self,
+        selected_display_id: Option<&str>,
+        fallback_to_primary: bool,
+    ) -> bool {
+        let mut selection = self.display_selection.lock().unwrap();
+        let requires_reconfigure =
+            selection.reconcile_policy(selected_display_id, fallback_to_primary);
+        if requires_reconfigure {
+            advance_generation(&self.reconfigure_generation);
+        }
+        requires_reconfigure
+    }
+
+    fn display_policy_matches(
+        &self,
+        selected_display_id: Option<&str>,
+        fallback_to_primary: bool,
+    ) -> bool {
+        self.display_selection
+            .lock()
+            .unwrap()
+            .policy_matches(selected_display_id, fallback_to_primary)
     }
 
     fn stream_descriptor(&self) -> StreamDescriptorState {
@@ -360,6 +427,357 @@ fn advance_generation(generation: &AtomicU64) -> u64 {
     generation.fetch_add(1, Ordering::SeqCst).wrapping_add(1)
 }
 
+fn load_display_policy() -> (Option<String>, bool) {
+    let selected =
+        hbb_common::config::LocalConfig::get_option_from_file(SELECTED_DISPLAY_ID_OPTION_KEY);
+    let selected_display_id = if selected.is_empty() {
+        None
+    } else if display::validate_display_id(&selected).is_ok() {
+        Some(selected)
+    } else {
+        log::warn!("[screencam] ignoring invalid persisted display selection");
+        None
+    };
+    let persisted_fallback =
+        hbb_common::config::LocalConfig::get_option_from_file(FALLBACK_TO_PRIMARY_OPTION_KEY);
+    let fallback_to_primary = match persisted_fallback.as_str() {
+        "Y" => true,
+        "N" => false,
+        "" => true,
+        _ => {
+            if !INVALID_FALLBACK_WARNING_EMITTED.swap(true, Ordering::Relaxed) {
+                log::warn!("[screencam] ignoring invalid persisted fallback policy");
+            }
+            true
+        }
+    };
+    (selected_display_id, fallback_to_primary)
+}
+
+/// Validates the only display identifier accepted through the service IPC.
+/// The implementation is shared with Windows display enumeration so policy
+/// cannot admit a value that inventory lookup would later reject.
+pub(crate) fn validate_display_policy_id(display_id: &str) -> bool {
+    display::validate_display_id(display_id).is_ok()
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DisplayPolicyRejection {
+    InvalidPolicy,
+    PersistenceFailed,
+    IpcUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DisplayPolicyApplyState {
+    Applied,
+    PendingReconciliation,
+    Rejected(DisplayPolicyRejection),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct DisplayPolicyApplyOutcome {
+    pub state: DisplayPolicyApplyState,
+    pub changed: bool,
+}
+
+#[derive(Clone, Debug)]
+struct PersistedDisplayPolicy {
+    selected_display_id: Option<String>,
+    fallback_to_primary: bool,
+}
+
+/// Backing store for the persisted display policy. Production reads and writes
+/// the real `LocalConfig`; the decision logic in
+/// [`persist_and_apply_display_policy_update_in`] is shared verbatim so tests
+/// can drive the persistence outcomes (`Ok(false)`, `Err`) that a healthy
+/// filesystem will not produce on demand.
+pub(crate) trait DisplayPolicyStore {
+    fn get(&self, key: &str) -> String;
+    fn set_options_atomic(&self, updates: &[(String, String)]) -> ResultType<bool>;
+}
+
+pub(crate) struct LocalConfigDisplayPolicyStore;
+
+impl DisplayPolicyStore for LocalConfigDisplayPolicyStore {
+    fn get(&self, key: &str) -> String {
+        hbb_common::config::LocalConfig::get_option(key)
+    }
+
+    fn set_options_atomic(&self, updates: &[(String, String)]) -> ResultType<bool> {
+        hbb_common::config::LocalConfig::set_options_atomic(updates)
+    }
+}
+
+fn registered_live_state() -> Option<Arc<SharedState>> {
+    LIVE_STATE.lock().unwrap().as_ref().and_then(Weak::upgrade)
+}
+
+/// Maps an already-reconciled live state onto the ACK outcome. Kept separate so
+/// the Condvar path and the direct path cannot drift apart.
+fn outcome_for_live_state(
+    state: &SharedState,
+    policy: &PersistedDisplayPolicy,
+    changed: bool,
+) -> DisplayPolicyApplyOutcome {
+    if state.display_policy_matches(
+        policy.selected_display_id.as_deref(),
+        policy.fallback_to_primary,
+    ) {
+        DisplayPolicyApplyOutcome {
+            state: DisplayPolicyApplyState::Applied,
+            changed,
+        }
+    } else {
+        DisplayPolicyApplyOutcome {
+            state: DisplayPolicyApplyState::Rejected(DisplayPolicyRejection::IpcUnavailable),
+            changed: false,
+        }
+    }
+}
+
+fn publish_display_policy(
+    policy: &PersistedDisplayPolicy,
+    changed: bool,
+) -> DisplayPolicyApplyOutcome {
+    let Some(state) = registered_live_state() else {
+        return DisplayPolicyApplyOutcome {
+            state: DisplayPolicyApplyState::PendingReconciliation,
+            changed,
+        };
+    };
+    state.reconcile_display_policy(
+        policy.selected_display_id.as_deref(),
+        policy.fallback_to_primary,
+    );
+    outcome_for_live_state(&state, policy, changed)
+}
+
+fn wait_for_display_policy_reconciliation(
+    policy: &PersistedDisplayPolicy,
+    changed: bool,
+    timeout: Duration,
+) -> DisplayPolicyApplyOutcome {
+    let unavailable = DisplayPolicyApplyOutcome {
+        state: DisplayPolicyApplyState::Rejected(DisplayPolicyRejection::IpcUnavailable),
+        changed: false,
+    };
+    let started = Instant::now();
+    let mut live = LIVE_STATE.lock().unwrap();
+    loop {
+        if let Some(state) = live.as_ref().and_then(Weak::upgrade) {
+            drop(live);
+            return outcome_for_live_state(&state, policy, changed);
+        }
+        let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+            return unavailable;
+        };
+        let (next, wait_result) = LIVE_STATE_RECONCILED.wait_timeout(live, remaining).unwrap();
+        live = next;
+        if wait_result.timed_out() {
+            // A registration landing exactly at expiry must not be reported as
+            // unavailable, so check the predicate once more before giving up.
+            return match live.as_ref().and_then(Weak::upgrade) {
+                Some(state) => {
+                    drop(live);
+                    outcome_for_live_state(&state, policy, changed)
+                }
+                None => unavailable,
+            };
+        }
+    }
+}
+
+/// Persists the complete partial update atomically, then publishes it to the
+/// live state while startup reconciliation is excluded. A successful ACK is
+/// possible only after the live state contains the complete persisted policy.
+pub(crate) fn persist_and_apply_display_policy_update(
+    selected_display_id: Option<&str>,
+    fallback_to_primary: Option<bool>,
+) -> DisplayPolicyApplyOutcome {
+    persist_and_apply_display_policy_update_in(
+        &LocalConfigDisplayPolicyStore,
+        selected_display_id,
+        fallback_to_primary,
+        DISPLAY_POLICY_RECONCILIATION_TIMEOUT,
+    )
+}
+
+fn persist_and_apply_display_policy_update_in<S: DisplayPolicyStore>(
+    store: &S,
+    selected_display_id: Option<&str>,
+    fallback_to_primary: Option<bool>,
+    reconciliation_timeout: Duration,
+) -> DisplayPolicyApplyOutcome {
+    let rejected = |rejection| DisplayPolicyApplyOutcome {
+        state: DisplayPolicyApplyState::Rejected(rejection),
+        changed: false,
+    };
+    if selected_display_id
+        .map(|display_id| !validate_display_policy_id(display_id))
+        .unwrap_or(false)
+        || (selected_display_id.is_none() && fallback_to_primary.is_none())
+    {
+        return rejected(DisplayPolicyRejection::InvalidPolicy);
+    }
+
+    let pending = {
+        let _policy_update = DISPLAY_POLICY_UPDATE.lock().unwrap();
+
+        // The persisted selection is re-validated exactly as startup does in
+        // `load_display_policy`. Without this, an unrelated fallback-only update
+        // would promote a corrupted identifier into the live state and the
+        // heartbeat, and the next restart would silently drop it again.
+        let stored_selected = store.get(SELECTED_DISPLAY_ID_OPTION_KEY);
+        let stored_selection_is_corrupt =
+            !stored_selected.is_empty() && !validate_display_policy_id(&stored_selected);
+        if stored_selection_is_corrupt
+            && !INVALID_STORED_SELECTION_WARNING_EMITTED.swap(true, Ordering::Relaxed)
+        {
+            log::warn!("[screencam] discarding invalid persisted display selection");
+        }
+        let current_selected = (!stored_selected.is_empty() && !stored_selection_is_corrupt)
+            .then_some(stored_selected);
+        let current_fallback = store.get(FALLBACK_TO_PRIMARY_OPTION_KEY) != "N";
+
+        let selected_changed = selected_display_id
+            .map(|display_id| {
+                current_selected
+                    .as_deref()
+                    .map_or(true, |current| !current.eq_ignore_ascii_case(display_id))
+            })
+            .unwrap_or(false);
+        let fallback_changed = fallback_to_primary
+            .map(|fallback| fallback != current_fallback)
+            .unwrap_or(false);
+        // A corrupt stored selection is repaired in the same write, so the file
+        // never keeps a value the live state and heartbeat refuse to show.
+        let clear_stale_selection = stored_selection_is_corrupt && !selected_changed;
+        let changed = selected_changed || fallback_changed || clear_stale_selection;
+
+        let policy = PersistedDisplayPolicy {
+            selected_display_id: if selected_changed {
+                selected_display_id.map(str::to_owned)
+            } else {
+                current_selected
+            },
+            fallback_to_primary: fallback_to_primary.unwrap_or(current_fallback),
+        };
+
+        if changed {
+            let mut updates = Vec::with_capacity(2);
+            if selected_changed {
+                updates.push((
+                    SELECTED_DISPLAY_ID_OPTION_KEY.to_owned(),
+                    selected_display_id.unwrap_or_default().to_owned(),
+                ));
+            } else if clear_stale_selection {
+                updates.push((SELECTED_DISPLAY_ID_OPTION_KEY.to_owned(), String::new()));
+            }
+            if fallback_changed {
+                updates.push((
+                    FALLBACK_TO_PRIMARY_OPTION_KEY.to_owned(),
+                    if policy.fallback_to_primary { "Y" } else { "N" }.to_owned(),
+                ));
+            }
+            match store.set_options_atomic(&updates) {
+                // Only `Ok(true)` means the requested configuration reached the
+                // file. Publishing on anything else would leave the live state
+                // ahead of the persisted policy.
+                Ok(true) => {}
+                Ok(false) => {
+                    if !POLICY_NOT_PERSISTED_WARNING_EMITTED.swap(true, Ordering::Relaxed) {
+                        log::warn!(
+                            "[screencam] display policy was not stored; refusing to publish it"
+                        );
+                    }
+                    return rejected(DisplayPolicyRejection::PersistenceFailed);
+                }
+                Err(_) => return rejected(DisplayPolicyRejection::PersistenceFailed),
+            }
+        }
+        let outcome = publish_display_policy(&policy, changed);
+        (policy, outcome)
+    };
+
+    if pending.1.state == DisplayPolicyApplyState::PendingReconciliation {
+        wait_for_display_policy_reconciliation(
+            &pending.0,
+            pending.1.changed,
+            reconciliation_timeout,
+        )
+    } else {
+        pending.1
+    }
+}
+
+fn register_and_reconcile_display_policy(state: &Arc<SharedState>) {
+    register_and_reconcile_display_policy_with(state, load_display_policy);
+}
+
+fn register_and_reconcile_display_policy_with<F>(state: &Arc<SharedState>, load_policy: F)
+where
+    F: FnOnce() -> (Option<String>, bool),
+{
+    let _policy_update = DISPLAY_POLICY_UPDATE.lock().unwrap();
+    let (selected_display_id, fallback_to_primary) = load_policy();
+    state.reconcile_display_policy(selected_display_id.as_deref(), fallback_to_primary);
+    *LIVE_STATE.lock().unwrap() = Some(Arc::downgrade(state));
+    LIVE_STATE_RECONCILED.notify_all();
+}
+
+/// Produces the display portion of the heartbeat from one cloned runtime
+/// snapshot. The state lock is released before JSON serialization or HTTP.
+pub(crate) fn heartbeat_display_status() -> Option<serde_json::Value> {
+    let state = {
+        let live = LIVE_STATE.lock().unwrap();
+        live.as_ref().and_then(Weak::upgrade)
+    }?;
+    let snapshot = state.display_snapshot();
+    Some(heartbeat_display_status_from_snapshot(snapshot))
+}
+
+pub(crate) fn heartbeat_initial_display_status() -> serde_json::Value {
+    let selected =
+        hbb_common::config::LocalConfig::get_option_from_file(SELECTED_DISPLAY_ID_OPTION_KEY);
+    let selected_display_id =
+        (!selected.is_empty() && validate_display_policy_id(&selected)).then_some(selected);
+    heartbeat_display_status_from_snapshot(display::DisplayRuntimeState {
+        available_displays: Vec::new(),
+        selected_display_id,
+        active_display_id: None,
+        fallback_active: false,
+        display_warning: None,
+    })
+}
+
+fn heartbeat_display_status_from_snapshot(
+    snapshot: display::DisplayRuntimeState,
+) -> serde_json::Value {
+    let available_displays = snapshot
+        .available_displays
+        .into_iter()
+        .map(|display| {
+            serde_json::json!({
+                "display_id": display.display_id,
+                "name": display.name,
+                "index": display.index,
+                "width": display.width,
+                "height": display.height,
+                "primary": display.primary,
+                "connected": display.connected,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "available_displays": available_displays,
+        "selected_display_id": snapshot.selected_display_id,
+        "active_display_id": snapshot.active_display_id,
+        "fallback_active": snapshot.fallback_active,
+        "display_warning": snapshot.display_warning,
+    })
+}
+
 struct ResolvedCapturePlan<D> {
     generation: u64,
     selected: display::CapturableDisplay<D>,
@@ -475,8 +893,10 @@ pub fn start(cfg: ScreenCamConfig) {
         // whatever actually failed. A session hitting DESCRIBE while nothing
         // is capturing just gets a 503 until capture_loop comes back up.
         let state = Arc::new(SharedState::new());
+        register_and_reconcile_display_policy(&state);
         if let Err(e) = rtsp::start_listener(cfg.rtsp_port, state.clone()) {
             log::error!("[screencam] failed to start RTSP listener, giving up: {e:?}");
+            *LIVE_STATE.lock().unwrap() = None;
             return;
         }
         // Best-effort: WS-Discovery needs UDP 3702, which some other ONVIF
@@ -1053,6 +1473,148 @@ mod delivery2_tests {
     use std::sync::atomic::AtomicUsize;
     use std::thread;
 
+    static DISPLAY_POLICY_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Serializes every test that touches the process-wide policy globals and
+    /// restores all of them on drop, so a failing test cannot leak state into
+    /// the next one: `LIVE_STATE`, the two `LocalConfig` keys and the storage
+    /// path the real `set_options_atomic` writes to. `DISPLAY_POLICY_UPDATE` is
+    /// taken and released by the code under test itself.
+    struct DisplayPolicyTestGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        app_name: String,
+        redirected_root: Option<std::path::PathBuf>,
+        previous_selected: String,
+        previous_fallback: String,
+    }
+
+    impl DisplayPolicyTestGuard {
+        fn new() -> Self {
+            // Tolerate poisoning: a panicking test must not cascade into the
+            // rest of the policy suite.
+            let _lock = DISPLAY_POLICY_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Force LOCAL_CONFIG to load from the real file *before* the storage
+            // path is redirected, so the developer's configuration is preserved
+            // in memory and restored untouched on drop.
+            let previous_selected =
+                hbb_common::config::LocalConfig::get_option(SELECTED_DISPLAY_ID_OPTION_KEY);
+            let previous_fallback =
+                hbb_common::config::LocalConfig::get_option(FALLBACK_TO_PRIMARY_OPTION_KEY);
+            let app_name = hbb_common::config::APP_NAME.read().unwrap().clone();
+            *hbb_common::config::APP_NAME.write().unwrap() =
+                format!("sehcontrol-screencam-test-{}", uuid::Uuid::new_v4());
+            let redirected_root = hbb_common::config::Config::file()
+                .parent()
+                .and_then(std::path::Path::parent)
+                .map(std::path::Path::to_path_buf);
+            *LIVE_STATE.lock().unwrap() = None;
+            Self {
+                _lock,
+                app_name,
+                redirected_root,
+                previous_selected,
+                previous_fallback,
+            }
+        }
+
+        fn seed(&self, selected: &str, fallback: &str) {
+            hbb_common::config::LocalConfig::set_option(
+                SELECTED_DISPLAY_ID_OPTION_KEY.to_owned(),
+                selected.to_owned(),
+            );
+            hbb_common::config::LocalConfig::set_option(
+                FALLBACK_TO_PRIMARY_OPTION_KEY.to_owned(),
+                fallback.to_owned(),
+            );
+        }
+
+        fn stored(&self, key: &str) -> String {
+            hbb_common::config::LocalConfig::get_option(key)
+        }
+
+        fn stored_on_disk(&self, key: &str) -> String {
+            hbb_common::config::LocalConfig::get_option_from_file(key)
+        }
+    }
+
+    impl Drop for DisplayPolicyTestGuard {
+        fn drop(&mut self) {
+            *LIVE_STATE.lock().unwrap() = None;
+            // Restore the two keys while still redirected, so the real
+            // configuration file is never rewritten by the test suite.
+            hbb_common::config::LocalConfig::set_option(
+                SELECTED_DISPLAY_ID_OPTION_KEY.to_owned(),
+                self.previous_selected.clone(),
+            );
+            hbb_common::config::LocalConfig::set_option(
+                FALLBACK_TO_PRIMARY_OPTION_KEY.to_owned(),
+                self.previous_fallback.clone(),
+            );
+            if let Some(root) = &self.redirected_root {
+                let _ = std::fs::remove_dir_all(root);
+            }
+            *hbb_common::config::APP_NAME.write().unwrap() = self.app_name.clone();
+        }
+    }
+
+    enum StubStoreOutcome {
+        Stored,
+        NotStored,
+        Failed,
+    }
+
+    /// Drives the persistence outcomes a healthy filesystem will not produce on
+    /// demand. The decision logic under test is the production one — only the
+    /// store behind it is substituted.
+    struct StubPolicyStore {
+        selected: String,
+        fallback: String,
+        outcome: StubStoreOutcome,
+        writes: Mutex<Vec<Vec<(String, String)>>>,
+    }
+
+    impl StubPolicyStore {
+        fn new(selected: &str, fallback: &str, outcome: StubStoreOutcome) -> Self {
+            Self {
+                selected: selected.to_owned(),
+                fallback: fallback.to_owned(),
+                outcome,
+                writes: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl DisplayPolicyStore for StubPolicyStore {
+        fn get(&self, key: &str) -> String {
+            if key == SELECTED_DISPLAY_ID_OPTION_KEY {
+                self.selected.clone()
+            } else {
+                self.fallback.clone()
+            }
+        }
+
+        fn set_options_atomic(&self, updates: &[(String, String)]) -> ResultType<bool> {
+            self.writes.lock().unwrap().push(updates.to_vec());
+            match self.outcome {
+                StubStoreOutcome::Stored => Ok(true),
+                StubStoreOutcome::NotStored => Ok(false),
+                StubStoreOutcome::Failed => Err(anyhow!("simulated persistence failure")),
+            }
+        }
+    }
+
+    fn registered_state(selected: Option<&str>, fallback: bool) -> Arc<SharedState> {
+        let state = Arc::new(SharedState::new_with_display_policy(
+            selected.map(str::to_owned),
+            fallback,
+        ));
+        let policy = (selected.map(str::to_owned), fallback);
+        register_and_reconcile_display_policy_with(&state, move || policy);
+        state
+    }
+
     fn available_display(
         display_id: &str,
         index: usize,
@@ -1118,6 +1680,482 @@ mod delivery2_tests {
         let (resized_update, _) = state.apply_display_inventory(&resized);
         assert!(resized_update.requires_reconfigure);
         assert_eq!(state.reconfigure_generation.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn every_effective_display_policy_change_reconfigures_once() {
+        let state = SharedState::new_with_display_policy(None, true);
+        let displays = inventory_with(vec![
+            available_display(r"\\.\DISPLAY1", 0, 1920, 1080, true),
+            available_display(r"\\.\DISPLAY2", 1, 1920, 1080, false),
+        ]);
+        let (initial, generation) = state.apply_display_inventory(&displays);
+        assert!(state.activate_display_for_generation(generation, &initial.resolution));
+
+        // Selecting the display already resolved as primary still changes the
+        // persistent intent and therefore advances exactly once.
+        assert!(state.apply_display_policy(Some(r"\\.\display1"), None));
+        assert_eq!(
+            state.reconfigure_generation.load(Ordering::SeqCst),
+            generation.wrapping_add(1)
+        );
+        assert_eq!(
+            state.display_snapshot().selected_display_id.as_deref(),
+            Some(r"\\.\display1")
+        );
+
+        assert!(state.apply_display_policy(Some(r"\\.\DISPLAY2"), None));
+        assert_eq!(
+            state.reconfigure_generation.load(Ordering::SeqCst),
+            generation.wrapping_add(2)
+        );
+        assert!(!state.apply_display_policy(Some(r"\\.\display2"), None));
+    }
+
+    #[test]
+    fn unavailable_selection_and_fallback_changes_advance_policy_generation() {
+        let state = SharedState::new_with_display_policy(Some(r"\\.\DISPLAY8".to_owned()), true);
+        let displays = inventory_with(vec![available_display(
+            r"\\.\DISPLAY1",
+            0,
+            1920,
+            1080,
+            true,
+        )]);
+        let (_, generation) = state.apply_display_inventory(&displays);
+
+        assert!(state.apply_display_policy(Some(r"\\.\DISPLAY9"), Some(false)));
+        assert_eq!(
+            state.reconfigure_generation.load(Ordering::SeqCst),
+            generation.wrapping_add(1)
+        );
+        assert!(!state.apply_display_policy(Some(r"\\.\display9"), Some(false)));
+    }
+
+    #[test]
+    fn fallback_policy_can_resolve_an_unavailable_selection_once() {
+        let state = SharedState::new_with_display_policy(Some(r"\\.\DISPLAY9".to_owned()), false);
+        let displays = inventory_with(vec![available_display(
+            r"\\.\DISPLAY1",
+            3,
+            1920,
+            1080,
+            true,
+        )]);
+        let (_, generation) = state.apply_display_inventory(&displays);
+        assert_eq!(generation, 0);
+
+        assert!(state.apply_display_policy(None, Some(true)));
+        assert_eq!(state.reconfigure_generation.load(Ordering::SeqCst), 1);
+        assert!(!state.apply_display_policy(None, Some(true)));
+        let snapshot = state.display_snapshot();
+        assert_eq!(
+            snapshot.selected_display_id.as_deref(),
+            Some(r"\\.\DISPLAY9")
+        );
+        assert_eq!(snapshot.active_display_id, None);
+    }
+
+    #[test]
+    fn heartbeat_display_snapshot_keeps_selected_active_and_warning_together() {
+        let snapshot = display::DisplayRuntimeState {
+            available_displays: vec![available_display(r"\\.\DISPLAY9", 4, 1360, 768, true)],
+            selected_display_id: Some(r"\\.\DISPLAY2".to_owned()),
+            active_display_id: Some(r"\\.\DISPLAY9".to_owned()),
+            fallback_active: true,
+            display_warning: Some("selected display is unavailable".to_owned()),
+        };
+        let value = heartbeat_display_status_from_snapshot(snapshot);
+        assert_eq!(value["available_displays"][0]["index"], 4);
+        assert_eq!(value["selected_display_id"], r"\\.\DISPLAY2");
+        assert_eq!(value["active_display_id"], r"\\.\DISPLAY9");
+        assert_eq!(value["fallback_active"], true);
+        assert_eq!(value["display_warning"], "selected display is unavailable");
+    }
+
+    #[test]
+    fn heartbeat_display_snapshot_emits_null_warning_without_an_active_display() {
+        let value = heartbeat_display_status_from_snapshot(display::DisplayRuntimeState {
+            available_displays: Vec::new(),
+            selected_display_id: None,
+            active_display_id: None,
+            fallback_active: false,
+            display_warning: None,
+        });
+        assert!(value["available_displays"].as_array().unwrap().is_empty());
+        assert!(value["selected_display_id"].is_null());
+        assert!(value["active_display_id"].is_null());
+        assert!(value["display_warning"].is_null());
+    }
+
+    #[test]
+    fn initial_heartbeat_shape_contains_every_dynamic_display_field() {
+        let value = heartbeat_display_status_from_snapshot(display::DisplayRuntimeState {
+            available_displays: Vec::new(),
+            selected_display_id: Some(r"\\.\DISPLAY2".to_owned()),
+            active_display_id: None,
+            fallback_active: false,
+            display_warning: None,
+        });
+        assert!(value["available_displays"].as_array().unwrap().is_empty());
+        assert_eq!(value["selected_display_id"], r"\\.\DISPLAY2");
+        assert!(value["active_display_id"].is_null());
+        assert_eq!(value["fallback_active"], false);
+        assert!(value["display_warning"].is_null());
+    }
+
+    #[test]
+    fn startup_registration_reconciles_policy_loaded_after_state_creation() {
+        let _guard = DisplayPolicyTestGuard::new();
+        let state = Arc::new(SharedState::new_with_display_policy(
+            Some(r"\\.\DISPLAY1".to_owned()),
+            true,
+        ));
+        register_and_reconcile_display_policy_with(&state, || {
+            (Some(r"\\.\DISPLAY2".to_owned()), false)
+        });
+        let snapshot = state.display_snapshot();
+        assert_eq!(
+            snapshot.selected_display_id.as_deref(),
+            Some(r"\\.\DISPLAY2")
+        );
+        assert_eq!(state.reconfigure_generation.load(Ordering::SeqCst), 1);
+        *LIVE_STATE.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn live_policy_is_published_and_generation_advances_before_applied() {
+        let _guard = DisplayPolicyTestGuard::new();
+        let state = Arc::new(SharedState::new_with_display_policy(
+            Some(r"\\.\DISPLAY1".to_owned()),
+            true,
+        ));
+        register_and_reconcile_display_policy_with(&state, || {
+            (Some(r"\\.\DISPLAY1".to_owned()), true)
+        });
+        let generation = state.reconfigure_generation.load(Ordering::SeqCst);
+        let policy = PersistedDisplayPolicy {
+            selected_display_id: Some(r"\\.\DISPLAY2".to_owned()),
+            fallback_to_primary: false,
+        };
+        let outcome = publish_display_policy(&policy, true);
+        assert_eq!(outcome.state, DisplayPolicyApplyState::Applied);
+        assert!(outcome.changed);
+        assert_eq!(
+            state.reconfigure_generation.load(Ordering::SeqCst),
+            generation.wrapping_add(1)
+        );
+        assert!(state.display_policy_matches(Some(r"\\.\DISPLAY2"), false));
+        *LIVE_STATE.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn absent_live_state_is_pending_and_times_out_as_ipc_unavailable() {
+        let _guard = DisplayPolicyTestGuard::new();
+        *LIVE_STATE.lock().unwrap() = None;
+        let policy = PersistedDisplayPolicy {
+            selected_display_id: Some(r"\\.\DISPLAY3".to_owned()),
+            fallback_to_primary: true,
+        };
+        assert_eq!(
+            publish_display_policy(&policy, true).state,
+            DisplayPolicyApplyState::PendingReconciliation
+        );
+        let outcome =
+            wait_for_display_policy_reconciliation(&policy, true, Duration::from_millis(10));
+        assert_eq!(
+            outcome,
+            DisplayPolicyApplyOutcome {
+                state: DisplayPolicyApplyState::Rejected(DisplayPolicyRejection::IpcUnavailable),
+                changed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn startup_reconciliation_wakes_pending_policy_before_ack() {
+        let _guard = DisplayPolicyTestGuard::new();
+        *LIVE_STATE.lock().unwrap() = None;
+        let policy = PersistedDisplayPolicy {
+            selected_display_id: Some(r"\\.\DISPLAY4".to_owned()),
+            fallback_to_primary: false,
+        };
+        let waiting_policy = policy.clone();
+        let waiter = thread::spawn(move || {
+            wait_for_display_policy_reconciliation(&waiting_policy, true, Duration::from_secs(1))
+        });
+        thread::sleep(Duration::from_millis(20));
+        let state = Arc::new(SharedState::new_with_display_policy(None, true));
+        register_and_reconcile_display_policy_with(&state, || {
+            (
+                policy.selected_display_id.clone(),
+                policy.fallback_to_primary,
+            )
+        });
+        let outcome = waiter.join().unwrap();
+        assert_eq!(outcome.state, DisplayPolicyApplyState::Applied);
+        assert!(outcome.changed);
+        assert!(state.display_policy_matches(Some(r"\\.\DISPLAY4"), false));
+        *LIVE_STATE.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn idempotent_live_policy_returns_applied_without_generation_change() {
+        let _guard = DisplayPolicyTestGuard::new();
+        let state = Arc::new(SharedState::new_with_display_policy(
+            Some(r"\\.\DISPLAY5".to_owned()),
+            false,
+        ));
+        register_and_reconcile_display_policy_with(&state, || {
+            (Some(r"\\.\DISPLAY5".to_owned()), false)
+        });
+        let generation = state.reconfigure_generation.load(Ordering::SeqCst);
+        let outcome = publish_display_policy(
+            &PersistedDisplayPolicy {
+                selected_display_id: Some(r"\\.\display5".to_owned()),
+                fallback_to_primary: false,
+            },
+            false,
+        );
+        assert_eq!(
+            outcome,
+            DisplayPolicyApplyOutcome {
+                state: DisplayPolicyApplyState::Applied,
+                changed: false,
+            }
+        );
+        assert_eq!(
+            state.reconfigure_generation.load(Ordering::SeqCst),
+            generation
+        );
+        *LIVE_STATE.lock().unwrap() = None;
+    }
+
+    // ---------------------------------------------------------------------
+    // Productive route: these drive `persist_and_apply_display_policy_update`
+    // itself — real LocalConfig reads, real `set_options_atomic`, real
+    // LIVE_STATE publication, real generation accounting and the real ACK
+    // mapping. Only the persistence *outcome* is substituted where a healthy
+    // filesystem cannot produce it on demand.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn productive_policy_update_persists_publishes_and_matches_heartbeat() {
+        let guard = DisplayPolicyTestGuard::new();
+        guard.seed("", "Y");
+        let state = registered_state(None, true);
+        // A real topology, so the new selection actually resolves and the
+        // heartbeat is exercised without a "display unavailable" warning.
+        let displays = inventory_with(vec![
+            available_display(r"\\.\DISPLAY1", 0, 1920, 1080, true),
+            available_display(r"\\.\DISPLAY2", 1, 1360, 768, false),
+        ]);
+        state.apply_display_inventory(&displays);
+        let generation = state.reconfigure_generation.load(Ordering::SeqCst);
+
+        let outcome = persist_and_apply_display_policy_update(Some(r"\\.\DISPLAY2"), Some(false));
+
+        assert_eq!(outcome.state, DisplayPolicyApplyState::Applied);
+        assert!(outcome.changed);
+        // One generation for the whole combined change.
+        assert_eq!(
+            state.reconfigure_generation.load(Ordering::SeqCst),
+            generation.wrapping_add(1)
+        );
+        assert_eq!(
+            guard.stored(SELECTED_DISPLAY_ID_OPTION_KEY),
+            r"\\.\DISPLAY2"
+        );
+        assert_eq!(guard.stored(FALLBACK_TO_PRIMARY_OPTION_KEY), "N");
+        // The file, not only the in-memory copy.
+        assert_eq!(
+            guard.stored_on_disk(SELECTED_DISPLAY_ID_OPTION_KEY),
+            r"\\.\DISPLAY2"
+        );
+        assert_eq!(guard.stored_on_disk(FALLBACK_TO_PRIMARY_OPTION_KEY), "N");
+        // The heartbeat reports the effective policy.
+        let heartbeat = heartbeat_display_status().unwrap();
+        assert_eq!(heartbeat["selected_display_id"], r"\\.\DISPLAY2");
+        assert_eq!(heartbeat["fallback_active"], false);
+        assert!(heartbeat["display_warning"].is_null());
+        assert_eq!(heartbeat["available_displays"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn productive_policy_update_is_idempotent_for_a_repeated_policy() {
+        let guard = DisplayPolicyTestGuard::new();
+        guard.seed(r"\\.\DISPLAY2", "N");
+        let state = registered_state(Some(r"\\.\DISPLAY2"), false);
+        let generation = state.reconfigure_generation.load(Ordering::SeqCst);
+
+        // Same policy, different ASCII case.
+        let outcome = persist_and_apply_display_policy_update(Some(r"\\.\display2"), Some(false));
+
+        assert_eq!(outcome.state, DisplayPolicyApplyState::Applied);
+        assert!(!outcome.changed);
+        assert_eq!(
+            state.reconfigure_generation.load(Ordering::SeqCst),
+            generation
+        );
+        // The stored casing is left alone.
+        assert_eq!(
+            guard.stored(SELECTED_DISPLAY_ID_OPTION_KEY),
+            r"\\.\DISPLAY2"
+        );
+    }
+
+    #[test]
+    fn productive_policy_update_discards_a_corrupt_stored_selection() {
+        let guard = DisplayPolicyTestGuard::new();
+        guard.seed("not-a-display-id", "Y");
+        let state = registered_state(None, true);
+        let generation = state.reconfigure_generation.load(Ordering::SeqCst);
+
+        // Fallback-only update on top of a corrupted stored selection.
+        let outcome = persist_and_apply_display_policy_update(None, Some(false));
+
+        assert_eq!(outcome.state, DisplayPolicyApplyState::Applied);
+        assert!(outcome.changed);
+        assert_eq!(
+            state.reconfigure_generation.load(Ordering::SeqCst),
+            generation.wrapping_add(1),
+            "the corrupt selection must not cost an extra generation"
+        );
+        // The corrupt identifier never reaches the live state ...
+        assert_eq!(state.display_snapshot().selected_display_id, None);
+        // ... nor the heartbeat ...
+        assert!(heartbeat_display_status().unwrap()["selected_display_id"].is_null());
+        // ... and persistence is left coherent with both.
+        assert_eq!(guard.stored(SELECTED_DISPLAY_ID_OPTION_KEY), "");
+        assert_eq!(guard.stored(FALLBACK_TO_PRIMARY_OPTION_KEY), "N");
+        assert_eq!(guard.stored_on_disk(SELECTED_DISPLAY_ID_OPTION_KEY), "");
+    }
+
+    #[test]
+    fn productive_policy_update_refuses_to_publish_when_nothing_was_stored() {
+        let _guard = DisplayPolicyTestGuard::new();
+        let state = registered_state(None, true);
+        let generation = state.reconfigure_generation.load(Ordering::SeqCst);
+        let store = StubPolicyStore::new("", "Y", StubStoreOutcome::NotStored);
+
+        let outcome = persist_and_apply_display_policy_update_in(
+            &store,
+            Some(r"\\.\DISPLAY3"),
+            None,
+            Duration::from_millis(20),
+        );
+
+        assert_eq!(
+            outcome,
+            DisplayPolicyApplyOutcome {
+                state: DisplayPolicyApplyState::Rejected(DisplayPolicyRejection::PersistenceFailed),
+                changed: false,
+            }
+        );
+        assert_eq!(store.writes.lock().unwrap().len(), 1);
+        assert_eq!(
+            state.reconfigure_generation.load(Ordering::SeqCst),
+            generation
+        );
+        assert_eq!(state.display_snapshot().selected_display_id, None);
+    }
+
+    #[test]
+    fn productive_policy_update_leaves_live_state_untouched_when_persistence_fails() {
+        let _guard = DisplayPolicyTestGuard::new();
+        let state = registered_state(Some(r"\\.\DISPLAY1"), true);
+        let generation = state.reconfigure_generation.load(Ordering::SeqCst);
+        let store = StubPolicyStore::new(r"\\.\DISPLAY1", "Y", StubStoreOutcome::Failed);
+
+        let outcome = persist_and_apply_display_policy_update_in(
+            &store,
+            Some(r"\\.\DISPLAY7"),
+            Some(false),
+            Duration::from_millis(20),
+        );
+
+        assert_eq!(
+            outcome,
+            DisplayPolicyApplyOutcome {
+                state: DisplayPolicyApplyState::Rejected(DisplayPolicyRejection::PersistenceFailed),
+                changed: false,
+            }
+        );
+        assert_eq!(
+            state.reconfigure_generation.load(Ordering::SeqCst),
+            generation
+        );
+        assert!(state.display_policy_matches(Some(r"\\.\DISPLAY1"), true));
+        assert_eq!(
+            heartbeat_display_status().unwrap()["selected_display_id"],
+            r"\\.\DISPLAY1"
+        );
+    }
+
+    #[test]
+    fn productive_policy_update_times_out_without_live_state() {
+        let _guard = DisplayPolicyTestGuard::new();
+        let store = StubPolicyStore::new("", "Y", StubStoreOutcome::Stored);
+
+        let outcome = persist_and_apply_display_policy_update_in(
+            &store,
+            Some(r"\\.\DISPLAY4"),
+            None,
+            Duration::from_millis(20),
+        );
+
+        assert_eq!(
+            outcome,
+            DisplayPolicyApplyOutcome {
+                state: DisplayPolicyApplyState::Rejected(DisplayPolicyRejection::IpcUnavailable),
+                changed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn productive_policy_update_waits_for_startup_reconciliation() {
+        let _guard = DisplayPolicyTestGuard::new();
+        let registrar = thread::spawn(|| {
+            thread::sleep(Duration::from_millis(30));
+            registered_state(Some(r"\\.\DISPLAY5"), true)
+        });
+        let store = StubPolicyStore::new("", "Y", StubStoreOutcome::Stored);
+
+        let outcome = persist_and_apply_display_policy_update_in(
+            &store,
+            Some(r"\\.\DISPLAY5"),
+            None,
+            Duration::from_secs(2),
+        );
+
+        let state = registrar.join().unwrap();
+        assert_eq!(outcome.state, DisplayPolicyApplyState::Applied);
+        assert!(outcome.changed);
+        assert!(state.display_policy_matches(Some(r"\\.\DISPLAY5"), true));
+    }
+
+    #[test]
+    fn productive_policy_update_rejects_invalid_and_empty_requests() {
+        let _guard = DisplayPolicyTestGuard::new();
+        let store = StubPolicyStore::new("", "Y", StubStoreOutcome::Stored);
+        for (selected, fallback) in [(Some(r"\\.\DISPLAY0"), None), (None, None)] {
+            let outcome = persist_and_apply_display_policy_update_in(
+                &store,
+                selected,
+                fallback,
+                Duration::from_millis(20),
+            );
+            assert_eq!(
+                outcome,
+                DisplayPolicyApplyOutcome {
+                    state: DisplayPolicyApplyState::Rejected(DisplayPolicyRejection::InvalidPolicy),
+                    changed: false,
+                }
+            );
+        }
+        // Nothing was even attempted against the store.
+        assert!(store.writes.lock().unwrap().is_empty());
     }
 
     #[test]

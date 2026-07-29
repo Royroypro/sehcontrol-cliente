@@ -83,6 +83,109 @@ const IPC_TOKEN_RANDOM_BYTES: usize = IPC_TOKEN_LEN / 2;
 const _: () = assert!(IPC_TOKEN_LEN % 2 == 0);
 pub static EXIT_RECV_CLOSE: AtomicBool = AtomicBool::new(true);
 
+#[cfg(all(windows, feature = "screencam"))]
+const SCREENCAM_DISPLAY_POLICY_MAX_BYTES: usize = 256;
+#[cfg(all(windows, feature = "screencam"))]
+static SCREENCAM_POLICY_REJECTION_WARNED: AtomicBool = AtomicBool::new(false);
+#[cfg(all(windows, feature = "screencam"))]
+static SCREENCAM_POLICY_PERSISTENCE_WARNED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(all(windows, feature = "screencam"))]
+fn parse_screencam_display_policy_update(value: &str) -> Option<(Option<String>, Option<bool>)> {
+    if value.is_empty() || value.len() > SCREENCAM_DISPLAY_POLICY_MAX_BYTES {
+        return None;
+    }
+    let policy = serde_json::from_str::<serde_json::Value>(value).ok()?;
+    let object = policy.as_object()?;
+    let selected_display_id = object
+        .get("selected_display_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|display_id| crate::server::screen_cam::validate_display_policy_id(display_id))
+        .map(str::to_owned);
+    let fallback_to_primary = object
+        .get("fallback_to_primary")
+        .and_then(serde_json::Value::as_bool);
+    (selected_display_id.is_some() || fallback_to_primary.is_some())
+        .then_some((selected_display_id, fallback_to_primary))
+}
+
+#[cfg(all(windows, feature = "screencam"))]
+fn screencam_display_policy_ack(applied: bool, changed: bool, error: Option<&str>) -> String {
+    serde_json::json!({
+        "applied": applied,
+        "changed": changed,
+        "error": error,
+    })
+    .to_string()
+}
+
+/// Maps a failed blocking task onto the public NACK. A panicked or cancelled
+/// task must never take the IPC listener down, and the client must still see
+/// one of the four public codes.
+#[cfg(all(windows, feature = "screencam"))]
+fn screencam_display_policy_join_failure_ack(error: &tokio::task::JoinError) -> String {
+    log::warn!("[screencam] display policy task did not complete: {error}");
+    screencam_display_policy_ack(false, false, Some("ipc_unavailable"))
+}
+
+/// Runs the policy apply off the IPC runtime.
+///
+/// `ipc::start` drives a `current_thread` runtime and every connection is
+/// spawned onto that single thread. The apply path reads and persists
+/// configuration and can block on a Condvar until startup reconciliation lands,
+/// so running it inline would stall the accept loop and every other IPC
+/// connection for the whole wait. Persistence and publication still happen
+/// exactly once, inside the blocking task, and the reconciliation timeout is
+/// unchanged.
+#[cfg(all(windows, feature = "screencam"))]
+async fn screencam_display_policy_response(value: String) -> String {
+    tokio::task::spawn_blocking(move || process_screencam_display_policy_update(&value))
+        .await
+        .unwrap_or_else(|error| screencam_display_policy_join_failure_ack(&error))
+}
+
+#[cfg(all(windows, feature = "screencam"))]
+fn process_screencam_display_policy_update(value: &str) -> String {
+    process_screencam_display_policy_update_with(value, |selected, fallback| {
+        crate::server::screen_cam::persist_and_apply_display_policy_update(selected, fallback)
+    })
+}
+
+#[cfg(all(windows, feature = "screencam"))]
+fn process_screencam_display_policy_update_with<F>(value: &str, apply: F) -> String
+where
+    F: FnOnce(Option<&str>, Option<bool>) -> crate::server::screen_cam::DisplayPolicyApplyOutcome,
+{
+    let Some((selected_display_id, fallback_to_primary)) =
+        parse_screencam_display_policy_update(value)
+    else {
+        if !SCREENCAM_POLICY_REJECTION_WARNED.swap(true, Ordering::Relaxed) {
+            log::warn!("[screencam] rejected invalid display policy IPC request");
+        }
+        return screencam_display_policy_ack(false, false, Some("invalid_policy"));
+    };
+    use crate::server::screen_cam::{DisplayPolicyApplyState, DisplayPolicyRejection};
+    let outcome = apply(selected_display_id.as_deref(), fallback_to_primary);
+    match outcome.state {
+        DisplayPolicyApplyState::Applied => {
+            screencam_display_policy_ack(true, outcome.changed, None)
+        }
+        DisplayPolicyApplyState::Rejected(DisplayPolicyRejection::InvalidPolicy) => {
+            screencam_display_policy_ack(false, false, Some("invalid_policy"))
+        }
+        DisplayPolicyApplyState::Rejected(DisplayPolicyRejection::PersistenceFailed) => {
+            if !SCREENCAM_POLICY_PERSISTENCE_WARNED.swap(true, Ordering::Relaxed) {
+                log::warn!("[screencam] failed to persist display policy");
+            }
+            screencam_display_policy_ack(false, false, Some("persistence_failed"))
+        }
+        DisplayPolicyApplyState::PendingReconciliation
+        | DisplayPolicyApplyState::Rejected(DisplayPolicyRejection::IpcUnavailable) => {
+            screencam_display_policy_ack(false, false, Some("ipc_unavailable"))
+        }
+    }
+}
+
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 thread_local! {
     static USE_USER_MAIN_IPC: Cell<bool> = Cell::new(false);
@@ -941,6 +1044,24 @@ async fn handle(data: Data, stream: &mut Connection) {
                     } else {
                         updated = false;
                     }
+                } else if name == "screencam-display-policy" {
+                    #[cfg(all(windows, feature = "screencam"))]
+                    {
+                        let response = screencam_display_policy_response(value).await;
+                        updated = serde_json::from_str::<serde_json::Value>(&response)
+                            .ok()
+                            .and_then(|value| value["applied"].as_bool())
+                            .unwrap_or(false);
+                        allow_err!(
+                            stream
+                                .send(&Data::Config((name.clone(), Some(response))))
+                                .await
+                        );
+                    }
+                    #[cfg(not(all(windows, feature = "screencam")))]
+                    {
+                        updated = false;
+                    }
                 } else {
                     return;
                 }
@@ -1552,6 +1673,24 @@ pub async fn set_config_async(name: &str, value: String) -> ResultType<()> {
     Ok(())
 }
 
+#[cfg(all(windows, feature = "screencam"))]
+#[tokio::main(flavor = "current_thread")]
+pub async fn set_screencam_display_policy_with_ack(value: String) -> ResultType<String> {
+    const ACK_TIMEOUT_MS: u64 = 1_000;
+    let mut connection = connect(ACK_TIMEOUT_MS, "").await?;
+    connection
+        .send_config("screencam-display-policy", value)
+        .await?;
+    if let Some(Data::Config((name, Some(response)))) =
+        connection.next_timeout(ACK_TIMEOUT_MS).await?
+    {
+        if name == "screencam-display-policy" {
+            return Ok(response);
+        }
+    }
+    bail!("ScreenCam display policy IPC did not return an acknowledgement")
+}
+
 #[tokio::main(flavor = "current_thread")]
 pub async fn set_data(data: &Data) -> ResultType<()> {
     set_data_async(data).await
@@ -2159,6 +2298,190 @@ mod test {
     fn verify_ffi_enum_data_size() {
         println!("{}", std::mem::size_of::<Data>());
         assert!(std::mem::size_of::<Data>() <= 120);
+    }
+
+    #[cfg(all(windows, feature = "screencam"))]
+    #[test]
+    fn screencam_display_policy_ipc_accepts_valid_fields_independently() {
+        let both = parse_screencam_display_policy_update(
+            r#"{"selected_display_id":"\\\\.\\DISPLAY2","fallback_to_primary":false}"#,
+        )
+        .unwrap();
+        assert_eq!(both.0.as_deref(), Some(r"\\.\DISPLAY2"));
+        assert_eq!(both.1, Some(false));
+
+        let fallback_only = parse_screencam_display_policy_update(
+            r#"{"selected_display_id":"invalid","fallback_to_primary":true}"#,
+        )
+        .unwrap();
+        assert_eq!(fallback_only.0, None);
+        assert_eq!(fallback_only.1, Some(true));
+        assert!(parse_screencam_display_policy_update(r#"{"fallback_to_primary":"Y"}"#).is_none());
+    }
+
+    #[cfg(all(windows, feature = "screencam"))]
+    #[test]
+    fn screencam_display_policy_ipc_enforces_payload_limit_before_json() {
+        let base = r#"{"fallback_to_primary":true}"#;
+        let at_limit = format!(
+            "{base}{}",
+            " ".repeat(SCREENCAM_DISPLAY_POLICY_MAX_BYTES - base.len())
+        );
+        assert_eq!(at_limit.len(), SCREENCAM_DISPLAY_POLICY_MAX_BYTES);
+        assert!(parse_screencam_display_policy_update(&at_limit).is_some());
+
+        let over_limit = format!("{at_limit} ");
+        assert!(parse_screencam_display_policy_update(&over_limit).is_none());
+        assert!(parse_screencam_display_policy_update("").is_none());
+    }
+
+    #[cfg(all(windows, feature = "screencam"))]
+    #[test]
+    fn screencam_display_policy_ack_has_stable_shape() {
+        let ack = serde_json::from_str::<serde_json::Value>(&screencam_display_policy_ack(
+            true, false, None,
+        ))
+        .unwrap();
+        assert_eq!(ack["applied"], true);
+        assert_eq!(ack["changed"], false);
+        assert!(ack["error"].is_null());
+
+        let nack = serde_json::from_str::<serde_json::Value>(&screencam_display_policy_ack(
+            false,
+            false,
+            Some("invalid_policy"),
+        ))
+        .unwrap();
+        assert_eq!(nack["applied"], false);
+        assert_eq!(nack["error"], "invalid_policy");
+    }
+
+    #[cfg(all(windows, feature = "screencam"))]
+    #[test]
+    fn screencam_display_policy_productive_route_acks_only_after_apply() {
+        let mut called = false;
+        let ack = process_screencam_display_policy_update_with(
+            r#"{"selected_display_id":"\\\\.\\DISPLAY4","fallback_to_primary":false}"#,
+            |selected, fallback| {
+                called = true;
+                assert_eq!(selected, Some(r"\\.\DISPLAY4"));
+                assert_eq!(fallback, Some(false));
+                crate::server::screen_cam::DisplayPolicyApplyOutcome {
+                    state: crate::server::screen_cam::DisplayPolicyApplyState::Applied,
+                    changed: true,
+                }
+            },
+        );
+        assert!(called);
+        let ack = serde_json::from_str::<serde_json::Value>(&ack).unwrap();
+        assert_eq!(ack["applied"], true);
+        assert_eq!(ack["changed"], true);
+    }
+
+    #[cfg(all(windows, feature = "screencam"))]
+    #[test]
+    fn screencam_display_policy_productive_route_nacks_persistence_failure() {
+        let nack = process_screencam_display_policy_update_with(
+            r#"{"fallback_to_primary":true}"#,
+            |_, _| crate::server::screen_cam::DisplayPolicyApplyOutcome {
+                state: crate::server::screen_cam::DisplayPolicyApplyState::Rejected(
+                    crate::server::screen_cam::DisplayPolicyRejection::PersistenceFailed,
+                ),
+                changed: false,
+            },
+        );
+        let nack = serde_json::from_str::<serde_json::Value>(&nack).unwrap();
+        assert_eq!(nack["applied"], false);
+        assert_eq!(nack["changed"], false);
+        assert_eq!(nack["error"], "persistence_failed");
+    }
+
+    #[cfg(all(windows, feature = "screencam"))]
+    #[test]
+    fn screencam_display_policy_route_nacks_unpublished_state() {
+        for state in [
+            crate::server::screen_cam::DisplayPolicyApplyState::PendingReconciliation,
+            crate::server::screen_cam::DisplayPolicyApplyState::Rejected(
+                crate::server::screen_cam::DisplayPolicyRejection::IpcUnavailable,
+            ),
+        ] {
+            let nack = process_screencam_display_policy_update_with(
+                r#"{"fallback_to_primary":true}"#,
+                |_, _| crate::server::screen_cam::DisplayPolicyApplyOutcome {
+                    state,
+                    changed: true,
+                },
+            );
+            let nack = serde_json::from_str::<serde_json::Value>(&nack).unwrap();
+            assert_eq!(nack["applied"], false);
+            assert_eq!(nack["changed"], false);
+            assert_eq!(nack["error"], "ipc_unavailable");
+        }
+    }
+
+    #[cfg(all(windows, feature = "screencam"))]
+    #[test]
+    fn screencam_display_policy_runs_off_the_current_thread_runtime() {
+        use std::sync::atomic::AtomicU32;
+        use std::sync::Arc;
+
+        // Same runtime flavor the IPC listener uses.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let stop = Arc::new(AtomicBool::new(false));
+            let ticks = Arc::new(AtomicU32::new(0));
+            let ticker_stop = Arc::clone(&stop);
+            let ticker_ticks = Arc::clone(&ticks);
+            // Stands in for the accept loop and every other IPC connection: it
+            // can only advance while the runtime thread is free.
+            let ticker = tokio::spawn(async move {
+                while !ticker_stop.load(Ordering::Relaxed) {
+                    ticker_ticks.fetch_add(1, Ordering::Relaxed);
+                    tokio::task::yield_now().await;
+                }
+            });
+
+            let response =
+                screencam_display_policy_response(r#"{"selected_display_id":"nope"}"#.to_owned())
+                    .await;
+            stop.store(true, Ordering::Relaxed);
+            ticker.await.unwrap();
+
+            // The apply produced a well-formed public NACK ...
+            let ack = serde_json::from_str::<serde_json::Value>(&response).unwrap();
+            assert_eq!(ack["applied"], false);
+            assert_eq!(ack["error"], "invalid_policy");
+            // ... without ever parking the runtime thread.
+            assert!(
+                ticks.load(Ordering::Relaxed) > 0,
+                "the IPC runtime made no progress while the policy was applied"
+            );
+        });
+    }
+
+    #[cfg(all(windows, feature = "screencam"))]
+    #[test]
+    fn screencam_display_policy_join_failure_is_reported_as_ipc_unavailable() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let error = runtime.block_on(async {
+            tokio::task::spawn_blocking(|| panic!("policy task panicked"))
+                .await
+                .unwrap_err()
+        });
+        assert!(error.is_panic());
+        let nack = serde_json::from_str::<serde_json::Value>(
+            &screencam_display_policy_join_failure_ack(&error),
+        )
+        .unwrap();
+        assert_eq!(nack["applied"], false);
+        assert_eq!(nack["changed"], false);
+        assert_eq!(nack["error"], "ipc_unavailable");
     }
 
     #[cfg(any(target_os = "linux", target_os = "macos"))]

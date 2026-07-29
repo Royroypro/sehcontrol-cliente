@@ -100,30 +100,84 @@ impl InfoUploaded {
 /// copy is already correct.
 #[cfg(all(windows, feature = "screencam"))]
 fn screen_cam_status() -> Option<Value> {
-    let raw_state = LocalConfig::get_option("screencam-actual-state");
-    if raw_state.is_empty() {
-        return None;
-    }
-    let actual_state = if raw_state == "running" { "running" } else { "stopped" };
+    let display_status = crate::server::screen_cam::heartbeat_display_status();
+    Some(build_screen_cam_status(ScreenCamHeartbeatStatus {
+        raw_state: LocalConfig::get_option("screencam-actual-state"),
+        licensed: LocalConfig::get_option_from_file("screencam-licensed") == "Y",
+        desired_state: LocalConfig::get_option_from_file("screencam-desired-state"),
+        encoder: LocalConfig::get_option("screencam-encoder"),
+        last_error: LocalConfig::get_option("screencam-last-error"),
+        rtsp_clients: LocalConfig::get_option("screencam-rtsp-clients")
+            .parse::<i64>()
+            .ok(),
+        local_ip: LocalConfig::get_option("screencam-local-ip"),
+        rtsp_port: LocalConfig::get_option("screencam-rtsp-port")
+            .parse::<i64>()
+            .ok(),
+        rtsp_user: LocalConfig::get_option_from_file("screencam-rtsp-user"),
+        display_status: display_status
+            .unwrap_or_else(crate::server::screen_cam::heartbeat_initial_display_status),
+    }))
+}
+
+#[cfg(all(windows, feature = "screencam"))]
+struct ScreenCamHeartbeatStatus {
+    raw_state: String,
+    licensed: bool,
+    desired_state: String,
+    encoder: String,
+    last_error: String,
+    rtsp_clients: Option<i64>,
+    local_ip: String,
+    rtsp_port: Option<i64>,
+    rtsp_user: String,
+    display_status: Value,
+}
+
+#[cfg(all(windows, feature = "screencam"))]
+fn build_screen_cam_status(status: ScreenCamHeartbeatStatus) -> Value {
+    let actual_state = if status.raw_state == "running" {
+        "running"
+    } else {
+        "stopped"
+    };
     let mut v = serde_json::Map::new();
     v.insert("actual_state".to_owned(), json!(actual_state));
-    let encoder = LocalConfig::get_option("screencam-encoder");
-    if !encoder.is_empty() {
-        v.insert("encoder".to_owned(), json!(encoder));
+    v.insert(
+        "status".to_owned(),
+        json!(if status.raw_state.is_empty() {
+            "stopped"
+        } else {
+            status.raw_state.as_str()
+        }),
+    );
+    v.insert("licensed".to_owned(), json!(status.licensed));
+    v.insert(
+        "desired_state".to_owned(),
+        json!(if status.desired_state == "running" {
+            "running"
+        } else {
+            "stopped"
+        }),
+    );
+    if !status.encoder.is_empty() {
+        v.insert("encoder".to_owned(), json!(status.encoder));
     }
-    let last_error = LocalConfig::get_option("screencam-last-error");
     v.insert(
         "last_error".to_owned(),
-        if last_error.is_empty() { Value::Null } else { json!(last_error) },
+        if status.last_error.is_empty() {
+            Value::Null
+        } else {
+            json!(status.last_error)
+        },
     );
-    if let Ok(rtsp_clients) = LocalConfig::get_option("screencam-rtsp-clients").parse::<i64>() {
+    if let Some(rtsp_clients) = status.rtsp_clients {
         v.insert("rtsp_clients".to_owned(), json!(rtsp_clients));
     }
-    let local_ip = LocalConfig::get_option("screencam-local-ip");
-    if !local_ip.is_empty() {
-        v.insert("local_ip".to_owned(), json!(local_ip));
+    if !status.local_ip.is_empty() {
+        v.insert("local_ip".to_owned(), json!(status.local_ip));
     }
-    if let Ok(rtsp_port) = LocalConfig::get_option("screencam-rtsp-port").parse::<i64>() {
+    if let Some(rtsp_port) = status.rtsp_port {
         v.insert("rtsp_port".to_owned(), json!(rtsp_port));
     }
     // Lets the panel confirm the credentials it issued actually reached this
@@ -133,21 +187,111 @@ fn screen_cam_status() -> Option<Value> {
     // never the password.
     //
     // Unlike every key above, this one is written by the *UI* process (Dart's
-    // `_persistScreenCamPolicy`), not by screen_cam in this process — so the
+    // `_persistScreenCamPolicyHistory`), not by screen_cam in this process — so the
     // cached `get_option` would never observe a credential rotation and the
     // panel would be told "no auth" forever. Same cross-process staleness the
     // module doc above describes, hence the from-file read here.
-    let rtsp_user = LocalConfig::get_option_from_file("screencam-rtsp-user");
-    v.insert("auth_enabled".to_owned(), json!(!rtsp_user.is_empty()));
-    if !rtsp_user.is_empty() {
-        v.insert("rtsp_user".to_owned(), json!(rtsp_user));
+    v.insert(
+        "auth_enabled".to_owned(),
+        json!(!status.rtsp_user.is_empty()),
+    );
+    if !status.rtsp_user.is_empty() {
+        v.insert("rtsp_user".to_owned(), json!(status.rtsp_user));
     }
-    Some(Value::Object(v))
+    if let Value::Object(display_status) = status.display_status {
+        // `heartbeat_display_status` clones one DisplayRuntimeState while its
+        // lock is held and serializes only after releasing it, so these five
+        // fields always describe the same topology/selection instant.
+        v.extend(display_status);
+    }
+    Value::Object(v)
 }
 
 #[cfg(not(all(windows, feature = "screencam")))]
 fn screen_cam_status() -> Option<Value> {
     None
+}
+
+#[cfg(all(test, windows, feature = "screencam"))]
+mod screen_cam_heartbeat_tests {
+    use super::*;
+
+    fn status_with_display(display_status: Value) -> ScreenCamHeartbeatStatus {
+        ScreenCamHeartbeatStatus {
+            raw_state: String::new(),
+            licensed: false,
+            desired_state: String::new(),
+            encoder: String::new(),
+            last_error: String::new(),
+            rtsp_clients: None,
+            local_ip: String::new(),
+            rtsp_port: None,
+            rtsp_user: String::new(),
+            display_status,
+        }
+    }
+
+    #[test]
+    fn heartbeat_envelope_always_contains_screen_cam_shape_without_live_state() {
+        let screen_cam = build_screen_cam_status(status_with_display(json!({
+            "available_displays": [],
+            "selected_display_id": null,
+            "active_display_id": null,
+            "fallback_active": false,
+            "display_warning": null,
+        })));
+        let envelope = json!({"screen_cam": screen_cam});
+        let status = &envelope["screen_cam"];
+        assert_eq!(status["status"], "stopped");
+        assert_eq!(status["actual_state"], "stopped");
+        assert_eq!(status["licensed"], false);
+        assert_eq!(status["desired_state"], "stopped");
+        assert!(status["available_displays"].as_array().unwrap().is_empty());
+        assert!(status["selected_display_id"].is_null());
+        assert!(status["active_display_id"].is_null());
+        assert_eq!(status["fallback_active"], false);
+        assert!(status["display_warning"].is_null());
+    }
+
+    #[test]
+    fn productive_heartbeat_constructor_never_omits_screen_cam() {
+        let screen_cam = screen_cam_status().expect("Windows ScreenCam heartbeat must exist");
+        for field in [
+            "available_displays",
+            "selected_display_id",
+            "active_display_id",
+            "fallback_active",
+            "display_warning",
+        ] {
+            assert!(screen_cam.get(field).is_some(), "missing field {field}");
+        }
+    }
+
+    #[test]
+    fn heartbeat_envelope_preserves_persisted_selection_fallback_and_warning() {
+        let mut input = status_with_display(json!({
+            "available_displays": [],
+            "selected_display_id": r"\\.\DISPLAY7",
+            "active_display_id": null,
+            "fallback_active": true,
+            "display_warning": "selected display is unavailable",
+        }));
+        input.raw_state = "disabled".to_owned();
+        input.licensed = true;
+        input.desired_state = "running".to_owned();
+        let screen_cam = build_screen_cam_status(input);
+        assert_eq!(screen_cam["status"], "disabled");
+        assert_eq!(screen_cam["actual_state"], "stopped");
+        assert_eq!(screen_cam["licensed"], true);
+        assert_eq!(screen_cam["desired_state"], "running");
+        assert_eq!(screen_cam["selected_display_id"], r"\\.\DISPLAY7");
+        assert!(screen_cam["active_display_id"].is_null());
+        assert_eq!(screen_cam["fallback_active"], true);
+        assert_eq!(
+            screen_cam["display_warning"],
+            "selected display is unavailable"
+        );
+    }
 }
 
 #[cfg(not(any(target_os = "ios")))]

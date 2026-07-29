@@ -343,7 +343,94 @@ impl DisplaySelectionState {
         self.active_capture = None;
     }
 
+    /// Applies a policy update to the existing topology. Any effective policy
+    /// change requests one rebuild even when the new policy currently resolves
+    /// to the same capture, because it changes the intent used by later
+    /// topology resolutions.
     #[cfg(test)]
+    pub fn update_policy(
+        &mut self,
+        selected_display_id: Option<&str>,
+        fallback_to_primary: Option<bool>,
+    ) -> bool {
+        self.update_policy_fields(selected_display_id.map(Some), fallback_to_primary)
+    }
+
+    /// Reconciles the complete persisted policy, including clearing a stale
+    /// selection when the persisted value is absent.
+    pub fn reconcile_policy(
+        &mut self,
+        selected_display_id: Option<&str>,
+        fallback_to_primary: bool,
+    ) -> bool {
+        self.update_policy_fields(Some(selected_display_id), Some(fallback_to_primary))
+    }
+
+    fn update_policy_fields(
+        &mut self,
+        selected_display_id: Option<Option<&str>>,
+        fallback_to_primary: Option<bool>,
+    ) -> bool {
+        let selected_changed = selected_display_id.map_or(false, |display_id| {
+            match (self.runtime.selected_display_id.as_deref(), display_id) {
+                (Some(current), Some(candidate)) => !current.eq_ignore_ascii_case(candidate),
+                (None, None) => false,
+                _ => true,
+            }
+        });
+        let fallback_changed = fallback_to_primary
+            .map(|fallback| fallback != self.fallback_to_primary)
+            .unwrap_or(false);
+        if !selected_changed && !fallback_changed {
+            return false;
+        }
+
+        if let Some(display_id) = selected_display_id {
+            self.runtime.selected_display_id = display_id.map(str::to_owned);
+        }
+        if let Some(fallback) = fallback_to_primary {
+            self.fallback_to_primary = fallback;
+        }
+
+        let resolution = resolve_display(
+            self.runtime.available_displays.iter(),
+            self.runtime.selected_display_id.as_deref(),
+            self.fallback_to_primary,
+        );
+        self.desired_capture = resolution.capture_fingerprint.clone();
+        if self.active_capture == resolution.capture_fingerprint {
+            self.runtime.active_display_id = resolution.active_display_id;
+            self.runtime.fallback_active = resolution.fallback_active;
+            self.runtime.display_warning = resolution.warning;
+        } else if self.active_capture.is_some() {
+            self.runtime.active_display_id = None;
+            self.runtime.fallback_active = false;
+            self.runtime.display_warning = resolution.warning;
+            self.active_capture = None;
+        } else if resolution.capture_fingerprint.is_none() || resolution.warning.is_some() {
+            self.runtime.active_display_id = None;
+            self.runtime.fallback_active = false;
+            self.runtime.display_warning = resolution.warning;
+        }
+        true
+    }
+
+    pub fn policy_matches(
+        &self,
+        selected_display_id: Option<&str>,
+        fallback_to_primary: bool,
+    ) -> bool {
+        let selected_matches = match (
+            self.runtime.selected_display_id.as_deref(),
+            selected_display_id,
+        ) {
+            (Some(current), Some(expected)) => current.eq_ignore_ascii_case(expected),
+            (None, None) => true,
+            _ => false,
+        };
+        selected_matches && self.fallback_to_primary == fallback_to_primary
+    }
+
     pub fn snapshot(&self) -> DisplayRuntimeState {
         self.runtime.clone()
     }
@@ -443,7 +530,7 @@ fn topology_fingerprint<'a>(
     TopologyFingerprint(entries)
 }
 
-fn validate_display_id(display_id: &str) -> io::Result<()> {
+pub(super) fn validate_display_id(display_id: &str) -> io::Result<()> {
     let prefix = display_id.get(..DISPLAY_ID_PREFIX.len());
     let suffix = display_id.get(DISPLAY_ID_PREFIX.len()..);
     let valid = display_id.trim() == display_id
@@ -454,8 +541,12 @@ fn validate_display_id(display_id: &str) -> io::Result<()> {
         && suffix
             .map(|suffix| {
                 !suffix.is_empty()
+                    && suffix.len() <= 10
                     && suffix.bytes().all(|character| character.is_ascii_digit())
-                    && suffix.bytes().any(|character| character != b'0')
+                    && suffix
+                        .parse::<u32>()
+                        .map(|number| number > 0)
+                        .unwrap_or(false)
             })
             .unwrap_or(false);
 
@@ -695,6 +786,8 @@ mod tests {
     fn rejects_invalid_prefix_suffix_and_additional_content() {
         assert_invalid_display_id(r"DISPLAY1");
         assert_invalid_display_id(r"\\.\MONITOR1");
+        assert_invalid_display_id("\\\\.\\D\u{0131}SPLAY1");
+        assert_invalid_display_id("\\\\.\\D\u{017f}PLAY1");
         assert_invalid_display_id(r"\\.\DISPLAY");
         assert_invalid_display_id(r"\\.\DISPLAYA");
         assert_invalid_display_id(r"\\.\DISPLAY1-extra");
@@ -704,6 +797,29 @@ mod tests {
     fn rejects_display_zero() {
         assert_invalid_display_id(r"\\.\DISPLAY0");
         assert_invalid_display_id(r"\\.\DISPLAY000");
+    }
+
+    #[test]
+    fn rejects_display_number_overflow() {
+        assert_invalid_display_id(r"\\.\DISPLAY4294967296");
+    }
+
+    /// Kept in lockstep with the Dart mirror in
+    /// `flutter/test/screencam_policy_test.dart` so both sides of the policy
+    /// IPC accept and reject exactly the same values.
+    #[test]
+    fn rejects_control_characters_signs_and_non_ascii_digits() {
+        assert_invalid_display_id("\\\\.\\DISPLAY1\u{0}");
+        assert_invalid_display_id("\\\\.\\DISPLAY\u{0}1");
+        assert_invalid_display_id("\\\\.\\DISPLAY1\t");
+        assert_invalid_display_id("\\\\.\\DISPLAY\t1");
+        assert_invalid_display_id(r"\\.\DISPLAY+1");
+        assert_invalid_display_id(r"\\.\DISPLAY-1");
+        assert_invalid_display_id(r"\\.\DISPLAY 1");
+        assert_invalid_display_id(r"\\.\DISPLAY1 2");
+        // Arabic-Indic and fullwidth digits must not pass as ASCII digits.
+        assert_invalid_display_id("\\\\.\\DISPLAY\u{0661}");
+        assert_invalid_display_id("\\\\.\\DISPLAY\u{ff11}");
     }
 
     #[test]
