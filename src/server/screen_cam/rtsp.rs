@@ -1379,6 +1379,8 @@ mod tests {
                 0, 0, 0, 1, 0x67, 0x64, 0, 0x1f, 0, 0, 1, 0x68, 0xee, 0, 0, 1, 0x65, 0x88,
             ],
             0,
+            0,     // pts_ms: preview no participa en este test
+            false, // keyframe
             Duration::from_millis(1),
             1200,
         );
@@ -1391,6 +1393,8 @@ mod tests {
             &mut payloader,
             &[0, 0, 1, 0x61, 0x20],
             0,
+            0,     // pts_ms: preview no participa en este test
+            false, // keyframe
             Duration::from_millis(2),
             1200,
         );

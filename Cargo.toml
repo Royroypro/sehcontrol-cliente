@@ -31,7 +31,7 @@ hwcodec = ["scrap/hwcodec"]
 vram = ["scrap/vram"]
 # Sehcontrol ScreenCam (docs/SCREENCAM_PLAN.md). Hardware-only by design
 # (plan section 7, option A) Ã¢â‚¬â€ depends on hwcodec, no software H.264 path.
-screencam = ["hwcodec"]
+screencam = ["hwcodec", "dep:srt-tokio", "dep:srt-protocol"]
 mediacodec = ["scrap/mediacodec"]
 plugin_framework = []
 linux-pkg-config = ["magnum-opus/linux-pkg-config", "scrap/linux-pkg-config"]
@@ -152,6 +152,17 @@ shared_memory = "0.12"
 tauri-winrt-notification = "0.1"
 runas = "1.2"
 
+[target.'cfg(windows)'.dependencies]
+# Sehcontrol ScreenCam Preview (Entrega C1): MPEG-TS over SRT to MediaMTX.
+# Pure Rust on purpose — no libsrt, no OpenSSL, no extra DLL to package, so
+# build.py stays untouched. Pinned exactly: 0.4.4 is the version verified
+# against rustc 1.75 (this crate's rust-version and the CI's RUST_VERSION).
+srt-tokio = { version = "=0.4.4", optional = true }
+# Same crate srt-tokio already pulls in (and the same vendored copy, via
+# [patch.crates-io] below): named directly only so a failed handshake can be
+# classified from the typed reject reason instead of from the error's text.
+srt-protocol = { version = "=0.4.4", optional = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc = "0.2"
 cocoa = "0.24"
@@ -211,7 +222,11 @@ jni = "0.21"
 android-wakelock = { git = "https://github.com/rustdesk-org/android-wakelock" }
 
 [workspace]
-members = ["libs/scrap", "libs/hbb_common", "libs/enigo", "libs/clipboard", "libs/virtual_display", "libs/virtual_display/dylib", "libs/portable", "libs/remote_printer"]
+members = ["libs/scrap", "libs/hbb_common", "libs/enigo", "libs/clipboard", "libs/virtual_display", "libs/virtual_display/dylib", "libs/portable", "libs/remote_printer",
+    # Vendored fork (see the [patch.crates-io] note below). A member so that
+    # `cargo test -p srt-protocol` runs the guard on the patched constant;
+    # otherwise the fork would be shipped with nothing verifying it.
+    "libs/srt-protocol-patched"]
 exclude = ["vdi/host", "examples/custom_plugin"]
 
 # Patch libxdo-sys to use a stub implementation that doesn't require libxdo
@@ -225,6 +240,18 @@ libxdo-sys = { path = "libs/libxdo-sys-stub" }
 # it ignores SODIUM_LIB_DIR and always tries to link the bundled Windows/MSVC
 # x64 prebuilt regardless of target. Patched to check the real TARGET string.
 libsodium-sys = { path = "libs/libsodium-sys-patched" }
+# Patch srt-protocol (ScreenCam Preview, Entrega C1): upstream 0.4.4 announces
+# SRT 1.3.1 in the HSv5 handshake, and MediaMTX 1.9.3 — which embeds
+# datarhei/gosrt v0.7.0 with MinVersion = 0x010401 — rejects that with
+# REJ_VERSION (0x03F0) before it ever reads the stream id. The vendored copy
+# changes exactly one constant, SrtVersion::CURRENT, to 1.4.1; the other 74
+# files are byte-identical to the published crate, and its own test suite
+# guards the value. Capability is still declared through SrtShakeFlags, which
+# this patch leaves alone, so nothing is claimed that the crate cannot do.
+#
+# Keep it on srt-protocol 0.4.4: srt-tokio is pinned to =0.4.4 and both build
+# on rustc 1.75, which is this crate's rust-version and the CI's RUST_VERSION.
+srt-protocol = { path = "libs/srt-protocol-patched" }
 
 [package.metadata.winres]
 LegalCopyright = "Copyright Ã‚Â© 2026 Sehcontrol. All rights reserved."

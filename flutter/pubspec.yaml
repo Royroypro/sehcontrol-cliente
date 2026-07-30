@@ -117,6 +117,10 @@ dev_dependencies:
   icons_launcher: ^2.0.4
   flutter_test:
     sdk: flutter
+  # Already resolved transitively through flutter_test (1.3.1 in pubspec.lock);
+  # declared explicitly so the realtime channel tests may import it to drive
+  # timers deterministically instead of sleeping.
+  fake_async: ^1.3.1
   build_runner: ^2.4.6
   freezed: ^2.4.2
   flutter_lints: ^2.0.2

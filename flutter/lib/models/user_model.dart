@@ -9,10 +9,39 @@ import 'package:get/get.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../common.dart';
+import '../common/realtime_channel.dart';
+import '../common/screen_cam_preview_lifecycle.dart';
+import '../common/screen_cam_preview_protocol.dart';
 import '../utils/http_service.dart' as http;
 import 'model.dart';
 import 'platform_model.dart';
 import 'screencam_policy.dart';
+
+/// Bridges `web_socket_channel` to the transport-agnostic interface the
+/// realtime controller drives. `WebSocketChannel.connect` returns before the
+/// handshake completes, so `ready` is what the controller waits on.
+class _WebSocketChannelAdapter implements RealtimeSocket {
+  _WebSocketChannelAdapter(Uri url) : _channel = WebSocketChannel.connect(url);
+
+  final WebSocketChannel _channel;
+
+  @override
+  Future<void> get ready => _channel.ready;
+
+  @override
+  Stream<dynamic> get stream => _channel.stream;
+
+  @override
+  void send(String data) => _channel.sink.add(data);
+
+  @override
+  Future<void> close() => _channel.sink.close();
+}
+
+/// Event name the Rust poller pushes on, and the handler key under it. Constants
+/// so registration and removal cannot drift apart.
+const _previewLifecycleEvent = 'screencam_preview_lifecycle';
+const _previewLifecycleHandler = 'user_model_preview_lifecycle';
 
 bool refreshingUser = false;
 const _trustedServerKeyOption = 'trusted-server-key';
@@ -69,9 +98,8 @@ class UserModel {
   Timer? _heartbeatTimer;
   bool _heartbeatInFlight = false;
   bool _heartbeatConfirmed = false;
-  WebSocketChannel? _realtimeChannel;
-  Timer? _realtimePingTimer;
-  bool _realtimeReconnectScheduled = false;
+  RealtimeChannelController? _realtimeController;
+  ScreenCamPreviewLifecycleDispatcher? _previewLifecycle;
 
   bool get isLogin => userName.isNotEmpty;
   String get displayNameOrUserName =>
@@ -146,6 +174,15 @@ class UserModel {
       startMembershipPolling();
     } catch (e) {
       debugPrint('Failed to refreshCurrentUser: $e');
+      // A stored token plus an unreachable panel is exactly the startup this
+      // has to survive: without this the session machinery never started, so
+      // the realtime channel had nothing to reconnect from and stayed down for
+      // the whole run of the app even after the panel came back. A 401/400 is
+      // handled above and returns before reaching here, so this only covers
+      // transport failures.
+      if (bind.mainGetLocalOption(key: 'access_token').isNotEmpty) {
+        startMembershipPolling();
+      }
     } finally {
       refreshingUser = false;
       await updateOtherModels();
@@ -166,6 +203,35 @@ class UserModel {
     });
     _startHeartbeat();
     connectRealtimeChannel();
+    _startPreviewLifecycleForwarding();
+  }
+
+  /// Bridges the daemon's preview publisher to the panel.
+  ///
+  /// Registered here rather than in the FFI constructor on purpose: this runs
+  /// for the one logged-in session that owns the authenticated WebSocket, while
+  /// the constructor runs for every remote session too and would forward each
+  /// transition once per session.
+  void _startPreviewLifecycleForwarding() {
+    _previewLifecycle ??=
+        ScreenCamPreviewLifecycleDispatcher(_sendRealtimeApplicationEvent);
+    // replace: true keeps a second startMembershipPolling() (a re-login,
+    // say) from stacking handlers.
+    platformFFI.registerEventHandler(
+      _previewLifecycleEvent,
+      _previewLifecycleHandler,
+      (evt) async {
+        _previewLifecycle?.handle(evt);
+      },
+      replace: true,
+    );
+  }
+
+  void _stopPreviewLifecycleForwarding() {
+    platformFFI.unregisterEventHandler(
+        _previewLifecycleEvent, _previewLifecycleHandler);
+    _previewLifecycle?.reset();
+    _previewLifecycle = null;
   }
 
   void stopMembershipPolling() {
@@ -184,6 +250,7 @@ class UserModel {
     membershipMaxDevices.value = null;
     clearNotifications();
     disconnectRealtimeChannel();
+    _stopPreviewLifecycleForwarding();
   }
 
   void _startHeartbeat() {
@@ -393,70 +460,46 @@ class UserModel {
   /// started by [startMembershipPolling] is kept running regardless, as a
   /// low-frequency fallback for when this socket is down. No-op with no
   /// api_server or access_token available.
+  RealtimeChannelController _ensureRealtimeController() {
+    return _realtimeController ??= RealtimeChannelController(
+      apiServerProvider: () => bind.mainGetApiServer(),
+      tokenProvider: () => bind.mainGetLocalOption(key: 'access_token'),
+      socketFactory: (url) => _WebSocketChannelAdapter(url),
+      onEvent: _handleRealtimeEvent,
+      logger: debugPrint,
+    );
+  }
+
   void connectRealtimeChannel() {
-    disconnectRealtimeChannel();
-    unawaited(() async {
-      final url = await bind.mainGetApiServer();
-      final token = bind.mainGetLocalOption(key: 'access_token');
-      if (url.trim().isEmpty || token.isEmpty) return;
-      // Naive http->ws / https->wss: "http" is a prefix of "https", so
-      // replacing it with "ws" leaves the trailing "s" in place for TLS.
-      final wsUrl = '${url.replaceFirst('http', 'ws')}/api/ws?token=$token';
-      try {
-        final channel = WebSocketChannel.connect(Uri.parse(wsUrl));
-        _realtimeChannel = channel;
-        channel.stream.listen(
-          (raw) => _handleRealtimeEvent(raw),
-          onDone: _scheduleRealtimeReconnect,
-          onError: (e) {
-            debugPrint('Realtime channel error: $e');
-            _scheduleRealtimeReconnect();
-          },
-          cancelOnError: true,
-        );
-        _realtimePingTimer?.cancel();
-        _realtimePingTimer = Timer.periodic(const Duration(seconds: 30), (_) {
-          try {
-            _realtimeChannel?.sink.add('ping');
-          } catch (e) {
-            debugPrint('Failed to ping realtime channel: $e');
-          }
-        });
-      } catch (e) {
-        debugPrint('Failed to connect realtime channel: $e');
-        _scheduleRealtimeReconnect();
-      }
-    }());
+    _ensureRealtimeController().start();
+  }
+
+  /// The persisted access token may have just changed, so the socket has to be
+  /// rebuilt: an open one is still authenticated with the previous credential.
+  void refreshRealtimeChannel() {
+    _ensureRealtimeController().restart();
   }
 
   void disconnectRealtimeChannel() {
-    _realtimePingTimer?.cancel();
-    _realtimePingTimer = null;
-    _realtimeChannel?.sink.close();
-    _realtimeChannel = null;
+    _realtimeController?.stop();
   }
 
-  void _scheduleRealtimeReconnect() {
-    if (_realtimeReconnectScheduled || _membershipTimer == null) return;
-    _realtimeReconnectScheduled = true;
-    Future.delayed(const Duration(seconds: 5), () {
-      _realtimeReconnectScheduled = false;
-      // Only reconnect if polling (i.e. a logged-in session) is still active;
-      // stopMembershipPolling()/logOut() may have run while we were waiting.
-      if (_membershipTimer != null) {
-        connectRealtimeChannel();
-      }
-    });
+  // Kept as the single safe path for Entrega E application events.
+  // ignore: unused_element
+  bool _sendRealtimeApplicationEvent(Map<String, Object?> payload) {
+    return _realtimeController?.send(payload) ?? false;
   }
 
-  void _handleRealtimeEvent(dynamic raw) {
+  /// Application events only: the controller has already decoded the frame and
+  /// consumed the transport-level `pong`.
+  void _handleRealtimeEvent(Map<Object?, Object?> event) {
     try {
-      if (raw is! String) return;
-      final event = jsonDecode(raw);
-      if (event is! Map) return;
       final data = event['data'];
       switch (event['type']) {
         case 'connected':
+          // The publisher may have connected while this socket was down, in
+          // which case its transition is still owed to the panel.
+          _previewLifecycle?.flush();
           // Server dev confirmed (docs/SCREENCAM_PLAN.md section "Fase 4b",
           // point 12.4): screen_cam.update only pushes on the *next* change,
           // so a policy change that happened while this socket was down
@@ -492,9 +535,71 @@ class UserModel {
             }());
           }
           break;
+        case 'screen_cam.preview.start':
+          if (isWindows) {
+            unawaited(_handleScreenCamPreviewStart(data));
+          }
+          break;
+        case 'screen_cam.preview.stop':
+          if (isWindows) {
+            unawaited(_handleScreenCamPreviewStop(data));
+          }
+          break;
       }
-    } catch (e) {
-      debugPrint('Failed to handle realtime event: $e');
+    } catch (_) {
+      // Decoder errors can quote the source message, which may contain a
+      // short-lived ScreenCam Preview credential.
+      debugPrint('Failed to handle realtime event');
+    }
+  }
+
+  Future<void> _handleScreenCamPreviewStart(Object? data) {
+    return dispatchScreenCamPreviewStart(
+      data,
+      isWindowsPlatform: isWindows,
+      getLocalId: () async => (await bind.mainGetMyId()).trim(),
+      onValidated: _onScreenCamPreviewStartValidated,
+    );
+  }
+
+  Future<void> _handleScreenCamPreviewStop(Object? data) {
+    return dispatchScreenCamPreviewStop(
+      data,
+      isWindowsPlatform: isWindows,
+      getLocalId: () async => (await bind.mainGetMyId()).trim(),
+      onValidated: _onScreenCamPreviewStopValidated,
+    );
+  }
+
+  Future<void> _onScreenCamPreviewStartValidated(
+    ScreenCamPreviewStartMessage message,
+  ) async {
+    try {
+      final response = await bind.mainStartScreencamPreview(
+        sessionId: message.sessionId,
+        rustdeskId: message.rustdeskId,
+        publishUrl: message.publishUrl,
+        publishToken: message.publishToken,
+        streamName: message.streamName,
+        expiresIn: message.expiresIn,
+      );
+      _isValidScreenCamPreviewAck(response, message.sessionId);
+    } catch (_) {
+      // Publisher state events, including failures, belong to Entrega E.
+    }
+  }
+
+  Future<void> _onScreenCamPreviewStopValidated(
+    ScreenCamPreviewStopMessage message,
+  ) async {
+    try {
+      final response = await bind.mainStopScreencamPreview(
+        sessionId: message.sessionId,
+        rustdeskId: message.rustdeskId,
+      );
+      _isValidScreenCamPreviewAck(response, message.sessionId);
+    } catch (_) {
+      // Publisher state events, including failures, belong to Entrega E.
     }
   }
 
@@ -867,5 +972,18 @@ class UserModel {
           "queryOidcLoginOptions: jsonDecode resp body failed: ${e.toString()}");
       return [];
     }
+  }
+}
+
+bool _isValidScreenCamPreviewAck(String response, String sessionId) {
+  try {
+    final decoded = jsonDecode(response);
+    return decoded is Map &&
+        decoded['applied'] is bool &&
+        decoded['changed'] is bool &&
+        decoded['session_id'] == sessionId &&
+        (decoded['error'] == null || decoded['error'] is String);
+  } catch (_) {
+    return false;
   }
 }

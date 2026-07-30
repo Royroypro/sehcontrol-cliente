@@ -22,6 +22,7 @@
 mod auth;
 mod display;
 mod onvif;
+mod preview;
 mod rtp;
 mod rtsp;
 
@@ -42,6 +43,43 @@ use scrap::{
     CodecFormat, TraitCapturer,
 };
 
+pub(crate) use preview::control::{PreviewControlOutcome, PreviewStartRequest, PreviewStopRequest};
+
+/// The preview publisher's last reported state, as JSON safe to forward to the
+/// panel. `{"state":"idle"}` when no session has reported anything yet — an
+/// explicit answer rather than an absent one, so the caller never has to treat
+/// a timeout as a state.
+pub(crate) fn preview_lifecycle_status_json() -> String {
+    match preview::publisher::lifecycle_snapshot() {
+        Some(snapshot) => snapshot.to_json(),
+        None => r#"{"state":"idle"}"#.to_owned(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_preview_lifecycle_for_test() {
+    preview::publisher::reset_lifecycle_for_test();
+}
+
+/// Drives one `Started` through the real sink, so the IPC test exercises the
+/// production path rather than a hand-built snapshot.
+#[cfg(test)]
+pub(crate) fn publish_preview_lifecycle_for_test() {
+    use preview::publisher::{
+        PreviewEventSink, PreviewLifecycleSink, PreviewOwnership, PreviewPublisherEvent,
+    };
+    use std::sync::{atomic::AtomicU64, Arc};
+
+    let current = Arc::new(AtomicU64::new(1));
+    let sink = PreviewLifecycleSink::new(
+        "pv_status_test".to_owned(),
+        "485236790".to_owned(),
+        1,
+        PreviewOwnership::new(current, 1),
+    );
+    sink.emit(PreviewPublisherEvent::Started { generation: 1 });
+}
+use preview::{control::PreviewControl, tap::PreviewTap};
 use rtsp::Session;
 
 const SELECTED_DISPLAY_ID_OPTION_KEY: &str = "screencam-selected-display-id";
@@ -206,6 +244,21 @@ pub struct SharedState {
     last_confirmed_resolution: Mutex<Option<(usize, usize)>>,
     display_selection: Mutex<display::DisplaySelectionState>,
     reconfigure_generation: AtomicU64,
+    /// Bounded hand-off to the panel-driven preview publisher. Owned here on
+    /// purpose: `SharedState` outlives every `capture_loop` run and every
+    /// watchdog restart, whereas the capturer, the encoder and the RTSP
+    /// sessions do not. A preview session lasts 300 s and can easily span a
+    /// display change, so recreating the tap with the capture loop would
+    /// silently reset the counters the publisher is watching.
+    ///
+    /// Starts inactive. `PreviewControl` activates it only while an IPC-owned
+    /// preview session exists, so normal capture without preview remains a
+    /// single atomic load per frame.
+    preview_tap: Arc<PreviewTap>,
+    /// Owns the single preview session, drives the same tap stored above and,
+    /// since C1, the SRT publisher that drains it. Nothing it does can reach
+    /// the capture loop: it only ever opens and closes the tap.
+    preview_control: Arc<PreviewControl>,
 }
 
 impl SharedState {
@@ -218,6 +271,11 @@ impl SharedState {
         selected_display_id: Option<String>,
         fallback_to_primary: bool,
     ) -> Self {
+        let preview_tap = Arc::new(PreviewTap::new());
+        let preview_control = Arc::new(PreviewControl::new(
+            Arc::clone(&preview_tap),
+            Arc::new(preview::publisher::SrtPublisherSpawner),
+        ));
         Self {
             sessions: Mutex::new(Vec::new()),
             stream_descriptor: Mutex::new(StreamDescriptorState::new()),
@@ -227,7 +285,15 @@ impl SharedState {
                 fallback_to_primary,
             )),
             reconfigure_generation: AtomicU64::new(0),
+            preview_tap,
+            preview_control,
         }
+    }
+
+    /// A handle the future publisher can hold independently of this state.
+    #[allow(dead_code)]
+    fn preview_tap(&self) -> Arc<PreviewTap> {
+        Arc::clone(&self.preview_tap)
     }
 
     fn apply_display_inventory<D>(
@@ -351,7 +417,18 @@ impl SharedState {
     }
 
     fn invalidate_stream(&self) -> u64 {
+        // The descriptor lock is released by the end of this statement, and
+        // the sessions lock is not taken until the next one. The tap is told
+        // in between, holding neither: `PreviewTap::invalidate_stream` takes
+        // no lock of its own, but calling it from inside either critical
+        // section would add a second acquisition order to a module that
+        // documents exactly one (see rtsp.rs's note on this pair).
         let epoch = self.stream_descriptor.lock().unwrap().invalidate();
+        // Once per real invalidation, whether or not anything is previewing:
+        // an inactive tap still records the epoch and bumps its generation,
+        // which is what lets a publisher that activates later start from a
+        // truthful snapshot instead of assuming epoch 0.
+        self.preview_tap.invalidate_stream(epoch);
         drain_and_process(&self.sessions, |session| session.close());
         set_rtsp_clients(0);
         epoch
@@ -511,6 +588,26 @@ impl DisplayPolicyStore for LocalConfigDisplayPolicyStore {
 
 fn registered_live_state() -> Option<Arc<SharedState>> {
     LIVE_STATE.lock().unwrap().as_ref().and_then(Weak::upgrade)
+}
+
+pub(crate) fn apply_preview_start(
+    request: PreviewStartRequest,
+    local_rustdesk_id: &str,
+) -> PreviewControlOutcome {
+    let session_id = request.session_id.clone();
+    registered_live_state()
+        .map(|state| state.preview_control.start(request, local_rustdesk_id))
+        .unwrap_or_else(|| PreviewControlOutcome::unavailable(session_id))
+}
+
+pub(crate) fn apply_preview_stop(
+    request: PreviewStopRequest,
+    local_rustdesk_id: &str,
+) -> PreviewControlOutcome {
+    let session_id = request.session_id.clone();
+    registered_live_state()
+        .map(|state| state.preview_control.stop(request, local_rustdesk_id))
+        .unwrap_or_else(|| PreviewControlOutcome::unavailable(session_id))
 }
 
 /// Maps an already-reconciled live state onto the ACK outcome. Kept separate so
@@ -1343,11 +1440,18 @@ fn capture_loop(cfg: ScreenCamConfig, state: Arc<SharedState>) -> ResultType<Cap
                         Ok(vf) => {
                             if let Some(video_frame::Union::H264s(h264s)) = vf.union {
                                 for f in h264s.frames.iter() {
+                                    // `f.pts`/`f.key` are the encoder's own
+                                    // millisecond timestamp and keyframe
+                                    // flag, forwarded for the preview. RTP
+                                    // keeps deriving its 90 kHz timestamp
+                                    // from `start.elapsed()` as before.
                                     handle_access_unit(
                                         &state,
                                         &mut payloader,
                                         &f.data,
                                         stream_epoch,
+                                        f.pts,
+                                        f.key,
                                         start.elapsed(),
                                         RTP_MTU,
                                     );
@@ -1400,11 +1504,18 @@ fn log_display_inventory<D>(displays: &display::DisplayInventory<D>) {
     }
 }
 
+/// `pts_ms` and `keyframe` come straight from the encoder's own
+/// `EncodedVideoFrame` (`f.pts`, `f.key`) and exist for the preview tap.
+/// `elapsed` remains the capture clock the RTP timestamp is derived from —
+/// the two time bases stay separate on purpose, so wiring the preview cannot
+/// perturb what an NVR already sees over RTSP.
 fn handle_access_unit(
     state: &SharedState,
     payloader: &mut rtp::H264Payloader,
     data: &[u8],
     stream_epoch: u64,
+    pts_ms: i64,
+    keyframe: bool,
     elapsed: Duration,
     mtu: usize,
 ) {
@@ -1415,6 +1526,39 @@ fn handle_access_unit(
     if !state.apply_stream_access_unit(stream_epoch, &nals) {
         return;
     }
+
+    // Preview tap. Placed exactly here on purpose: after the epoch has been
+    // accepted, so a stale access unit can never reach the publisher, and
+    // *before* the RTSP session lookup below, so the preview keeps receiving
+    // frames even when nobody is watching over RTSP — which is the normal
+    // case for a panel-driven preview, and the reason the early return a few
+    // lines down would otherwise starve it.
+    //
+    // `has_sps`/`has_pps` reuse the NAL split above rather than parsing
+    // `data` again, and describe *this* access unit rather than the cached
+    // descriptor: the publisher needs to know whether the parameter sets are
+    // in-band right here, while the descriptor only remembers that they were
+    // seen at some point in this epoch.
+    let has_sps = nals
+        .iter()
+        .any(|nal| rtp::nal_unit_type(nal) == rtp::NAL_TYPE_SPS);
+    let has_pps = nals
+        .iter()
+        .any(|nal| rtp::nal_unit_type(nal) == rtp::NAL_TYPE_PPS);
+    // Deliberately ignored. A frame the preview cannot take (a negative PTS
+    // from the encoder, say) is skipped for preview only — RTSP carries on
+    // untouched, nothing returns early, and nothing is logged, because this
+    // runs once per frame and a rejection is a property of the frame, which
+    // would turn any log into a per-frame log. While the tap is inactive this
+    // is one atomic load and nothing else: no validation, no copy.
+    let _ = state.preview_tap.push_annexb_copy_if_active(
+        stream_epoch,
+        pts_ms,
+        keyframe,
+        has_sps,
+        has_pps,
+        data,
+    );
 
     let sessions = snapshot_matching(&state.sessions, |session| session.epoch() == stream_epoch);
     if sessions.is_empty() {
@@ -2569,5 +2713,414 @@ mod delivery2_tests {
         assert!(!absent_snapshot.fallback_active);
         assert!(absent_snapshot.display_warning.is_some());
         assert!(absent_snapshot.available_displays.is_empty());
+    }
+}
+
+/// Preview tap integration (Entrega 4). These exercise the wiring only —
+/// where the tap sits in `handle_access_unit`, what metadata reaches it, and
+/// that invalidation is forwarded — never a publisher, a muxer or a socket.
+#[cfg(test)]
+mod preview_tap_tests {
+    use super::*;
+
+    /// SPS + PPS + IDR, the shape a keyframe access unit really has.
+    const KEYFRAME_AU: &[u8] = &[
+        0, 0, 0, 1, 0x67, 0x64, 0x00, 0x1F, // SPS
+        0, 0, 1, 0x68, 0xEE, // PPS
+        0, 0, 1, 0x65, 0x88, 0x84, // IDR
+    ];
+    /// A non-IDR slice on its own, as inter frames arrive.
+    const INTER_AU: &[u8] = &[0, 0, 1, 0x61, 0x20, 0x40];
+
+    fn feed(state: &SharedState, data: &[u8], epoch: u64, pts_ms: i64, keyframe: bool) {
+        let mut payloader = rtp::H264Payloader::new();
+        handle_access_unit(
+            state,
+            &mut payloader,
+            data,
+            epoch,
+            pts_ms,
+            keyframe,
+            Duration::from_millis(1),
+            1200,
+        );
+    }
+
+    #[test]
+    fn shared_state_owns_one_inactive_tap() {
+        let state = SharedState::new();
+        let tap = state.preview_tap();
+        assert_eq!(tap.capacity(), 8, "default capacity");
+        assert!(!tap.is_active(), "must not activate itself");
+        assert!(tap.is_empty());
+        let stats = tap.stats();
+        assert_eq!(stats.dropped_total, 0);
+        assert_eq!(stats.invalidation_generation, 0);
+        assert_eq!(stats.discarded_on_invalidate_total, 0);
+    }
+
+    #[test]
+    fn the_accessor_hands_out_the_same_instance() {
+        let state = Arc::new(SharedState::new());
+        let first = state.preview_tap();
+        let second = state.preview_tap();
+        assert!(Arc::ptr_eq(&first, &second), "one tap, not one per call");
+        // A capture_loop restart re-reads this state; it does not rebuild it,
+        // so a publisher holding this handle keeps its counters across one.
+        first.activate();
+        let after_restart = Arc::clone(&state).preview_tap();
+        assert!(after_restart.is_active(), "state survived the restart");
+        assert!(Arc::ptr_eq(&first, &after_restart));
+    }
+
+    #[test]
+    fn an_inactive_tap_receives_nothing() {
+        let state = SharedState::new();
+        for index in 0..20i64 {
+            feed(&state, KEYFRAME_AU, 0, index * 40, index == 0);
+        }
+        let tap = state.preview_tap();
+        assert!(tap.is_empty());
+        assert_eq!(tap.dropped_total(), 0);
+    }
+
+    /// The point of tapping before the RTSP session lookup: with zero
+    /// sessions `handle_access_unit` returns early, and the preview must
+    /// still have been fed.
+    #[test]
+    fn an_active_tap_is_fed_even_with_no_rtsp_sessions() {
+        let state = SharedState::new();
+        assert!(state.preview_tap().activate().activated);
+        assert!(
+            state.sessions.lock().unwrap().is_empty(),
+            "no RTSP consumer at all"
+        );
+
+        feed(&state, KEYFRAME_AU, 0, 40, true);
+
+        let tap = state.preview_tap();
+        assert_eq!(tap.len(), 1, "the tap ran before the early return");
+        let unit = tap.pop().expect("queued");
+        assert_eq!(unit.epoch, 0);
+        assert_eq!(unit.pts_ms, 40);
+        assert!(unit.keyframe);
+        assert!(unit.has_sps);
+        assert!(unit.has_pps);
+        assert_eq!(&*unit.annexb, KEYFRAME_AU, "payload must be byte-exact");
+    }
+
+    /// The C1 regression guard for the outlet that already works.
+    ///
+    /// Whatever the preview is doing — saturated, dropping frames, no consumer
+    /// at all because the publisher died — `handle_access_unit` must hand RTSP
+    /// and UDP exactly what it handed them before there was a tap. The proxy for
+    /// "exactly what" is the stream descriptor: it is what DESCRIBE answers
+    /// from, what the SPS/PPS and IDR readiness live in, and what the RTP
+    /// dispatch below it is gated on.
+    #[test]
+    fn a_saturated_preview_tap_changes_nothing_the_rtsp_path_sees() {
+        fn descriptor_after_a_burst(activate_tap: bool) -> (bool, bool, u64, (usize, usize)) {
+            let state = SharedState::new();
+            if activate_tap {
+                assert!(state.preview_tap().activate().activated);
+            }
+            // Far more access units than the tap's 8 slots, and nobody popping,
+            // so with the tap active this burst saturates it many times over.
+            for pts in 0..50 {
+                feed(&state, KEYFRAME_AU, 0, pts, true);
+                feed(&state, INTER_AU, 0, pts, false);
+            }
+            let descriptor = state.stream_descriptor();
+            (
+                descriptor.is_ready(),
+                descriptor.idr_ready,
+                state.preview_tap().dropped_total(),
+                state.stream_dimensions(),
+            )
+        }
+
+        let (ready, idr, dropped, dimensions) = descriptor_after_a_burst(true);
+        assert!(dropped > 0, "the burst must really have saturated the tap");
+        let baseline = descriptor_after_a_burst(false);
+        assert_eq!(
+            (ready, idr, dimensions),
+            (baseline.0, baseline.1, baseline.3),
+            "an overflowing preview tap must not change what RTSP is told"
+        );
+        assert_eq!(baseline.2, 0, "an inactive tap cannot drop anything");
+    }
+
+    #[test]
+    fn parameter_set_flags_describe_this_access_unit() {
+        let cases: [(&[u8], bool, bool); 4] = [
+            (KEYFRAME_AU, true, true),
+            (&[0, 0, 1, 0x67, 0x64, 0x00, 0x1F], true, false), // SPS only
+            (&[0, 0, 1, 0x68, 0xEE], false, true),             // PPS only
+            (INTER_AU, false, false),                          // neither
+        ];
+        for (data, expect_sps, expect_pps) in cases {
+            let state = SharedState::new();
+            assert!(state.preview_tap().activate().activated);
+            feed(&state, data, 0, 0, false);
+            let unit = state
+                .preview_tap()
+                .pop()
+                .unwrap_or_else(|| panic!("nothing queued for {data:02X?}"));
+            assert_eq!(unit.has_sps, expect_sps, "SPS for {data:02X?}");
+            assert_eq!(unit.has_pps, expect_pps, "PPS for {data:02X?}");
+            assert_eq!(&*unit.annexb, data);
+        }
+    }
+
+    #[test]
+    fn the_keyframe_flag_is_the_encoders_own() {
+        let state = SharedState::new();
+        assert!(state.preview_tap().activate().activated);
+        // Deliberately contradictory: an IDR payload flagged as not a
+        // keyframe. This task forwards `f.key` and does not second-guess it.
+        feed(&state, KEYFRAME_AU, 0, 0, false);
+        assert!(!state.preview_tap().pop().expect("queued").keyframe);
+        feed(&state, INTER_AU, 0, 40, true);
+        assert!(state.preview_tap().pop().expect("queued").keyframe);
+    }
+
+    #[test]
+    fn a_negative_pts_is_skipped_for_preview_without_disturbing_rtsp() {
+        let state = SharedState::new();
+        let epoch = state.stream_epoch();
+        assert!(state.set_stream_dimensions(epoch, 1920, 1080));
+        let tap = state.preview_tap();
+        assert!(tap.activate().activated);
+        let dropped_before = tap.dropped_total();
+        assert_eq!(
+            tap.push_annexb_copy_if_active(epoch, -1, true, true, true, KEYFRAME_AU),
+            Err(super::preview::tap::AccessUnitError::NegativePts),
+            "the active tap rejects the encoder's negative PTS"
+        );
+        assert!(tap.is_empty(), "the rejected probe was not queued");
+
+        // A payload that completes the descriptor, so the RTSP side is
+        // observably still doing its job.
+        feed(&state, KEYFRAME_AU, epoch, -1, true);
+
+        assert!(tap.is_empty(), "not queued for preview");
+        assert_eq!(
+            tap.dropped_total(),
+            dropped_before,
+            "and not counted as loss"
+        );
+        assert!(tap.is_active(), "the tap stays open");
+        let descriptor = state.stream_descriptor();
+        assert_eq!((descriptor.width, descriptor.height), (1920, 1080));
+        assert_eq!(
+            descriptor.sps.as_deref(),
+            Some(&[0x67, 0x64, 0x00, 0x1F][..])
+        );
+        assert_eq!(descriptor.pps.as_deref(), Some(&[0x68, 0xEE][..]));
+        assert!(descriptor.idr_ready, "the complete IDR was observed");
+        assert!(descriptor.is_ready(), "the RTSP descriptor was completed");
+    }
+
+    #[test]
+    fn a_stale_epoch_never_reaches_the_tap() {
+        let state = SharedState::new();
+        assert!(state.preview_tap().activate().activated);
+        let current = state.stream_epoch();
+
+        feed(&state, KEYFRAME_AU, current.wrapping_add(7), 0, true);
+
+        let tap = state.preview_tap();
+        assert!(tap.is_empty(), "apply_stream_access_unit refused it first");
+        assert_eq!(tap.dropped_total(), 0);
+        assert_eq!(tap.stats().discarded_on_invalidate_total, 0);
+        assert!(
+            !state.stream_descriptor().is_ready(),
+            "and the descriptor was not touched either"
+        );
+    }
+
+    #[test]
+    fn saturation_keeps_the_most_recent_eight_access_units() {
+        let state = SharedState::new();
+        assert!(state.preview_tap().activate().activated);
+        for index in 0..12i64 {
+            feed(&state, INTER_AU, 0, index * 40, false);
+        }
+        let tap = state.preview_tap();
+        assert_eq!(tap.len(), 8, "bounded at the default capacity");
+        assert_eq!(tap.dropped_total(), 4, "12 fed, 8 kept");
+        let kept: Vec<i64> = std::iter::from_fn(|| tap.pop())
+            .map(|unit| unit.pts_ms)
+            .collect();
+        assert_eq!(kept, vec![160, 200, 240, 280, 320, 360, 400, 440]);
+    }
+
+    #[test]
+    fn invalidation_reaches_the_tap_exactly_once() {
+        let state = SharedState::new();
+        assert!(state.preview_tap().activate().activated);
+        for index in 0..3i64 {
+            feed(&state, INTER_AU, 0, index * 40, false);
+        }
+        assert_eq!(state.preview_tap().len(), 3);
+
+        let new_epoch = state.invalidate_stream();
+
+        let tap = state.preview_tap();
+        let stats = tap.stats();
+        assert_eq!(new_epoch, 1, "the descriptor advanced");
+        assert_eq!(stats.invalidated_epoch, new_epoch, "the tap got that epoch");
+        assert_eq!(stats.invalidation_generation, 1, "exactly one event");
+        assert_eq!(stats.queued, 0, "the queue was drained");
+        assert_eq!(stats.discarded_on_invalidate_total, 3);
+        assert_eq!(stats.dropped_total, 0, "not billed as saturation");
+        assert!(stats.active, "invalidation must not close the tap");
+    }
+
+    #[test]
+    fn successive_invalidations_advance_epoch_and_generation_together() {
+        let state = SharedState::new();
+        assert!(state.preview_tap().activate().activated);
+
+        let first = state.invalidate_stream();
+        let second = state.invalidate_stream();
+        assert_eq!((first, second), (1, 2));
+
+        let snapshot = state.preview_tap().invalidation_snapshot();
+        assert_eq!(snapshot.epoch, second);
+        assert_eq!(snapshot.generation, 2, "one generation per invalidation");
+        assert_eq!(snapshot.epoch, state.stream_epoch(), "epochs agree");
+    }
+
+    #[test]
+    fn invalidation_is_recorded_even_while_the_tap_is_inactive() {
+        let state = SharedState::new();
+        assert!(!state.preview_tap().is_active());
+        state.invalidate_stream();
+        state.invalidate_stream();
+        let snapshot = state.preview_tap().invalidation_snapshot();
+        assert_eq!(snapshot.generation, 2);
+        assert_eq!(snapshot.epoch, state.stream_epoch());
+        // Which is what lets a publisher activating later start from the
+        // truth instead of assuming epoch 0.
+        assert!(!state.preview_tap().is_active());
+    }
+
+    #[test]
+    fn feeding_resumes_on_the_new_epoch_after_an_invalidation() {
+        let state = SharedState::new();
+        assert!(state.preview_tap().activate().activated);
+        feed(&state, KEYFRAME_AU, 0, 0, true);
+        let new_epoch = state.invalidate_stream();
+        assert!(state.preview_tap().is_empty());
+
+        // The old epoch is refused by apply_stream_access_unit; the new one
+        // goes through.
+        feed(&state, KEYFRAME_AU, 0, 40, true);
+        assert!(state.preview_tap().is_empty(), "stale epoch refused");
+        feed(&state, KEYFRAME_AU, new_epoch, 80, true);
+        let unit = state.preview_tap().pop().expect("queued");
+        assert_eq!(unit.epoch, new_epoch);
+        assert_eq!(unit.pts_ms, 80);
+    }
+
+    /// The RTP side must be untouched by any of this: same functional
+    /// packetization and same 90 kHz timestamp derived from `elapsed` — not
+    /// from the `pts_ms` the preview now receives.
+    #[test]
+    fn rtp_packetization_is_unchanged_by_the_preview_wiring() {
+        let state = SharedState::new();
+        assert!(state.preview_tap().activate().activated);
+        let nals = rtp::split_annexb_nals(KEYFRAME_AU);
+        let elapsed = Duration::from_millis(250);
+        let timestamp = (elapsed.as_secs_f64() * 90_000.0) as u32;
+
+        let mut expected_payloader = rtp::H264Payloader::new();
+        let expected = expected_payloader.packetize(&nals, timestamp, 1200);
+
+        let mut actual_payloader = rtp::H264Payloader::new();
+        handle_access_unit(
+            &state,
+            &mut actual_payloader,
+            KEYFRAME_AU,
+            0,
+            // A wildly different preview timestamp: it must not leak into RTP.
+            999_999,
+            true,
+            elapsed,
+            1200,
+        );
+
+        let actual = actual_payloader.packetize(&nals, timestamp, 1200);
+        assert_eq!(actual.len(), expected.len(), "same RTP packet count");
+        assert!(!actual.is_empty(), "the fixture produces RTP packets");
+        for (actual_packet, expected_packet) in actual.iter().zip(&expected) {
+            assert!(actual_packet.len() >= 12 && expected_packet.len() >= 12);
+            assert_eq!(actual_packet[0], expected_packet[0], "same RTP header");
+            assert_eq!(
+                actual_packet[1], expected_packet[1],
+                "same marker and payload type"
+            );
+            assert_eq!(
+                &actual_packet[4..8],
+                &expected_packet[4..8],
+                "same RTP timestamp"
+            );
+            assert_eq!(
+                &actual_packet[12..],
+                &expected_packet[12..],
+                "same H.264 payload and fragmentation"
+            );
+        }
+
+        let expected_sequences: Vec<u16> = expected
+            .iter()
+            .map(|packet| u16::from_be_bytes([packet[2], packet[3]]))
+            .collect();
+        let actual_sequences: Vec<u16> = actual
+            .iter()
+            .map(|packet| u16::from_be_bytes([packet[2], packet[3]]))
+            .collect();
+        let sequence_deltas = |sequences: &[u16]| {
+            sequences
+                .windows(2)
+                .map(|pair| pair[1].wrapping_sub(pair[0]))
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            expected_sequences
+                .windows(2)
+                .all(|pair| pair[1] == pair[0].wrapping_add(1)),
+            "expected flow has consecutive sequences"
+        );
+        assert!(
+            actual_sequences
+                .windows(2)
+                .all(|pair| pair[1] == pair[0].wrapping_add(1)),
+            "actual flow has consecutive sequences"
+        );
+        assert_eq!(
+            sequence_deltas(&actual_sequences),
+            sequence_deltas(&expected_sequences),
+            "same relative sequence progression"
+        );
+
+        let expected_ssrc = &expected[0][8..12];
+        let actual_ssrc = &actual[0][8..12];
+        assert!(
+            expected
+                .iter()
+                .all(|packet| &packet[8..12] == expected_ssrc),
+            "expected flow keeps one SSRC"
+        );
+        assert!(
+            actual.iter().all(|packet| &packet[8..12] == actual_ssrc),
+            "actual flow keeps one SSRC"
+        );
+        assert_eq!(
+            state.preview_tap().pop().expect("queued").pts_ms,
+            999_999,
+            "the preview kept its own time base"
+        );
     }
 }

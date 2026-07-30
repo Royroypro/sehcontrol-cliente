@@ -89,6 +89,8 @@ const SCREENCAM_DISPLAY_POLICY_MAX_BYTES: usize = 256;
 static SCREENCAM_POLICY_REJECTION_WARNED: AtomicBool = AtomicBool::new(false);
 #[cfg(all(windows, feature = "screencam"))]
 static SCREENCAM_POLICY_PERSISTENCE_WARNED: AtomicBool = AtomicBool::new(false);
+#[cfg(all(windows, feature = "screencam"))]
+const SCREENCAM_PREVIEW_REQUEST_MAX_BYTES: usize = 16 * 1024;
 
 #[cfg(all(windows, feature = "screencam"))]
 fn parse_screencam_display_policy_update(value: &str) -> Option<(Option<String>, Option<bool>)> {
@@ -184,6 +186,129 @@ where
             screencam_display_policy_ack(false, false, Some("ipc_unavailable"))
         }
     }
+}
+
+#[cfg(all(windows, feature = "screencam"))]
+fn sanitize_screencam_preview_error(error: &str) -> String {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("token") || lower.contains("://") {
+        return "preview request failed".to_owned();
+    }
+    error
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(100)
+        .collect()
+}
+
+#[cfg(all(windows, feature = "screencam"))]
+fn screencam_preview_ack(
+    applied: bool,
+    changed: bool,
+    session_id: &str,
+    error: Option<&str>,
+) -> String {
+    serde_json::json!({
+        "applied": applied,
+        "changed": changed,
+        "session_id": session_id,
+        "error": error.map(sanitize_screencam_preview_error),
+    })
+    .to_string()
+}
+
+#[cfg(all(windows, feature = "screencam"))]
+fn requested_preview_session_id(value: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(value)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("session_id")?
+                .as_str()
+                .map(str::trim)
+                .map(str::to_owned)
+        })
+        .unwrap_or_default()
+}
+
+#[cfg(all(windows, feature = "screencam"))]
+fn preview_outcome_ack(outcome: crate::server::screen_cam::PreviewControlOutcome) -> String {
+    screencam_preview_ack(
+        outcome.applied,
+        outcome.changed,
+        &outcome.session_id,
+        outcome.rejection.map(|rejection| rejection.message()),
+    )
+}
+
+#[cfg(all(windows, feature = "screencam"))]
+fn process_screencam_preview_start(value: &str) -> String {
+    process_screencam_preview_start_with(value, Config::get_id().as_str(), |request, local_id| {
+        crate::server::screen_cam::apply_preview_start(request, local_id)
+    })
+}
+
+#[cfg(all(windows, feature = "screencam"))]
+fn process_screencam_preview_start_with<F>(value: &str, local_rustdesk_id: &str, apply: F) -> String
+where
+    F: FnOnce(
+        crate::server::screen_cam::PreviewStartRequest,
+        &str,
+    ) -> crate::server::screen_cam::PreviewControlOutcome,
+{
+    let request_session_id = requested_preview_session_id(value);
+    if value.is_empty() || value.len() > SCREENCAM_PREVIEW_REQUEST_MAX_BYTES {
+        return screencam_preview_ack(
+            false,
+            false,
+            &request_session_id,
+            Some("invalid preview request"),
+        );
+    }
+    let Some(request) = crate::server::screen_cam::PreviewStartRequest::from_json(value) else {
+        return screencam_preview_ack(
+            false,
+            false,
+            &request_session_id,
+            Some("invalid preview request"),
+        );
+    };
+    preview_outcome_ack(apply(request, local_rustdesk_id))
+}
+
+#[cfg(all(windows, feature = "screencam"))]
+fn process_screencam_preview_stop(value: &str) -> String {
+    process_screencam_preview_stop_with(value, Config::get_id().as_str(), |request, local_id| {
+        crate::server::screen_cam::apply_preview_stop(request, local_id)
+    })
+}
+
+#[cfg(all(windows, feature = "screencam"))]
+fn process_screencam_preview_stop_with<F>(value: &str, local_rustdesk_id: &str, apply: F) -> String
+where
+    F: FnOnce(
+        crate::server::screen_cam::PreviewStopRequest,
+        &str,
+    ) -> crate::server::screen_cam::PreviewControlOutcome,
+{
+    let request_session_id = requested_preview_session_id(value);
+    if value.is_empty() || value.len() > SCREENCAM_PREVIEW_REQUEST_MAX_BYTES {
+        return screencam_preview_ack(
+            false,
+            false,
+            &request_session_id,
+            Some("invalid preview request"),
+        );
+    }
+    let Some(request) = crate::server::screen_cam::PreviewStopRequest::from_json(value) else {
+        return screencam_preview_ack(
+            false,
+            false,
+            &request_session_id,
+            Some("invalid preview request"),
+        );
+    };
+    preview_outcome_ack(apply(request, local_rustdesk_id))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1062,6 +1187,56 @@ async fn handle(data: Data, stream: &mut Connection) {
                     {
                         updated = false;
                     }
+                } else if name == "screencam-preview-start" {
+                    #[cfg(all(windows, feature = "screencam"))]
+                    {
+                        let response = process_screencam_preview_start(&value);
+                        updated = serde_json::from_str::<serde_json::Value>(&response)
+                            .ok()
+                            .and_then(|value| value["applied"].as_bool())
+                            .unwrap_or(false);
+                        allow_err!(
+                            stream
+                                .send(&Data::Config((name.clone(), Some(response))))
+                                .await
+                        );
+                    }
+                    #[cfg(not(all(windows, feature = "screencam")))]
+                    {
+                        updated = false;
+                    }
+                } else if name == "screencam-preview-status" {
+                    // Read-only: the snapshot stays put so the UI can re-send it
+                    // after a WebSocket reconnect. Always answers, so a caller
+                    // never has to read a timeout as a state.
+                    updated = false;
+                    #[cfg(all(windows, feature = "screencam"))]
+                    let response = crate::server::screen_cam::preview_lifecycle_status_json();
+                    #[cfg(not(all(windows, feature = "screencam")))]
+                    let response = r#"{"state":"unsupported"}"#.to_owned();
+                    allow_err!(
+                        stream
+                            .send(&Data::Config((name.clone(), Some(response))))
+                            .await
+                    );
+                } else if name == "screencam-preview-stop" {
+                    #[cfg(all(windows, feature = "screencam"))]
+                    {
+                        let response = process_screencam_preview_stop(&value);
+                        updated = serde_json::from_str::<serde_json::Value>(&response)
+                            .ok()
+                            .and_then(|value| value["applied"].as_bool())
+                            .unwrap_or(false);
+                        allow_err!(
+                            stream
+                                .send(&Data::Config((name.clone(), Some(response))))
+                                .await
+                        );
+                    }
+                    #[cfg(not(all(windows, feature = "screencam")))]
+                    {
+                        updated = false;
+                    }
                 } else {
                     return;
                 }
@@ -1689,6 +1864,107 @@ pub async fn set_screencam_display_policy_with_ack(value: String) -> ResultType<
         }
     }
     bail!("ScreenCam display policy IPC did not return an acknowledgement")
+}
+
+#[cfg(all(windows, feature = "screencam"))]
+fn serialize_screencam_preview_start(
+    session_id: String,
+    rustdesk_id: String,
+    publish_url: String,
+    publish_token: String,
+    stream_name: String,
+    expires_in: u32,
+) -> ResultType<String> {
+    Ok(serde_json::to_string(
+        &crate::server::screen_cam::PreviewStartRequest {
+            session_id,
+            rustdesk_id,
+            publish_url,
+            publish_token,
+            stream_name,
+            expires_in,
+        },
+    )?)
+}
+
+#[cfg(all(windows, feature = "screencam"))]
+fn serialize_screencam_preview_stop(session_id: String, rustdesk_id: String) -> ResultType<String> {
+    Ok(serde_json::to_string(
+        &crate::server::screen_cam::PreviewStopRequest {
+            session_id,
+            rustdesk_id,
+        },
+    )?)
+}
+
+#[cfg(all(windows, feature = "screencam"))]
+async fn send_screencam_preview_with_ack(name: &str, payload: String) -> ResultType<String> {
+    const ACK_TIMEOUT_MS: u64 = 1_000;
+    let mut connection = connect(ACK_TIMEOUT_MS, "").await?;
+    connection.send_config(name, payload).await?;
+    if let Some(Data::Config((response_name, Some(response)))) =
+        connection.next_timeout(ACK_TIMEOUT_MS).await?
+    {
+        if response_name == name {
+            return Ok(response);
+        }
+    }
+    bail!("ScreenCam preview IPC did not return an acknowledgement")
+}
+
+#[cfg(all(windows, feature = "screencam"))]
+#[tokio::main(flavor = "current_thread")]
+pub async fn set_screencam_preview_start_with_ack(
+    session_id: String,
+    rustdesk_id: String,
+    publish_url: String,
+    publish_token: String,
+    stream_name: String,
+    expires_in: u32,
+) -> ResultType<String> {
+    let payload = serialize_screencam_preview_start(
+        session_id,
+        rustdesk_id,
+        publish_url,
+        publish_token,
+        stream_name,
+        expires_in,
+    )?;
+    send_screencam_preview_with_ack("screencam-preview-start", payload).await
+}
+
+/// Reads the publisher's last reported lifecycle state from the daemon.
+///
+/// Deliberately separate from the START/STOP helpers: this one is polled, so it
+/// uses a short timeout and reports failure to the caller rather than logging —
+/// the daemon being momentarily absent is expected, not an error worth a line
+/// in the log every 400 ms.
+#[cfg(all(windows, feature = "screencam"))]
+#[tokio::main(flavor = "current_thread")]
+pub async fn get_screencam_preview_status() -> ResultType<String> {
+    const STATUS_TIMEOUT_MS: u64 = 500;
+    let mut connection = connect(STATUS_TIMEOUT_MS, "").await?;
+    connection
+        .send_config("screencam-preview-status", String::new())
+        .await?;
+    if let Some(Data::Config((response_name, Some(response)))) =
+        connection.next_timeout(STATUS_TIMEOUT_MS).await?
+    {
+        if response_name == "screencam-preview-status" {
+            return Ok(response);
+        }
+    }
+    bail!("ScreenCam preview status IPC did not answer")
+}
+
+#[cfg(all(windows, feature = "screencam"))]
+#[tokio::main(flavor = "current_thread")]
+pub async fn set_screencam_preview_stop_with_ack(
+    session_id: String,
+    rustdesk_id: String,
+) -> ResultType<String> {
+    let payload = serialize_screencam_preview_stop(session_id, rustdesk_id)?;
+    send_screencam_preview_with_ack("screencam-preview-stop", payload).await
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -2417,6 +2693,141 @@ mod test {
             assert_eq!(nack["changed"], false);
             assert_eq!(nack["error"], "ipc_unavailable");
         }
+    }
+
+    #[cfg(all(windows, feature = "screencam"))]
+    #[test]
+    fn screencam_preview_ipc_serializes_and_deserializes_start_and_stop() {
+        let start = serialize_screencam_preview_start(
+            "pv_serialized".to_owned(),
+            "485236790".to_owned(),
+            "srt://preview.example:8890".to_owned(),
+            "test-token-redacted".to_owned(),
+            "pv_serialized".to_owned(),
+            300,
+        )
+        .unwrap();
+        let decoded = crate::server::screen_cam::PreviewStartRequest::from_json(&start).unwrap();
+        assert_eq!(decoded.session_id, "pv_serialized");
+        assert_eq!(decoded.rustdesk_id, "485236790");
+        assert_eq!(decoded.expires_in, 300);
+
+        let stop =
+            serialize_screencam_preview_stop("pv_serialized".to_owned(), "485236790".to_owned())
+                .unwrap();
+        let decoded = crate::server::screen_cam::PreviewStopRequest::from_json(&stop).unwrap();
+        assert_eq!(decoded.session_id, "pv_serialized");
+        assert_eq!(decoded.rustdesk_id, "485236790");
+    }
+
+    #[cfg(all(windows, feature = "screencam"))]
+    #[test]
+    fn screencam_preview_ack_has_stable_sanitized_shape() {
+        let ack = screencam_preview_ack(true, false, "pv_ack", None);
+        let decoded = serde_json::from_str::<serde_json::Value>(&ack).unwrap();
+        assert_eq!(decoded["applied"], true);
+        assert_eq!(decoded["changed"], false);
+        assert_eq!(decoded["session_id"], "pv_ack");
+        assert!(decoded["error"].is_null());
+
+        let unsafe_error = format!("token={} srt://preview.example:8890", "sensitive");
+        let nack = screencam_preview_ack(false, false, "pv_ack", Some(&unsafe_error));
+        assert!(!nack.contains("sensitive"));
+        assert!(!nack.contains("preview.example"));
+        let decoded = serde_json::from_str::<serde_json::Value>(&nack).unwrap();
+        assert_eq!(decoded["error"], "preview request failed");
+
+        let long_error = "x".repeat(150);
+        let nack = screencam_preview_ack(false, false, "pv_ack", Some(&long_error));
+        let decoded = serde_json::from_str::<serde_json::Value>(&nack).unwrap();
+        assert_eq!(decoded["error"].as_str().unwrap().chars().count(), 100);
+    }
+
+    #[cfg(all(windows, feature = "screencam"))]
+    #[test]
+    fn screencam_preview_start_route_validates_before_apply() {
+        let valid = r#"{"session_id":"pv_valid","rustdesk_id":"485236790","publish_url":"srt://preview.example:8890","publish_token":"test-token-redacted","stream_name":"pv_valid","expires_in":300}"#;
+        let mut calls = 0;
+        let ack = process_screencam_preview_start_with(valid, "485236790", |request, local_id| {
+            calls += 1;
+            assert_eq!(request.session_id, "pv_valid");
+            assert_eq!(local_id, "485236790");
+            crate::server::screen_cam::PreviewControlOutcome {
+                applied: true,
+                changed: true,
+                session_id: request.session_id,
+                rejection: None,
+            }
+        });
+        assert_eq!(calls, 1);
+        assert!(!ack.contains("test-token-redacted"));
+        let ack = serde_json::from_str::<serde_json::Value>(&ack).unwrap();
+        assert_eq!(ack["applied"], true);
+        assert_eq!(ack["changed"], true);
+        assert_eq!(ack["session_id"], "pv_valid");
+
+        for invalid in [
+            "not-json",
+            "{}",
+            r#"{"session_id":"pv","rustdesk_id":1,"publish_url":"srt://preview.example:8890","publish_token":"secret","stream_name":"pv","expires_in":300}"#,
+            r#"{"session_id":"pv","rustdesk_id":"485236790","publish_url":"https://preview.example:8890","publish_token":"secret","stream_name":"pv","expires_in":300}"#,
+            r#"{"session_id":"pv","rustdesk_id":"485236790","publish_url":"srt://preview.example:8890","publish_token":"secret","stream_name":"pv","expires_in":0}"#,
+        ] {
+            let ack = process_screencam_preview_start_with(invalid, "485236790", |_, _| {
+                panic!("invalid request reached apply")
+            });
+            let ack = serde_json::from_str::<serde_json::Value>(&ack).unwrap();
+            assert_eq!(ack["applied"], false);
+            assert_eq!(ack["changed"], false);
+            assert_eq!(ack["error"], "invalid preview request");
+        }
+    }
+
+    #[cfg(all(windows, feature = "screencam"))]
+    /// The status route must always produce parseable JSON, including when
+    /// nothing has happened yet — the UI poller treats an unparseable answer
+    /// and a missing one the same way, and neither should be a normal state.
+    #[cfg(all(windows, feature = "screencam"))]
+    #[test]
+    fn screencam_preview_status_is_always_valid_json() {
+        crate::server::screen_cam::reset_preview_lifecycle_for_test();
+
+        let idle = crate::server::screen_cam::preview_lifecycle_status_json();
+        let parsed: serde_json::Value = serde_json::from_str(&idle).expect("valid JSON");
+        assert_eq!(parsed["state"], "idle");
+        assert!(parsed["sequence"].is_null(), "idle carries no sequence");
+
+        crate::server::screen_cam::publish_preview_lifecycle_for_test();
+
+        let live = crate::server::screen_cam::preview_lifecycle_status_json();
+        let parsed: serde_json::Value = serde_json::from_str(&live).expect("valid JSON");
+        assert_eq!(parsed["event"], "screen_cam.preview.started");
+        assert_eq!(parsed["session_id"], "pv_status_test");
+        assert_eq!(parsed["rustdesk_id"], "485236790");
+        assert!(parsed["sequence"].as_u64().is_some());
+        // Nothing the panel must never see.
+        assert!(!live.contains("publish:"));
+        assert!(!live.contains("srt://"));
+        assert!(!live.contains("token"));
+    }
+
+    #[test]
+    fn screencam_preview_old_stop_ack_is_idempotent() {
+        let stop = r#"{"session_id":"pv_old","rustdesk_id":"485236790"}"#;
+        let ack = process_screencam_preview_stop_with(stop, "485236790", |request, local_id| {
+            assert_eq!(local_id, "485236790");
+            crate::server::screen_cam::PreviewControlOutcome {
+                applied: true,
+                changed: false,
+                session_id: request.session_id,
+                rejection: None,
+            }
+        });
+        let ack = serde_json::from_str::<serde_json::Value>(&ack).unwrap();
+        assert_eq!(ack["applied"], true);
+        assert_eq!(ack["changed"], false);
+        assert_eq!(ack["session_id"], "pv_old");
+        assert!(ack["error"].is_null());
     }
 
     #[cfg(all(windows, feature = "screencam"))]
