@@ -14,7 +14,8 @@ use std::{
 };
 use url::Url;
 
-const MAX_PREVIEW_DURATION_SECS: u32 = 300;
+const MIN_PREVIEW_DURATION_SECS: u32 = 60;
+const MAX_PREVIEW_DURATION_SECS: u32 = 1800;
 
 #[derive(Deserialize, Serialize)]
 pub(crate) struct PreviewStartRequest {
@@ -36,7 +37,7 @@ impl PreviewStartRequest {
             return None;
         }
         request.stream_name = trimmed_non_empty(&request.stream_name)?;
-        if !(1..=MAX_PREVIEW_DURATION_SECS).contains(&request.expires_in)
+        if !(MIN_PREVIEW_DURATION_SECS..=MAX_PREVIEW_DURATION_SECS).contains(&request.expires_in)
             || !valid_srt_publish_url(&request.publish_url)
         {
             return None;
@@ -702,7 +703,7 @@ mod tests {
     #[test]
     fn preview_requests_validate_types_ranges_and_urls() {
         assert!(PreviewStartRequest::from_json(
-            r#"{"session_id":"pv","rustdesk_id":"485236790","publish_url":"srt://host:8890","publish_token":"secret","stream_name":"pv","expires_in":300}"#
+            r#"{"session_id":"pv","rustdesk_id":"485236790","publish_url":"srt://host:8890","publish_token":"secret","stream_name":"pv","expires_in":1800}"#
         )
         .is_some());
         for invalid in [
@@ -714,7 +715,8 @@ mod tests {
             r#"{"session_id":"pv","rustdesk_id":"485236790","publish_url":"srt://host:8890#fragment","publish_token":"secret","stream_name":"pv","expires_in":300}"#,
             r#"{"session_id":"pv","rustdesk_id":"485236790","publish_url":"srt://host:8890?streamid=existing","publish_token":"secret","stream_name":"pv","expires_in":300}"#,
             r#"{"session_id":"pv","rustdesk_id":"485236790","publish_url":"srt://host:8890","publish_token":"secret","stream_name":"pv","expires_in":0}"#,
-            r#"{"session_id":"pv","rustdesk_id":"485236790","publish_url":"srt://host:8890","publish_token":"secret","stream_name":"pv","expires_in":301}"#,
+            r#"{"session_id":"pv","rustdesk_id":"485236790","publish_url":"srt://host:8890","publish_token":"secret","stream_name":"pv","expires_in":59}"#,
+            r#"{"session_id":"pv","rustdesk_id":"485236790","publish_url":"srt://host:8890","publish_token":"secret","stream_name":"pv","expires_in":1801}"#,
         ] {
             assert!(PreviewStartRequest::from_json(invalid).is_none());
         }

@@ -51,8 +51,8 @@ ScreenCamPreviewStartMessage? parseScreenCamPreviewStart(Object? data) {
       publishToken.trim().isEmpty ||
       streamName == null ||
       expiresIn is! int ||
-      expiresIn < 1 ||
-      expiresIn > 300 ||
+      expiresIn < 60 ||
+      expiresIn > 1800 ||
       !_isValidSrtPublishUrl(publishUrl)) {
     return null;
   }

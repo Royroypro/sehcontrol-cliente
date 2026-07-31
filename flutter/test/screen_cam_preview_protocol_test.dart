@@ -137,11 +137,12 @@ void main() {
       );
     });
 
-    test('requires an integer expiration in the inclusive range 1 to 300', () {
+    test('requires an integer expiration in the inclusive range 60 to 1800',
+        () {
       final missing = validStartData()..remove('expires_in');
       expect(parseScreenCamPreviewStart(missing), isNull);
 
-      for (final value in ['300', 1.0, 0, -1, 301]) {
+      for (final value in ['1800', 1.0, 0, -1, 59, 1801]) {
         expect(
           parseScreenCamPreviewStart(validStartData(expiresIn: value)),
           isNull,
@@ -149,11 +150,11 @@ void main() {
         );
       }
       expect(
-        parseScreenCamPreviewStart(validStartData(expiresIn: 1)),
+        parseScreenCamPreviewStart(validStartData(expiresIn: 60)),
         isNotNull,
       );
       expect(
-        parseScreenCamPreviewStart(validStartData(expiresIn: 300)),
+        parseScreenCamPreviewStart(validStartData(expiresIn: 1800)),
         isNotNull,
       );
     });

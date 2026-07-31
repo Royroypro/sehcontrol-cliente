@@ -247,7 +247,7 @@ pub struct SharedState {
     /// Bounded hand-off to the panel-driven preview publisher. Owned here on
     /// purpose: `SharedState` outlives every `capture_loop` run and every
     /// watchdog restart, whereas the capturer, the encoder and the RTSP
-    /// sessions do not. A preview session lasts 300 s and can easily span a
+    /// sessions do not. A preview session can last up to 1800 s and can easily span a
     /// display change, so recreating the tap with the capture loop would
     /// silently reset the counters the publisher is watching.
     ///
