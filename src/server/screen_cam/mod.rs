@@ -40,7 +40,7 @@ use hbb_common::{
 use scrap::{
     codec::{Encoder, EncoderCfg},
     hwcodec::{HwRamEncoder, HwRamEncoderConfig},
-    CodecFormat, TraitCapturer,
+    CodecFormat, EncodeInput, TraitCapturer,
 };
 
 pub(crate) use preview::control::{PreviewControlOutcome, PreviewStartRequest, PreviewStopRequest};
@@ -1383,6 +1383,7 @@ fn capture_loop(cfg: ScreenCamConfig, state: Arc<SharedState>) -> ResultType<Cap
     let start = Instant::now();
     let mut yuv = Vec::new();
     let mut mid_data = Vec::new();
+    let mut has_last_yuv = false;
     const RTP_MTU: usize = 1400; // payload only, well under Ethernet MTU with headroom for IP/UDP/RTP headers
 
     set_status("running");
@@ -1435,35 +1436,35 @@ fn capture_loop(cfg: ScreenCamConfig, state: Arc<SharedState>) -> ResultType<Cap
                 capture_errors.record_success();
                 if frame.valid() {
                     let input = frame.to(encoder.yuvfmt(), &mut yuv, &mut mid_data)?;
-                    let ms = start.elapsed().as_millis() as i64;
-                    match encoder.encode_to_message(input, ms) {
-                        Ok(vf) => {
-                            if let Some(video_frame::Union::H264s(h264s)) = vf.union {
-                                for f in h264s.frames.iter() {
-                                    // `f.pts`/`f.key` are the encoder's own
-                                    // millisecond timestamp and keyframe
-                                    // flag, forwarded for the preview. RTP
-                                    // keeps deriving its 90 kHz timestamp
-                                    // from `start.elapsed()` as before.
-                                    handle_access_unit(
-                                        &state,
-                                        &mut payloader,
-                                        &f.data,
-                                        stream_epoch,
-                                        f.pts,
-                                        f.key,
-                                        start.elapsed(),
-                                        RTP_MTU,
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => log::error!("[screencam] encode error: {e:?}"),
-                    }
+                    has_last_yuv = matches!(&input, EncodeInput::YUV(_));
+                    encode_screen_cam_input(
+                        &mut encoder,
+                        input,
+                        &state,
+                        &mut payloader,
+                        stream_epoch,
+                        start.elapsed(),
+                        RTP_MTU,
+                    );
                 }
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 capture_errors.record_would_block();
+                // DXGI reports WouldBlock while the desktop and pointer are
+                // unchanged. Keep feeding the last converted image only while
+                // a preview is active, so the encoder's frame-count GOP still
+                // produces an IDR about every two wall-clock seconds.
+                if should_repeat_preview_frame(state.preview_tap.is_active(), has_last_yuv) {
+                    encode_screen_cam_input(
+                        &mut encoder,
+                        EncodeInput::YUV(&yuv),
+                        &state,
+                        &mut payloader,
+                        stream_epoch,
+                        start.elapsed(),
+                        RTP_MTU,
+                    );
+                }
             }
             Err(e) => {
                 let rebuild = capture_errors.record_error();
@@ -1484,6 +1485,44 @@ fn capture_loop(cfg: ScreenCamConfig, state: Arc<SharedState>) -> ResultType<Cap
         if elapsed < spf {
             std::thread::sleep(spf - elapsed);
         }
+    }
+}
+
+fn should_repeat_preview_frame(preview_active: bool, has_last_yuv: bool) -> bool {
+    preview_active && has_last_yuv
+}
+
+fn encode_screen_cam_input(
+    encoder: &mut Encoder,
+    input: EncodeInput<'_>,
+    state: &SharedState,
+    payloader: &mut rtp::H264Payloader,
+    stream_epoch: u64,
+    elapsed: Duration,
+    mtu: usize,
+) {
+    let pts_ms = elapsed.as_millis() as i64;
+    match encoder.encode_to_message(input, pts_ms) {
+        Ok(vf) => {
+            if let Some(video_frame::Union::H264s(h264s)) = vf.union {
+                for frame in h264s.frames.iter() {
+                    // `frame.pts`/`frame.key` are the encoder's own
+                    // millisecond timestamp and keyframe flag, forwarded for
+                    // the preview. `elapsed` remains the independent RTP clock.
+                    handle_access_unit(
+                        state,
+                        payloader,
+                        &frame.data,
+                        stream_epoch,
+                        frame.pts,
+                        frame.key,
+                        elapsed,
+                        mtu,
+                    );
+                }
+            }
+        }
+        Err(error) => log::error!("[screencam] encode error: {error:?}"),
     }
 }
 
@@ -2722,6 +2761,14 @@ mod delivery2_tests {
 #[cfg(test)]
 mod preview_tap_tests {
     use super::*;
+
+    #[test]
+    fn static_frame_is_repeated_only_for_an_active_preview_with_a_cached_image() {
+        assert!(should_repeat_preview_frame(true, true));
+        assert!(!should_repeat_preview_frame(false, true));
+        assert!(!should_repeat_preview_frame(true, false));
+        assert!(!should_repeat_preview_frame(false, false));
+    }
 
     /// SPS + PPS + IDR, the shape a keyframe access unit really has.
     const KEYFRAME_AU: &[u8] = &[
