@@ -10,6 +10,7 @@ if /I "%~1"=="__CONFIGURAR__" goto CONFIGURAR
 if /I "%~1"=="__AYUDA__" goto AYUDA
 if /I "%~1"=="__MENU__" goto MENU
 if /I "%~1"=="__ESTADO__" goto ESTADO
+if /I "%~1"=="__VERSION__" goto VERSION
 
 start "Sehcontrol Entrega 4 Dev CMD" cmd.exe /k ""%~f0" __CONFIGURAR__"
 exit /b
@@ -192,6 +193,8 @@ doskey abrir-apk=start "" "%SEHCONTROL_ROOT%\flutter\build\app\outputs\flutter-a
 rem ---------------------------------------------------------------------
 rem  Alias de ayuda, mantenimiento y diagnostico
 rem ---------------------------------------------------------------------
+doskey version=call "%SEHCONTROL_LAUNCHER%" __VERSION__
+doskey cambiar-version=call "%SEHCONTROL_LAUNCHER%" __VERSION__
 doskey ayuda=call "%SEHCONTROL_LAUNCHER%" __AYUDA__
 doskey seh-ayuda=call "%SEHCONTROL_LAUNCHER%" __AYUDA__
 doskey menu=call "%SEHCONTROL_LAUNCHER%" __MENU__
@@ -208,8 +211,39 @@ doskey ejecutar-seh=start "" "%SEHCONTROL_ROOT%\flutter\build\windows\x64\runner
 doskey seh-comandos=doskey /macros
 
 cls
+call :PREGUNTAR_VERSION
 call :PANEL_INICIAL
 goto :eof
+
+
+rem ---------------------------------------------------------------------
+rem  Pregunta si se quiere subir la version antes de compilar.
+rem
+rem  Existe porque olvidarse es facil y el sintoma aparece tarde y confunde:
+rem  si el binario publicado no alcanza la version declarada en el panel, los
+rem  equipos ofrecen la actualizacion, la instalan, siguen viendo la misma
+rem  version y la vuelven a ofrecer, en bucle.
+rem
+rem  El default es NO y hay timeout: cambiar la version solo hace falta cuando
+rem  se va a publicar, no en cada compilacion de prueba.
+rem ---------------------------------------------------------------------
+:PREGUNTAR_VERSION
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SEHCONTROL_ROOT%\scripts\cambiar-version.ps1" -Mostrar
+echo.
+choice /C SN /N /T 15 /D N /M "Cambiar la version antes de compilar? [S/N] (N en 15s): "
+if errorlevel 2 goto PREGUNTAR_VERSION_FIN
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SEHCONTROL_ROOT%\scripts\cambiar-version.ps1"
+echo.
+pause
+
+:PREGUNTAR_VERSION_FIN
+cls
+goto :eof
+
+
+:VERSION
+powershell -NoProfile -ExecutionPolicy Bypass -File "%SEHCONTROL_ROOT%\scripts\cambiar-version.ps1"
+exit /b
 
 
 :PANEL_INICIAL
@@ -237,6 +271,7 @@ echo   abrir-apk        Abrir la carpeta del APK generado
 echo.
 echo  AYUDA Y UTILIDADES
 echo  ----------------------------------------------------------------------
+echo   version          Cambiar la version antes de publicar
 echo   ayuda            Guia completa de variantes y comandos
 echo   menu             Menu interactivo por numeros
 echo   estado           Revisar herramientas, variables y FFmpeg
