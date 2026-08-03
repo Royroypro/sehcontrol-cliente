@@ -95,33 +95,32 @@ Set-Content -LiteralPath $pubspecPath -Value $pubspec -Encoding UTF8
 
 # Cargo.lock tambien registra la version del propio paquete, y build.py compila
 # con --locked: sin esto el build aborta con "the lock file needs to be updated
-# but --locked was passed" y hay que descubrir por que a mano.
+# but --locked was passed", que no menciona en ningun lado que el motivo fue
+# haber cambiado la version un minuto antes.
 #
-# Se deja que cargo lo reescriba en vez de editarlo con texto: el formato del
-# lock es suyo. --offline para que no salga a la red solo por cambiar un
-# numero. Su codigo de salida se ignora a proposito -- en offline puede quejarse
-# de otras cosas mientras igual sincroniza el lock, asi que lo que se comprueba
-# es el resultado.
-Push-Location $root
-try {
-    & cargo metadata --offline --format-version 1 *> $null
-} finally {
-    Pop-Location
-    # Sin esto el codigo de salida de cargo se convierte en el del script, y
-    # quien lo llame -el .bat, por ejemplo- lo lee como un fallo aunque el
-    # lock haya quedado bien. El resultado real se comprueba abajo.
-    $global:LASTEXITCODE = 0
-}
-
+# Se edita el archivo en vez de dejar que cargo lo reescriba. El primer intento
+# fue `cargo metadata --offline`, pero eso resuelve el grafo completo de
+# dependencias y falla si alguna no esta en la cache local ("failed to download
+# assert_matches"), escupiendo un error alarmante aunque el lock termine bien.
+# Cambiar la version de un miembro del workspace no requiere resolver nada: es
+# un solo campo, y este reemplazo es exactamente lo que hace cargo.
 $lockPath = Join-Path $root 'Cargo.lock'
-$lockOk = $false
-if (Test-Path -LiteralPath $lockPath) {
+if (-not (Test-Path -LiteralPath $lockPath)) {
+    Write-Warning "No se encontro Cargo.lock. Se creara al compilar."
+} else {
     $lock = Get-Content -LiteralPath $lockPath -Raw
-    # La entrada del paquete propio, no la de una dependencia que se llame igual.
-    $lockOk = $lock -match "(?m)^name = ""sehcontrol""\r?\nversion = ""$([regex]::Escape($Version))"""
-}
-if (-not $lockOk) {
-    Write-Warning "Cargo.lock no quedo sincronizado. Antes de compilar, corre: cargo metadata --offline"
+    # Ancla en el nombre exacto para no tocar sehcontrol-portable-packer, que
+    # es otro paquete con su propia version.
+    $patron = '(?m)^(name = "sehcontrol"\r?\nversion = ")[^"]+(")'
+    $coincidencias = ([regex]$patron).Matches($lock).Count
+    if ($coincidencias -ne 1) {
+        Write-Warning "Cargo.lock: se esperaba una entrada de 'sehcontrol' y hay $coincidencias. No se modifico; corre 'cargo check' antes de compilar."
+    } else {
+        $lock = [regex]::Replace($lock, $patron, "`${1}$Version`${2}")
+        # Sin BOM y respetando los finales de linea que ya tenia: cargo
+        # reescribiria el lock entero si algo no le cuadra.
+        [System.IO.File]::WriteAllText($lockPath, $lock, (New-Object System.Text.UTF8Encoding($false)))
+    }
 }
 
 Write-Output ''
