@@ -259,6 +259,27 @@ impl WsFramedStream {
         self.send_bytes(Bytes::from(msg)).await
     }
 
+    /// Sends a text frame verbatim, bypassing `encrypt`.
+    ///
+    /// The binary path above carries RustDesk's own protobuf protocol. A JSON
+    /// endpoint speaking text frames -- the Sehcontrol panel's `/api/ws` -- is
+    /// a different conversation: its peer would have to guess that a binary
+    /// frame holds UTF-8, and nothing on that side does. `next()` already
+    /// accepts text, so this only completes the pair.
+    pub async fn send_text(&mut self, text: String) -> ResultType<()> {
+        let msg = WsMessage::Text(text.into());
+        if self.send_timeout > 0 {
+            timeout(
+                Duration::from_millis(self.send_timeout),
+                self.stream.send(msg),
+            )
+            .await??
+        } else {
+            self.stream.send(msg).await?
+        };
+        Ok(())
+    }
+
     pub async fn send_bytes(&mut self, bytes: Bytes) -> ResultType<()> {
         let msg = WsMessage::Binary(bytes);
         if self.send_timeout > 0 {
