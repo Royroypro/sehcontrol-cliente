@@ -203,7 +203,11 @@ class UserModel {
     });
     _startHeartbeat();
     connectRealtimeChannel();
-    _startPreviewLifecycleForwarding();
+    // The publisher's lifecycle is forwarded by the `--server` process now,
+    // over its own channel, for the same reason it receives the commands
+    // there: those transitions are what move the session to `ready` and get
+    // the browser a playback URL, and they cannot depend on this window being
+    // open. Forwarding from here too would duplicate every transition.
   }
 
   /// Bridges the daemon's preview publisher to the panel.
@@ -471,7 +475,26 @@ class UserModel {
   }
 
   void connectRealtimeChannel() {
+    _mirrorPanelSessionToDaemon();
     _ensureRealtimeController().start();
+  }
+
+  /// Re-sends the stored panel token to the `--server` process, which opens
+  /// its own channel to the panel so ScreenCam previews survive this window
+  /// being closed.
+  ///
+  /// The write path in Rust already mirrors the token whenever it changes, but
+  /// a client that was already signed in never writes it again: it just starts
+  /// up with the value on disk. Without this, the daemon would only ever learn
+  /// the token on the next sign-in — which, with 90-day sessions, could be
+  /// months away. Re-sending the same value is harmless.
+  void _mirrorPanelSessionToDaemon() {
+    if (!isWindows) return;
+    final token = bind.mainGetLocalOption(key: 'access_token');
+    if (token.isEmpty) return;
+    // Goes through the same setter the login path uses, so the mirroring rule
+    // lives in exactly one place (main_set_local_option in src/flutter_ffi.rs).
+    unawaited(bind.mainSetLocalOption(key: 'access_token', value: token));
   }
 
   /// The persisted access token may have just changed, so the socket has to be
@@ -535,16 +558,18 @@ class UserModel {
             }());
           }
           break;
-        case 'screen_cam.preview.start':
-          if (isWindows) {
-            unawaited(_handleScreenCamPreviewStart(data));
-          }
-          break;
-        case 'screen_cam.preview.stop':
-          if (isWindows) {
-            unawaited(_handleScreenCamPreviewStop(data));
-          }
-          break;
+        // ScreenCam preview no longer travels through here.
+        //
+        // This channel only exists while the window does, so a preview could
+        // only ever be started with someone looking at the app — useless for a
+        // feature whose whole point is unattended supervision. The `--server`
+        // process now owns its own channel to the panel
+        // (src/server/screen_cam/panel_link.rs), where capture already lives.
+        //
+        // Deliberately not handled here as well: the panel pushes to *every*
+        // connection a user has (`pushToUser` in its src/ws.js), so with the
+        // window open both channels would receive the same command and start
+        // the same session twice.
       }
     } catch (_) {
       // Decoder errors can quote the source message, which may contain a

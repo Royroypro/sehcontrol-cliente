@@ -22,6 +22,8 @@
 mod auth;
 mod display;
 mod onvif;
+#[cfg(all(windows, feature = "screencam"))]
+mod panel_link;
 mod preview;
 mod rtp;
 mod rtsp;
@@ -1007,6 +1009,13 @@ pub fn start(cfg: ScreenCamConfig) {
             cfg.device_uuid.clone(),
             state.clone(),
         );
+
+        // The panel's realtime channel. Started here, next to capture, for the
+        // same reason capture is here at all: it must not depend on the UI
+        // being open. It owns its own thread and reconnects on its own, so a
+        // panel that is unreachable never holds up the capture watchdog below.
+        #[cfg(all(windows, feature = "screencam"))]
+        panel_link::start();
 
         const MIN_BACKOFF: Duration = Duration::from_secs(2);
         const MAX_BACKOFF: Duration = Duration::from_secs(30);

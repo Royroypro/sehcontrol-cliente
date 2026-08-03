@@ -1133,6 +1133,12 @@ async fn handle(data: Data, stream: &mut Connection) {
                     crate::audio_service::set_voice_call_input_device(Some(value), true);
                 } else if name == "unlock-pin" {
                     Config::set_unlock_pin(&value);
+                } else if name == "screencam-panel-token" {
+                    // Opaque to this process: it is only ever handed back to
+                    // the panel that issued it. An empty value is a logout and
+                    // must clear it, so there is no non-empty check here.
+                    // Never logged, and the ACK below prints the name only.
+                    set_local_option(name.clone(), value);
                 } else if name == "screencam-licensed" {
                     if matches!(value.as_str(), "Y" | "N") {
                         set_local_option(name.clone(), value);
