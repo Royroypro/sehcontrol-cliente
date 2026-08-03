@@ -11,6 +11,15 @@ import 'package:path/path.dart';
 import 'package:url_launcher/url_launcher_string.dart';
 import 'package:window_manager/window_manager.dart';
 
+/// Los documentos legales viven en el servidor del proveedor, no en
+/// rustdesk.com: quien instala esto acepta las condiciones de Sehcontrol, y el
+/// acuerdo de RustDesk describe otro servicio y otro responsable.
+///
+/// Es una constante y no el api-server configurado a proposito: en una
+/// instalacion nueva todavia no hay servidor configurado, y esta pantalla es
+/// justamente la primera que se ve.
+const String _kSiteBase = 'https://sehcontrol.sehuacho.com';
+
 class InstallPage extends StatefulWidget {
   const InstallPage({Key? key}) : super(key: key);
 
@@ -103,6 +112,29 @@ class _InstallPageBodyState extends State<_InstallPageBody>
     windowManager.close();
   }
 
+  /// Un enlace legal con su URL visible en el tooltip: quien esta por instalar
+  /// algo que controla su equipo tiene derecho a ver a donde lo mandan antes
+  /// de hacer clic.
+  Widget _legalLink(BuildContext context, String label, String url) {
+    return InkWell(
+      hoverColor: Colors.transparent,
+      onTap: () => launchUrlString(url),
+      child: Tooltip(
+        message: url,
+        child: Row(mainAxisSize: MainAxisSize.min, children: [
+          Icon(Icons.launch_outlined, size: 15).marginOnly(right: 5),
+          Text(
+            translate(label),
+            style: TextStyle(
+              decoration: TextDecoration.underline,
+              color: Theme.of(context).colorScheme.primary,
+            ),
+          )
+        ]),
+      ),
+    );
+  }
+
   InkWell Option(RxBool option, {String label = ''}) {
     return InkWell(
       // todo mouseCursor: "SystemMouseCursors.forbidden" or no cursor on btnEnabled == false
@@ -136,8 +168,29 @@ class _InstallPageBodyState extends State<_InstallPageBody>
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(translate('Installation'),
-                  style: Theme.of(context).textTheme.headlineMedium),
+              // Encabezado con el nombre del producto: el titulo suelto
+              // "Instalacion" no decia que se estaba instalando.
+              Row(
+                crossAxisAlignment: CrossAxisAlignment.center,
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text('${translate('Installation')} $appName',
+                            style:
+                                Theme.of(context).textTheme.headlineMedium),
+                        Text(
+                          '${translate('Version')} ${bind.mainGetVersion()}',
+                          style: TextStyle(
+                              fontSize: 13,
+                              color: Theme.of(context).hintColor),
+                        ).marginOnly(top: 4),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
               Row(
                 children: [
                   Text('${translate('Installation Path')}:')
@@ -161,50 +214,63 @@ class _InstallPageBodyState extends State<_InstallPageBody>
                   )
                 ],
               ).marginSymmetric(vertical: 2 * em),
+              // Las casillas quedaban sueltas contra el fondo, a la misma
+              // altura visual que el resto; agrupadas se leen como lo que son:
+              // opciones de la instalacion.
+              Text(
+                translate('Options'),
+                style: TextStyle(
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                    letterSpacing: 0.4,
+                    color: Theme.of(context).hintColor),
+              ).marginOnly(bottom: 8),
               Option(startmenu, label: 'Create start menu shortcuts')
-                  .marginOnly(bottom: 7),
-              Option(desktopicon, label: 'Create desktop icon')
-                  .marginOnly(bottom: 7),
+                  .marginOnly(bottom: 4),
+              Option(desktopicon, label: 'Create desktop icon'),
               //Option(printer, label: 'Install {$appName} Printer'),
               Container(
-                  padding: EdgeInsets.all(12),
+                  padding: EdgeInsets.all(14),
                   decoration: BoxDecoration(
                     color: isDarkTheme
                         ? Color.fromARGB(135, 87, 87, 90)
                         : Colors.grey[100],
                     borderRadius: BorderRadius.circular(8),
-                    border: Border.all(color: Colors.grey),
+                    border: Border.all(
+                        color: isDarkTheme
+                            ? Colors.grey.withOpacity(0.4)
+                            : Colors.grey.shade300),
                   ),
                   child: Row(
+                    crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
-                      Icon(Icons.info_outline_rounded, size: 32)
-                          .marginOnly(right: 16),
-                      Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Text(translate('agreement_tip'))
-                              .marginOnly(bottom: em),
-                          InkWell(
-                            hoverColor: Colors.transparent,
-                            onTap: () => launchUrlString(
-                                'https://rustdesk.com/privacy.html'),
-                            child: Tooltip(
-                              message: 'https://rustdesk.com/privacy.html',
-                              child: Row(children: [
-                                Icon(Icons.launch_outlined, size: 16)
-                                    .marginOnly(right: 5),
-                                Text(
-                                  translate('End-user license agreement'),
-                                  style: const TextStyle(
-                                      decoration: TextDecoration.underline),
-                                )
-                              ]),
+                      Icon(Icons.info_outline_rounded, size: 26)
+                          .marginOnly(right: 14, top: 2),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Text(translate('agreement_tip'))
+                                .marginOnly(bottom: 0.7 * em),
+                            // Los dos documentos juntos: el acuerdo remite a la
+                            // privacidad y quien va a instalar suele querer
+                            // leer esa antes que nada.
+                            Wrap(
+                              spacing: 18,
+                              runSpacing: 6,
+                              children: [
+                                _legalLink(
+                                    context, 'End-user license agreement',
+                                    '$_kSiteBase/eula'),
+                                _legalLink(context, 'Privacy Statement',
+                                    '$_kSiteBase/privacy.html'),
+                              ],
                             ),
-                          ),
-                        ],
+                          ],
+                        ),
                       )
                     ],
-                  )).marginSymmetric(vertical: 2 * em),
+                  )).marginSymmetric(vertical: 1.6 * em),
               Row(
                 children: [
                   Expanded(
@@ -213,6 +279,10 @@ class _InstallPageBodyState extends State<_InstallPageBody>
                         ? LinearProgressIndicator().marginOnly(right: 10)
                         : Offstage()),
                   ),
+                  // Orden: primero las salidas, y la accion recomendada al
+                  // final. Antes "Aceptar e instalar" quedaba en el medio,
+                  // entre dos botones que hacen otra cosa, y no se leia como
+                  // el camino principal.
                   Obx(
                     () => OutlinedButton.icon(
                       icon: Icon(Icons.close_rounded, size: 16),
@@ -221,14 +291,6 @@ class _InstallPageBodyState extends State<_InstallPageBody>
                           btnEnabled.value ? () => windowManager.close() : null,
                       style: buttonStyle,
                     ).marginOnly(right: 10),
-                  ),
-                  Obx(
-                    () => ElevatedButton.icon(
-                      icon: Icon(Icons.done_rounded, size: 16),
-                      label: Text(translate('Accept and Install')),
-                      onPressed: btnEnabled.value ? install : null,
-                      style: buttonStyle,
-                    ),
                   ),
                   Offstage(
                     offstage: bind.installShowRunWithoutInstall(),
@@ -240,7 +302,20 @@ class _InstallPageBodyState extends State<_InstallPageBody>
                             ? () => bind.installRunWithoutInstall()
                             : null,
                         style: buttonStyle,
-                      ).marginOnly(left: 10),
+                      ).marginOnly(right: 10),
+                    ),
+                  ),
+                  Obx(
+                    () => ElevatedButton.icon(
+                      icon: Icon(Icons.done_rounded, size: 18),
+                      label: Text(translate('Accept and Install')),
+                      onPressed: btnEnabled.value ? install : null,
+                      style: ElevatedButton.styleFrom(
+                        padding: EdgeInsets.symmetric(
+                            horizontal: 1.6 * em, vertical: 1.1 * em),
+                        textStyle: const TextStyle(
+                            fontSize: 14, fontWeight: FontWeight.w600),
+                      ),
                     ),
                   ),
                 ],

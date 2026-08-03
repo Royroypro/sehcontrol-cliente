@@ -754,6 +754,13 @@ pub fn current_is_wayland() -> bool {
 
 #[inline]
 pub fn get_new_version() -> String {
+    // When the operator's own panel answered, it stated the version outright.
+    // The fallback below infers it from the last path segment, which only
+    // works for a GitHub release page (".../tag/1.4.9"); against the panel's
+    // download URL it would return "windows".
+    if let Some(update) = crate::common::PANEL_UPDATE.lock().unwrap().as_ref() {
+        return update.version.clone();
+    }
     (*SOFTWARE_UPDATE_URL
         .lock()
         .unwrap()
@@ -761,6 +768,34 @@ pub fn get_new_version() -> String {
         .next()
         .unwrap_or(""))
     .to_string()
+}
+
+/// The operator's release notes for the published version, or empty when the
+/// update did not come from a panel. Shown verbatim to the user, so the panel
+/// is the only thing that decides what it says.
+#[inline]
+pub fn get_new_version_notes() -> String {
+    crate::common::PANEL_UPDATE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|update| update.notes.clone())
+        .unwrap_or_default()
+}
+
+/// The exact URL to download, when the panel provided one.
+///
+/// Empty means "compose it the old way" — the GitHub flow in
+/// `handleUpdate` derives a filename from the version and architecture.
+/// The panel serves one fixed filename instead, so nothing can be composed.
+#[inline]
+pub fn get_new_version_download_url() -> String {
+    crate::common::PANEL_UPDATE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|update| update.download_url.clone())
+        .unwrap_or_default()
 }
 
 #[inline]

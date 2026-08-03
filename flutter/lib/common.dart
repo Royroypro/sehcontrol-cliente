@@ -40,6 +40,7 @@ import 'desktop/pages/view_camera_page.dart' as desktop_view_camera;
 import 'package:flutter_hbb/desktop/widgets/remote_toolbar.dart';
 import 'models/model.dart';
 import 'models/platform_model.dart';
+import 'common/widgets/update_dialog.dart';
 
 import 'package:flutter_hbb/native/win32.dart'
     if (dart.library.html) 'package:flutter_hbb/web/win32.dart';
@@ -4430,6 +4431,14 @@ void checkUpdate() {
           (Map<String, dynamic> evt) async {
         if (evt['url'] is String) {
           stateGlobal.updateUrl.value = evt['url'];
+          // La tarjeta lateral (buildHelpCards) sigue siendo el recordatorio
+          // permanente; esto ademas lo pone al frente una vez por version,
+          // porque una tarjeta al costado que ademas se puede cerrar pasaba
+          // desapercibida. Solo aparece para actualizaciones publicadas por el
+          // panel: shouldOfferUpdate() exige una URL de descarga directa.
+          if (isDesktop) {
+            maybeShowUpdateDialog();
+          }
         }
       });
       Timer(const Duration(seconds: 1), () async {

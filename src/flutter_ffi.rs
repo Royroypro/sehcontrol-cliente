@@ -1275,6 +1275,26 @@ pub fn main_set_local_option(key: String, value: String) {
             | "screencam-rtsp-pass"
     );
 
+    // The panel session token is mirrored to the --server process, which needs
+    // it to open its own channel to the panel (ScreenCam previews must work
+    // with this window closed). `access_token` itself cannot be read there:
+    // this process writes it into the interactive user's profile, while
+    // --server runs as SYSTEM and resolves LocalConfig to
+    // ServiceProfiles\LocalService — a different file, where it is absent.
+    //
+    // Mirrored here rather than at the call sites because there are several
+    // (two login paths and a logout), and one of them being forgotten is a
+    // channel that silently never opens. An empty value is the logout and must
+    // propagate, so this is not conditional on the token being present.
+    #[cfg(all(windows, feature = "screencam"))]
+    if key == "access_token" {
+        if let Err(err) = crate::ipc::set_config("screencam-panel-token", value.clone()) {
+            // Not fatal: the daemon may simply not be up yet. It re-reads the
+            // mirrored value on its own schedule once it is.
+            log::warn!("[screencam] could not mirror panel session to daemon: {err}");
+        }
+    }
+
     if is_screen_cam_policy {
         if let Err(err) = crate::ipc::set_config(&key, value.clone()) {
             log::error!(
@@ -2821,6 +2841,11 @@ pub fn main_get_new_version() -> SyncReturn<String> {
     SyncReturn(get_new_version())
 }
 
+// The panel's release notes and download URL are reached through
+// `main_get_common_sync` instead of getting their own bridge functions: those
+// would need flutter_rust_bridge codegen re-run, and the generated bridge is
+// checked in. See the "update-notes"/"update-download-url" keys below.
+
 pub fn main_update_me() -> SyncReturn<bool> {
     update_me("".to_owned());
     SyncReturn(true)
@@ -3307,6 +3332,15 @@ pub fn main_get_common(key: String) -> String {
         return crate::platform::linux::has_gnome_shortcuts_inhibitor_permission().to_string();
         #[cfg(not(target_os = "linux"))]
         return false.to_string();
+    } else if key == "update-notes" {
+        // What the operator wrote about the published version. Empty when the
+        // update did not come from a panel, which is how the UI decides
+        // whether it has anything to explain.
+        return ui_interface::get_new_version_notes();
+    } else if key == "update-download-url" {
+        // The exact URL the panel published. Empty means "there is none", and
+        // the caller composes a GitHub release URL the old way instead.
+        return ui_interface::get_new_version_download_url();
     } else if key == "permanent-password-set" {
         return ui_interface::is_permanent_password_set().to_string();
     } else if key == "local-permanent-password-set" {
