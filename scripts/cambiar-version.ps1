@@ -23,6 +23,28 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
+# Leer y escribir UTF-8 sin BOM de forma explicita, en vez de confiar en
+# Get-Content/Set-Content.
+#
+# El .bat invoca "powershell", que es Windows PowerShell 5.1, no pwsh 7. Ahi
+# Get-Content lee como ANSI -y por lo tanto rompe cualquier acento o guion
+# largo de un archivo UTF-8- y Set-Content -Encoding UTF8 escribe CON BOM.
+# El resultado fue Cargo.toml con BOM y comentarios corrompidos ("—" quedo
+# como "â€""), que cargo tolera pero nadie quiere en el repo. Estas dos
+# funciones se comportan igual en 5.1 y en 7.
+$script:Utf8SinBom = New-Object System.Text.UTF8Encoding($false)
+
+function Read-TextLines([string]$Path) {
+    return [System.IO.File]::ReadAllLines($Path, [System.Text.Encoding]::UTF8)
+}
+
+function Write-TextLines([string]$Path, [string[]]$Lines) {
+    # ReadAllLines descarta el fin de linea final; se conserva el salto para
+    # no dejar el archivo sin nueva linea al final.
+    $texto = ($Lines -join "`r`n") + "`r`n"
+    [System.IO.File]::WriteAllText($Path, $texto, $script:Utf8SinBom)
+}
+
 $root = Split-Path -Parent $PSScriptRoot
 $cargoPath = Join-Path $root 'Cargo.toml'
 $pubspecPath = Join-Path $root 'flutter\pubspec.yaml'
@@ -33,12 +55,12 @@ foreach ($p in @($cargoPath, $pubspecPath)) {
 
 # Primera coincidencia: es la de [package]. Las de las dependencias vienen
 # despues y no deben tocarse.
-$cargo = Get-Content -LiteralPath $cargoPath
+$cargo = Read-TextLines $cargoPath
 $cargoIdx = ($cargo | Select-String -Pattern '^version\s*=' | Select-Object -First 1).LineNumber - 1
 if ($cargoIdx -lt 0) { throw 'No se encontro la version en Cargo.toml' }
 $actual = [regex]::Match($cargo[$cargoIdx], '"([^"]+)"').Groups[1].Value
 
-$pubspec = Get-Content -LiteralPath $pubspecPath
+$pubspec = Read-TextLines $pubspecPath
 $pubIdx = ($pubspec | Select-String -Pattern '^version:' | Select-Object -First 1).LineNumber - 1
 if ($pubIdx -lt 0) { throw 'No se encontro la version en pubspec.yaml' }
 $pubMatch = [regex]::Match($pubspec[$pubIdx], '^version:\s*([0-9.]+)(?:\+(\d+))?')
@@ -90,8 +112,8 @@ if ((& $comparar $Version $actual) -lt 0) {
 $cargo[$cargoIdx] = $cargo[$cargoIdx] -replace '"[^"]+"', "`"$Version`""
 $pubspec[$pubIdx] = "version: $Version+$($build + 1)"
 
-Set-Content -LiteralPath $cargoPath -Value $cargo -Encoding UTF8
-Set-Content -LiteralPath $pubspecPath -Value $pubspec -Encoding UTF8
+Write-TextLines $cargoPath $cargo
+Write-TextLines $pubspecPath $pubspec
 
 # Cargo.lock tambien registra la version del propio paquete, y build.py compila
 # con --locked: sin esto el build aborta con "the lock file needs to be updated
@@ -108,7 +130,7 @@ $lockPath = Join-Path $root 'Cargo.lock'
 if (-not (Test-Path -LiteralPath $lockPath)) {
     Write-Warning "No se encontro Cargo.lock. Se creara al compilar."
 } else {
-    $lock = Get-Content -LiteralPath $lockPath -Raw
+    $lock = [System.IO.File]::ReadAllText($lockPath, [System.Text.Encoding]::UTF8)
     # Ancla en el nombre exacto para no tocar sehcontrol-portable-packer, que
     # es otro paquete con su propia version.
     $patron = '(?m)^(name = "sehcontrol"\r?\nversion = ")[^"]+(")'
