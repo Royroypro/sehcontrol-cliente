@@ -984,6 +984,50 @@ async fn next_access_unit(tap: &PreviewTap) -> Option<EncodedAccessUnit> {
     .await
 }
 
+/// Buffer the far end keeps before handing packets up, which is also the
+/// window SRT has to retransmit a loss. srt-tokio defaults to 120 ms, and a
+/// latency at or below the round-trip time cannot work by construction: the
+/// retransmission arrives after its own playout deadline and is discarded.
+/// Preview clients reach the gateway over the open internet, so this is sized
+/// for a link an order of magnitude worse than a LAN rather than for the
+/// median one — the cost is start-up delay, not throughput.
+const SRT_LATENCY: Duration = Duration::from_millis(600);
+
+/// Ceiling on the rate SRT paces its output at.
+///
+/// Without it, the sender's congestion control is free to estimate the link at
+/// whatever it likes — in production it settled on 3.2 Gbps — and spaces
+/// packets ~11 µs apart. One access unit is one SRT message, so a keyframe
+/// (80-110 KB, versus 2-3 KB for an inter frame) leaves as a single ~85-packet
+/// burst delivered in about a millisecond. Nothing on a consumer uplink
+/// absorbs that: measured against production, every keyframe burst was lost in
+/// full and every inter frame arrived, which is why a viewer got a connected
+/// WebRTC track and never a decodable one.
+///
+/// The cap is not a throughput limit — it sits well above what this encoder
+/// produces (about 2 Mbps for 1080p at the default quality of 0.5, and ~13
+/// Mbps for the largest resolution and quality the bitrate curve allows). It
+/// exists to spread the keyframe burst over tens of milliseconds instead of
+/// one, which is still far shorter than the ~2 s between keyframes.
+const SRT_MAX_BANDWIDTH: srt_tokio::options::DataRate =
+    srt_tokio::options::DataRate(16_000_000);
+
+/// Send buffer, in bytes. srt-protocol turns this into a packet count by
+/// dividing by the payload size (`buffer_size / (max_segment_size - 44)`), and
+/// its default of 46_592 works out to 32 packets — while one keyframe is 48
+/// packets at 1360x768 and about 110 at 1920x1080. An access unit that does
+/// not fit evicts its own earlier packets, because a full buffer drops from
+/// the front to make room. Measured against production, that silently
+/// destroyed every keyframe before it ever reached the network and left the
+/// inter frames, which are 2-3 packets, untouched.
+///
+/// Sized so the buffer holds what the latency window allows in flight
+/// (600 ms x 16 Mbps is about 1.2 MB) with room to spare, and so no single
+/// access unit can ever approach it. The queue grows on demand, so this is a
+/// ceiling rather than an allocation.
+const SRT_SEND_BUFFER: srt_tokio::options::ByteCount =
+    srt_tokio::options::ByteCount(8 * 1024 * 1024);
+
 /// The real transport: SRT caller, MPEG-TS payload, MediaMTX on the other end.
 pub(crate) struct SrtTransport {
     socket: Option<srt_tokio::SrtSocket>,
@@ -1006,6 +1050,11 @@ impl PreviewTransport for SrtTransport {
 
         // srt-tokio has no connect timeout of its own, so one is imposed here.
         let attempt = srt_tokio::SrtSocket::builder()
+            .latency(SRT_LATENCY)
+            .bandwidth(srt_tokio::options::LiveBandwidthMode::Max(
+                SRT_MAX_BANDWIDTH,
+            ))
+            .set(|options| options.sender.buffer_size = SRT_SEND_BUFFER)
             .call(destination.as_str(), Some(stream_id.as_str()));
         match tokio::time::timeout(timeout, attempt).await {
             Err(_elapsed) => {
