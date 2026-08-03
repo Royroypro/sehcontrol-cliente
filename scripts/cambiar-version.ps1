@@ -93,10 +93,42 @@ $pubspec[$pubIdx] = "version: $Version+$($build + 1)"
 Set-Content -LiteralPath $cargoPath -Value $cargo -Encoding UTF8
 Set-Content -LiteralPath $pubspecPath -Value $pubspec -Encoding UTF8
 
+# Cargo.lock tambien registra la version del propio paquete, y build.py compila
+# con --locked: sin esto el build aborta con "the lock file needs to be updated
+# but --locked was passed" y hay que descubrir por que a mano.
+#
+# Se deja que cargo lo reescriba en vez de editarlo con texto: el formato del
+# lock es suyo. --offline para que no salga a la red solo por cambiar un
+# numero. Su codigo de salida se ignora a proposito -- en offline puede quejarse
+# de otras cosas mientras igual sincroniza el lock, asi que lo que se comprueba
+# es el resultado.
+Push-Location $root
+try {
+    & cargo metadata --offline --format-version 1 *> $null
+} finally {
+    Pop-Location
+    # Sin esto el codigo de salida de cargo se convierte en el del script, y
+    # quien lo llame -el .bat, por ejemplo- lo lee como un fallo aunque el
+    # lock haya quedado bien. El resultado real se comprueba abajo.
+    $global:LASTEXITCODE = 0
+}
+
+$lockPath = Join-Path $root 'Cargo.lock'
+$lockOk = $false
+if (Test-Path -LiteralPath $lockPath) {
+    $lock = Get-Content -LiteralPath $lockPath -Raw
+    # La entrada del paquete propio, no la de una dependencia que se llame igual.
+    $lockOk = $lock -match "(?m)^name = ""sehcontrol""\r?\nversion = ""$([regex]::Escape($Version))"""
+}
+if (-not $lockOk) {
+    Write-Warning "Cargo.lock no quedo sincronizado. Antes de compilar, corre: cargo metadata --offline"
+}
+
 Write-Output ''
 Write-Output "Version cambiada: $actual  ->  $Version"
 Write-Output "  Cargo.toml            version = `"$Version`""
 Write-Output "  flutter/pubspec.yaml  version: $Version+$($build + 1)"
+Write-Output "  Cargo.lock            sincronizado"
 Write-Output "  src/version.rs        se regenera solo al compilar"
 Write-Output ''
 Write-Output 'Recorda: al publicar en el panel hay que declarar EXACTAMENTE esta misma version.'
