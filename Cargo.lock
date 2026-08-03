@@ -7734,7 +7734,7 @@ dependencies = [
 
 [[package]]
 name = "sehcontrol"
-version = "1.4.9"
+version = "1.4.12"
 dependencies = [
  "android-wakelock",
  "android_logger",
