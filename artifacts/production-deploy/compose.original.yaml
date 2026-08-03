@@ -1,0 +1,64 @@
+services:
+  hbbr:
+    image: sehcontrol-rustdesk-server:1.1.16-membership-amd64
+    container_name: sehcontrol-hbbr
+    command: hbbr
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - ./rustdesk-data:/root
+
+  hbbs:
+    image: sehcontrol-rustdesk-server:1.1.16-membership-amd64
+    container_name: sehcontrol-hbbs
+    command: hbbs -r sehcontrol.sehuacho.com:21117
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - hbbr
+    volumes:
+      - ./rustdesk-data:/root
+
+  panel:
+    image: sehcontrol-panel:2026.07.30.1-amd64
+    container_name: sehcontrol-panel
+    user: "0:0"
+    command: ["sh", "-c", "npm run seed && exec npm start"]
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - hbbs
+    env_file:
+      - .env
+    environment:
+      ADMIN_DB_PATH: /app/data/admin.sqlite3
+      HBBS_DB_PATH: /rustdesk/db_v2.sqlite3
+      RUSTDESK_DATA_PATH: /rustdesk
+    volumes:
+      - ./data:/app/data
+      - ./public/client:/app/data/downloads
+      - ./rustdesk-data:/rustdesk
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - "fetch('http://127.0.0.1:8899/health').then(r => { if (!r.ok) process.exit(1) }).catch(() => process.exit(1))"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  # Gateway multimedia para la previsualizacion de ScreenCam. Componente
+  # separado del panel a proposito (aunque viva en la misma maquina): recibe
+  # la publicacion SRT saliente del cliente y la entrega al navegador por
+  # WebRTC. No graba. Ver production/mediamtx.yml.
+  mediamtx:
+    image: bluenviron/mediamtx:1.9.3
+    container_name: sehcontrol-mediamtx
+    network_mode: host
+    restart: unless-stopped
+    depends_on:
+      - panel
+    volumes:
+      - ./mediamtx.yml:/mediamtx.yml:ro
