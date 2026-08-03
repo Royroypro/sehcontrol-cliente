@@ -4432,11 +4432,15 @@ void checkUpdate() {
         if (evt['url'] is String) {
           stateGlobal.updateUrl.value = evt['url'];
           // La tarjeta lateral (buildHelpCards) sigue siendo el recordatorio
-          // permanente; esto ademas lo pone al frente una vez por version,
-          // porque una tarjeta al costado que ademas se puede cerrar pasaba
-          // desapercibida. Solo aparece para actualizaciones publicadas por el
-          // panel: shouldOfferUpdate() exige una URL de descarga directa.
-          if (isDesktop) {
+          // permanente en escritorio; esto ademas lo pone al frente una vez por
+          // version, porque una tarjeta al costado que ademas se puede cerrar
+          // pasaba desapercibida. Solo aparece para actualizaciones publicadas
+          // por el panel: shouldOfferUpdate() exige una URL de descarga directa.
+          //
+          // En Android el modal es el UNICO aviso -- ahi no existe la tarjeta
+          // lateral-, y su boton abre la descarga en el navegador en vez de
+          // instalar, porque la app no instala paquetes.
+          if (isDesktop || isAndroid) {
             maybeShowUpdateDialog();
           }
         }

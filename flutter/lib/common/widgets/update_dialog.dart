@@ -15,6 +15,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_hbb/common.dart';
 import 'package:flutter_hbb/desktop/widgets/update_progress.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
+import 'package:url_launcher/url_launcher_string.dart';
 
 /// Se muestra una vez por version: quien elige "Mas tarde" no vuelve a verlo
 /// hasta que el panel publique otra, pero la tarjeta lateral sigue ahi.
@@ -80,9 +81,14 @@ void maybeShowUpdateDialog() {
               style: const TextStyle(fontSize: 14, height: 1.4),
             ),
             const SizedBox(height: 14),
+            // En Android la instalacion no la hace la app: se descarga el APK y
+            // el instalador del sistema pide confirmacion. Prometer que "se
+            // instala sola" seria mentir, y el usuario abandonaria pensando
+            // que fallo cuando en realidad falta un paso suyo.
             Text(
-              translate(
-                  'La actualizacion se descarga e instala sola. El equipo se reinicia un momento al terminar.'),
+              translate(isAndroid
+                  ? 'Se descargara el instalador. Al abrirlo, Android pedira confirmar la instalacion.'
+                  : 'La actualizacion se descarga e instala sola. El equipo se reinicia un momento al terminar.'),
               style: TextStyle(fontSize: 12, color: Theme.of(context).hintColor),
             ),
           ],
@@ -97,13 +103,33 @@ void maybeShowUpdateDialog() {
           width: 200,
           height: 40,
           child: ElevatedButton.icon(
-            icon: const Icon(Icons.download_rounded),
-            label: Text(translate('Actualizar ahora')),
+            icon: Icon(isAndroid
+                ? Icons.open_in_new_rounded
+                : Icons.download_rounded),
+            label: Text(translate(
+                isAndroid ? 'Descargar actualizacion' : 'Actualizar ahora')),
             onPressed: () {
+              final url = bind.mainGetCommonSync(key: 'update-download-url');
               _dialogOpen = false;
+              if (isAndroid) {
+                // Se delega en el navegador y en el instalador del sistema.
+                //
+                // La alternativa era descargar el APK dentro de la app y
+                // lanzar un intent de instalacion, lo que obliga a pedir
+                // REQUEST_INSTALL_PACKAGES y a mandar al usuario a Ajustes a
+                // habilitar "instalar apps desconocidas" -- un permiso que
+                // asusta y un desvio que mucha gente no completa. Como estos
+                // clientes ya se instalan de forma lateral, este es
+                // exactamente el mismo camino que el usuario recorrio la
+                // primera vez.
+                _dismissedVersion = version;
+                close();
+                launchUrlString(url);
+                return;
+              }
               // handleUpdate abre su propio dialogo de progreso y hace
               // dismissAll() primero, asi que este se cierra solo.
-              handleUpdate(bind.mainGetCommonSync(key: 'update-download-url'));
+              handleUpdate(url);
             },
           ),
         ),
