@@ -975,6 +975,13 @@ pub struct PanelUpdate {
     pub version: String,
     pub download_url: String,
     pub notes: String,
+    /// SHA-256 en hexadecimal del binario publicado, tal y como lo declara el
+    /// panel. Vacio cuando el panel es anterior a publicarlo, en cuyo caso la
+    /// descarga se comprueba solo por tamano, que es lo que se hacia antes.
+    pub sha256: String,
+    /// Tamano declarado. Redundante con el Content-Length de la descarga a
+    /// proposito: si no coinciden, algo esta reescribiendo la respuesta.
+    pub size_bytes: u64,
 }
 
 lazy_static::lazy_static! {
@@ -1013,6 +1020,14 @@ async fn check_panel_software_update(api: &str) -> hbb_common::ResultType<bool> 
     let version = parsed["version"].as_str().unwrap_or_default().to_owned();
     let download_url = parsed["url"].as_str().unwrap_or_default().to_owned();
     let notes = parsed["notes"].as_str().unwrap_or_default().to_owned();
+    // Aditivos: un panel anterior a estos campos los omite y se leen vacios,
+    // que significa "no hay con que verificar" y no rompe la actualizacion.
+    let sha256 = parsed["sha256"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let size_bytes = parsed["size_bytes"].as_u64().unwrap_or_default();
 
     // Strictly greater: an equal or older published version must not offer
     // anything, so re-publishing the running version cannot loop a client
@@ -1022,10 +1037,18 @@ async fn check_panel_software_update(api: &str) -> hbb_common::ResultType<bool> 
         && get_version_number(&version) > get_version_number(crate::VERSION);
     if offer {
         log::info!("[update] panel publishes {version}");
+        if sha256.is_empty() {
+            log::warn!(
+                "[update] panel published {version} without a checksum; \
+                 the download can only be checked by size"
+            );
+        }
         *PANEL_UPDATE.lock().unwrap() = Some(PanelUpdate {
             version: version.clone(),
             download_url: download_url.clone(),
             notes: notes.clone(),
+            sha256,
+            size_bytes,
         });
         // Kept in sync so everything that already asks "is there an update?"
         // through the old path keeps working.
