@@ -1206,19 +1206,34 @@ pub fn main_get_local_option(key: String) -> SyncReturn<String> {
     // Windows profile (LocalService). Read its screencam-* values through
     // the authenticated main IPC instead of this Flutter process's profile.
     if key.starts_with("screencam-") {
-        match crate::ipc::get_config(&key) {
-            Ok(Some(value)) => return SyncReturn(value),
-            Ok(None) => {
-                log::warn!("[screencam] daemon returned no value for {}", key);
-            }
+        // Nunca se cae al perfil de ESTE proceso para estas claves: seria
+        // contradecir el motivo mismo de preguntar por IPC. El daemon corre en
+        // otro perfil de Windows, asi que la copia local es de otra epoca y
+        // puede no tener nada que ver con la realidad.
+        //
+        // El caso que lo hacia visible: `set_option` con cadena vacia BORRA la
+        // clave (ver LocalConfig en hbb_common). Cuando ScreenCam se recupera
+        // llama a set_last_error("") y la clave desaparece, asi que el daemon
+        // responde Ok(None) -- que es la respuesta correcta, "ya no hay error".
+        // Tratarlo como fallo y caer al perfil local resucitaba el ultimo error
+        // que hubiera quedado ahi, y la tarjeta de ajustes seguia mostrando un
+        // fallo ya resuelto indefinidamente.
+        return SyncReturn(match crate::ipc::get_config(&key) {
+            Ok(Some(value)) => value,
+            // El daemon contesto y no tiene valor. Eso ES el valor.
+            Ok(None) => String::new(),
             Err(err) => {
+                // Aqui no sabemos nada. Vacio hace que la UI muestre "sin
+                // configurar" en vez de inventarse un estado a partir de datos
+                // viejos, que es la unica salida honesta.
                 log::warn!(
                     "[screencam] failed to read {} from daemon via IPC: {}",
                     key,
                     err
                 );
+                String::new()
             }
-        }
+        });
     }
     SyncReturn(get_local_option(key))
 }
