@@ -1,6 +1,6 @@
 [package]
 name = "sehcontrol-portable-packer"
-version = "1.4.9"
+version = "1.4.13"
 edition = "2021"
 description = "Sehcontrol Remote Desktop"
 

@@ -48,8 +48,14 @@ function Write-TextLines([string]$Path, [string[]]$Lines) {
 $root = Split-Path -Parent $PSScriptRoot
 $cargoPath = Join-Path $root 'Cargo.toml'
 $pubspecPath = Join-Path $root 'flutter\pubspec.yaml'
+# El empaquetador portable declara su propia version y build.py la imprime al
+# compilarlo ("Compiling sehcontrol-portable-packer v..."). No viaja dentro del
+# instalador, pero al no actualizarse se quedaba anclada en una version vieja y
+# esa linea contradecia a la que se estaba compilando, justo cuando uno mira la
+# salida para confirmar que version salio.
+$packerPath = Join-Path $root 'libs\portable\Cargo.toml'
 
-foreach ($p in @($cargoPath, $pubspecPath)) {
+foreach ($p in @($cargoPath, $pubspecPath, $packerPath)) {
     if (-not (Test-Path -LiteralPath $p)) { throw "No se encontro $p" }
 }
 
@@ -112,8 +118,16 @@ if ((& $comparar $Version $actual) -lt 0) {
 $cargo[$cargoIdx] = $cargo[$cargoIdx] -replace '"[^"]+"', "`"$Version`""
 $pubspec[$pubIdx] = "version: $Version+$($build + 1)"
 
+# Misma regla que arriba: la primera coincidencia es la de [package], las que
+# vienen despues son de dependencias y no se tocan.
+$packer = Read-TextLines $packerPath
+$packerIdx = ($packer | Select-String -Pattern '^version\s*=' | Select-Object -First 1).LineNumber - 1
+if ($packerIdx -lt 0) { throw 'No se encontro la version en libs\portable\Cargo.toml' }
+$packer[$packerIdx] = $packer[$packerIdx] -replace '"[^"]+"', "`"$Version`""
+
 Write-TextLines $cargoPath $cargo
 Write-TextLines $pubspecPath $pubspec
+Write-TextLines $packerPath $packer
 
 # Cargo.lock tambien registra la version del propio paquete, y build.py compila
 # con --locked: sin esto el build aborta con "the lock file needs to be updated
@@ -131,14 +145,28 @@ if (-not (Test-Path -LiteralPath $lockPath)) {
     Write-Warning "No se encontro Cargo.lock. Se creara al compilar."
 } else {
     $lock = [System.IO.File]::ReadAllText($lockPath, [System.Text.Encoding]::UTF8)
-    # Ancla en el nombre exacto para no tocar sehcontrol-portable-packer, que
-    # es otro paquete con su propia version.
-    $patron = '(?m)^(name = "sehcontrol"\r?\nversion = ")[^"]+(")'
-    $coincidencias = ([regex]$patron).Matches($lock).Count
-    if ($coincidencias -ne 1) {
-        Write-Warning "Cargo.lock: se esperaba una entrada de 'sehcontrol' y hay $coincidencias. No se modifico; corre 'cargo check' antes de compilar."
-    } else {
-        $lock = [regex]::Replace($lock, $patron, "`${1}$Version`${2}")
+    # Los dos paquetes del workspace que llevan esta version. Se anclan por
+    # nombre exacto y por separado: "sehcontrol" no puede coincidir con
+    # "sehcontrol-portable-packer" ni al reves.
+    #
+    # El packer se dejaba fuera antes porque su version tampoco se actualizaba.
+    # Ahora que si, tiene que actualizarse tambien aqui: build.py compila con
+    # --locked, y un lock que no coincide con el Cargo.toml aborta el build.
+    $entradas = @(
+        @{ Nombre = 'sehcontrol'; Patron = '(?m)^(name = "sehcontrol"\r?\nversion = ")[^"]+(")' },
+        @{ Nombre = 'sehcontrol-portable-packer'; Patron = '(?m)^(name = "sehcontrol-portable-packer"\r?\nversion = ")[^"]+(")' }
+    )
+    $modificado = $true
+    foreach ($entrada in $entradas) {
+        $coincidencias = ([regex]$entrada.Patron).Matches($lock).Count
+        if ($coincidencias -ne 1) {
+            Write-Warning "Cargo.lock: se esperaba una entrada de '$($entrada.Nombre)' y hay $coincidencias. No se modifico; corre 'cargo check' antes de compilar."
+            $modificado = $false
+            break
+        }
+        $lock = [regex]::Replace($lock, $entrada.Patron, "`${1}$Version`${2}")
+    }
+    if ($modificado) {
         # Sin BOM y respetando los finales de linea que ya tenia: cargo
         # reescribiria el lock entero si algo no le cuadra.
         [System.IO.File]::WriteAllText($lockPath, $lock, (New-Object System.Text.UTF8Encoding($false)))

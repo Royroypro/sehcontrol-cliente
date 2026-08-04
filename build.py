@@ -484,18 +484,21 @@ def build_flutter_windows(version, features, skip_portable_pack):
     system2(
         f'python ./generate.py -f ../../{flutter_build_dir_2} -o . -e ../../{flutter_build_dir_2}/sehcontrol.exe')
     os.chdir('../..')
-    if os.path.exists('./rustdesk_portable.exe'):
-        os.replace('./target/release/sehcontrol-portable-packer.exe',
-                   './rustdesk_portable.exe')
-    else:
-        os.rename('./target/release/sehcontrol-portable-packer.exe',
-                  './rustdesk_portable.exe')
-    print(
-        f'output location: {os.path.abspath(os.curdir)}/rustdesk_portable.exe')
-    os.rename('./rustdesk_portable.exe', f'./sehcontrol-{version}-install.exe')
+    # Un solo rename, directo al nombre final. Antes se pasaba por
+    # "rustdesk_portable.exe" -- nombre heredado del proyecto original -- y se
+    # anunciaba como "output location" un archivo que la linea siguiente
+    # renombraba, asi que la salida del build nombraba dos veces al mismo
+    # binario y una de ellas con un nombre que ya no existe al terminar.
+    #
+    # El rodeo ademas escondia un fallo: el segundo paso usaba os.rename, que
+    # en Windows falla si el destino existe. Recompilar la misma version dos
+    # veces sin borrar el instalador anterior rompia el build al final de todo,
+    # despues de haber compilado. os.replace sobrescribe y no tiene ese caso.
+    installer = f'./sehcontrol-{version}-install.exe'
+    os.replace('./target/release/sehcontrol-portable-packer.exe', installer)
     print(
         f'output location: {os.path.abspath(os.curdir)}/sehcontrol-{version}-install.exe')
-    archive_binary(f'./sehcontrol-{version}-install.exe')
+    archive_binary(installer)
 
 
 def main():
