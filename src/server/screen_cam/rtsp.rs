@@ -1939,7 +1939,7 @@ mod tests {
 
         let started = Instant::now();
         assert_eq!(
-            super::super::watchdog_disposition(super::super::CaptureExit::Disabled),
+            super::super::watchdog_disposition(&super::super::CaptureExit::Disabled),
             super::super::WatchdogDisposition::RemainDisabled
         );
         assert_eq!(state.invalidate_stream(), 1);

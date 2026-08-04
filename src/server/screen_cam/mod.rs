@@ -953,16 +953,29 @@ fn wait_for_encoder_for_resolved_display<T>(
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 enum CaptureExit {
     Reconfigure,
     Disabled,
+    /// El capturador dejo de entregar frames y hay que rehacerlo. No es un
+    /// fallo: la causa mas comun es que Windows conmuto de escritorio -- un
+    /// prompt de UAC lleva al escritorio seguro, y DXGI Desktop Duplication
+    /// esta atado al escritorio en el que se creo. Basta con que alguien pulse
+    /// "Desbloquear ajustes de seguridad" para provocarlo.
+    ///
+    /// Se distingue de un Err porque el tratamiento correcto es otro: rehacer
+    /// y seguir, sin teñir de rojo la tarjeta de ajustes ni marcar el equipo
+    /// como averiado en el panel. Solo si no consigue rehacerse varias veces
+    /// seguidas pasa a ser un error de verdad.
+    Invalidated(String),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WatchdogDisposition {
     RestartImmediately,
     RemainDisabled,
+    /// Rehacer el capturador informando "arrancando", no "error".
+    Rebuild,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1020,12 +1033,18 @@ impl ConsecutiveCaptureErrors {
     }
 }
 
-fn watchdog_disposition(exit: CaptureExit) -> WatchdogDisposition {
+fn watchdog_disposition(exit: &CaptureExit) -> WatchdogDisposition {
     match exit {
         CaptureExit::Reconfigure => WatchdogDisposition::RestartImmediately,
         CaptureExit::Disabled => WatchdogDisposition::RemainDisabled,
+        CaptureExit::Invalidated(_) => WatchdogDisposition::Rebuild,
     }
 }
+
+/// Cuantas invalidaciones seguidas se toleran antes de considerarlo averiado.
+/// Un cambio de escritorio produce exactamente una; encadenar varias significa
+/// que el capturador no consigue rehacerse y ahi si hay que avisar.
+const MAX_CONSECUTIVE_REBUILDS: u32 = 5;
 
 /// Starts ScreenCam in the background. Never blocks the caller — all failures
 /// (no encoder, capture errors, port already in use, ...) are logged from the
@@ -1081,6 +1100,8 @@ pub fn start(cfg: ScreenCamConfig) {
         const HEALTHY_UPTIME: Duration = Duration::from_secs(60);
         const DISABLED_POLL_INTERVAL: Duration = Duration::from_secs(2);
         let mut backoff = MIN_BACKOFF;
+        // Invalidaciones encadenadas sin que ninguna llegue a sostenerse.
+        let mut consecutive_rebuilds: u32 = 0;
         loop {
             if !is_enabled() {
                 set_status("disabled");
@@ -1089,11 +1110,42 @@ pub fn start(cfg: ScreenCamConfig) {
             }
             let attempt_start = Instant::now();
             match capture_loop(cfg.clone(), state.clone()) {
-                Ok(exit) => match watchdog_disposition(exit) {
+                Ok(exit) => match watchdog_disposition(&exit) {
+                    // Rehacer el capturador es operacion normal, no averia: la
+                    // causa habitual es un prompt de UAC, que lleva a Windows
+                    // al escritorio seguro e invalida la duplicacion DXGI.
+                    // Reportarlo como "error" pintaba de rojo la tarjeta de
+                    // ajustes y marcaba el equipo como averiado en el panel
+                    // cada vez que alguien pulsaba "Desbloquear ajustes de
+                    // seguridad". Solo escala a error si encadena varias, que
+                    // ya significa que no consigue rehacerse.
+                    WatchdogDisposition::Rebuild => {
+                        let detail = match &exit {
+                            CaptureExit::Invalidated(detail) => detail.as_str(),
+                            _ => "",
+                        };
+                        state.deactivate_display();
+                        state.invalidate_stream();
+                        consecutive_rebuilds = consecutive_rebuilds.saturating_add(1);
+                        if consecutive_rebuilds >= MAX_CONSECUTIVE_REBUILDS {
+                            log::error!(
+                                "[screencam] capturer could not be rebuilt after {consecutive_rebuilds} attempts: {detail}"
+                            );
+                            set_status("error");
+                            set_last_error(&format!("capture_invalidated: {detail}"));
+                        } else {
+                            log::info!("[screencam] rebuilding display capturer: {detail}");
+                            set_status("starting");
+                            set_last_error("");
+                            backoff = MIN_BACKOFF;
+                            continue;
+                        }
+                    }
                     WatchdogDisposition::RestartImmediately => {
                         state.deactivate_display();
                         state.invalidate_stream();
                         log::info!("[screencam] rebuilding capture for display topology change");
+                        consecutive_rebuilds = 0;
                         backoff = MIN_BACKOFF;
                         continue;
                     }
@@ -1103,6 +1155,7 @@ pub fn start(cfg: ScreenCamConfig) {
                         log::info!("[screencam] capture stopped (switched off)");
                         set_status("disabled");
                         set_last_error("");
+                        consecutive_rebuilds = 0;
                         backoff = MIN_BACKOFF;
                         continue;
                     }
@@ -1116,7 +1169,11 @@ pub fn start(cfg: ScreenCamConfig) {
                 }
             }
             if attempt_start.elapsed() > HEALTHY_UPTIME {
+                // Una ejecucion que aguanto lo suficiente dice que lo anterior
+                // no era una cadena de fallos, asi que ni el backoff ni el
+                // contador de reconstrucciones deben arrastrarse.
                 backoff = MIN_BACKOFF;
+                consecutive_rebuilds = 0;
             }
             log::info!("[screencam] restarting capture in {:?}", backoff);
             std::thread::sleep(backoff);
@@ -1542,15 +1599,15 @@ fn capture_loop(cfg: ScreenCamConfig, state: Arc<SharedState>) -> ResultType<Cap
             }
             Err(e) => {
                 let rebuild = capture_errors.record_error();
-                log::error!(
+                log::warn!(
                     "[screencam] capture error ({}/{}): {e}",
                     capture_errors.count(),
                     MAX_CONSECUTIVE_CAPTURE_ERRORS
                 );
                 if rebuild {
-                    bail!(
-                        "capture_invalidated: rebuilding display capturer after repeated error: {e}"
-                    );
+                    return Ok(CaptureExit::Invalidated(format!(
+                        "rebuilding display capturer after repeated error: {e}"
+                    )));
                 }
                 std::thread::sleep(Duration::from_millis(500));
             }
@@ -1617,6 +1674,28 @@ fn log_display_inventory<D>(displays: &display::DisplayInventory<D>) {
     }
 }
 
+/// Ultimo aviso de rechazo del preview, en segundos desde UNIX_EPOCH. Mismo
+/// patron que `LAST_TAMPER_WARN_SECS`: esto corre una vez por frame, asi que
+/// sin limite un rechazo sistematico llenaria el log a la velocidad de los fps.
+static LAST_PREVIEW_REJECT_WARN_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn log_preview_rejection_throttled(error: &preview::tap::AccessUnitError, pts_ms: i64) {
+    use std::sync::atomic::Ordering as O;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_PREVIEW_REJECT_WARN_SECS.load(O::Relaxed);
+    if now.saturating_sub(last) >= 10 {
+        LAST_PREVIEW_REJECT_WARN_SECS.store(now, O::Relaxed);
+        log::warn!(
+            "[screencam] preview is dropping frames: {error} (pts_ms={pts_ms}). \
+             RTSP is unaffected — it uses the capture clock, not the encoder's PTS."
+        );
+    }
+}
+
 /// `pts_ms` and `keyframe` come straight from the encoder's own
 /// `EncodedVideoFrame` (`f.pts`, `f.key`) and exist for the preview tap.
 /// `elapsed` remains the capture clock the RTP timestamp is derived from —
@@ -1658,20 +1737,29 @@ fn handle_access_unit(
     let has_pps = nals
         .iter()
         .any(|nal| rtp::nal_unit_type(nal) == rtp::NAL_TYPE_PPS);
-    // Deliberately ignored. A frame the preview cannot take (a negative PTS
-    // from the encoder, say) is skipped for preview only — RTSP carries on
-    // untouched, nothing returns early, and nothing is logged, because this
-    // runs once per frame and a rejection is a property of the frame, which
-    // would turn any log into a per-frame log. While the tap is inactive this
-    // is one atomic load and nothing else: no validation, no copy.
-    let _ = state.preview_tap.push_annexb_copy_if_active(
+    // Un frame que el preview no puede aceptar se salta solo para el preview:
+    // RTSP sigue intacto, no se retorna antes de tiempo. Mientras el tap esta
+    // inactivo esto es una carga atomica y nada mas: ni validacion ni copia.
+    //
+    // El rechazo se registra, pero limitado en frecuencia. Antes se ignoraba
+    // en silencio, con el argumento de que un rechazo es propiedad del frame y
+    // loguearlo seria loguear cada frame. El problema es que un rechazo
+    // *sistematico* tambien queda mudo: con el encoder AMF el preview no
+    // publicaba absolutamente nada mientras RTSP funcionaba, porque los dos
+    // usan bases de tiempo distintas -- RTSP va con el reloj de captura y el
+    // preview con el PTS del encoder. Sin este aviso, el sintoma era una
+    // conexion SRT viva que no transmitia un solo byte, sin nada en el log que
+    // explicara por que.
+    if let Err(error) = state.preview_tap.push_annexb_copy_if_active(
         stream_epoch,
         pts_ms,
         keyframe,
         has_sps,
         has_pps,
         data,
-    );
+    ) {
+        log_preview_rejection_throttled(&error, pts_ms);
+    }
 
     let sessions = snapshot_matching(&state.sessions, |session| session.epoch() == stream_epoch);
     if sessions.is_empty() {
@@ -2688,11 +2776,11 @@ mod delivery2_tests {
     #[test]
     fn watchdog_reconfigure_restarts_without_backoff() {
         assert_eq!(
-            watchdog_disposition(CaptureExit::Reconfigure),
+            watchdog_disposition(&CaptureExit::Reconfigure),
             WatchdogDisposition::RestartImmediately
         );
         assert_eq!(
-            watchdog_disposition(CaptureExit::Disabled),
+            watchdog_disposition(&CaptureExit::Disabled),
             WatchdogDisposition::RemainDisabled
         );
     }
