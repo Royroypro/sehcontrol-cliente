@@ -72,9 +72,30 @@ bool set_lantency_free(void *priv_data, const std::string &name) {
     }
   }
   if (name.find("amf") != std::string::npos) {
+    // `query_timeout` solo acota cuanto espera el encoder por un frame ya
+    // codificado: es un ajuste de latencia, no un requisito para codificar.
+    // No existe en todos los builds de FFmpeg -- se agrego despues del que
+    // trae el vcpkg de este proyecto -- y ahi av_opt_set devuelve
+    // AVERROR_OPTION_NOT_FOUND.
+    //
+    // Tratar ESO como fatal significaba que h264_amf nunca llegaba a crearse,
+    // y como esta rama solo corre cuando el encoder es *_amf, el efecto era
+    // que `ram_encode` quedaba vacio en TODA maquina AMD. Es decir: ni
+    // ScreenCam (que solo usa la ruta RAM) ni el escritorio remoto por H.264
+    // podian usar el hardware, aunque la GPU codifique perfectamente -- se ve
+    // en que la ruta VRAM por el SDK nativo de AMD si pasa sus pruebas.
+    //
+    // "el build no tiene esta perilla" y "esta GPU no sirve" son cosas
+    // distintas. Solo la segunda justifica descartar el encoder, asi que
+    // cualquier OTRO error se sigue tratando como fatal.
     if ((ret = av_opt_set(priv_data, "query_timeout", "1000", 0)) < 0) {
-      LOG_ERROR(std::string("amf set_lantency_free failed, ret = ") + av_err2str(ret));
-      return false;
+      if (ret == AVERROR_OPTION_NOT_FOUND) {
+        LOG_WARN(std::string("amf query_timeout not available in this ffmpeg "
+                             "build, continuing without it"));
+      } else {
+        LOG_ERROR(std::string("amf set_lantency_free failed, ret = ") + av_err2str(ret));
+        return false;
+      }
     }
   }
   if (name.find("qsv") != std::string::npos) {
