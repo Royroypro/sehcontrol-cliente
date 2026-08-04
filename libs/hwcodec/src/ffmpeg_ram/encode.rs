@@ -321,11 +321,25 @@ impl Encoder {
                         let mut passed = false;
                         let mut last_err: Option<i32> = None;
 
-                        let max_attempts = if cfg!(all(target_os = "macos", target_arch = "x86_64")) {
-                            3
-                        } else {
-                            1
-                        };
+                        // Un encoder por hardware tiene pipeline: es normal que
+                        // no entregue paquete en el primer frame y que
+                        // avcodec_receive_packet devuelva EAGAIN, que
+                        // do_encode traduce a -1 sin mensaje de error.
+                        //
+                        // Con un solo intento eso se juzgaba como "encoder
+                        // roto". Afectaba justo a AMF: la rama nvenc de
+                        // set_lantency_free consigue poner `delay=0` y NVENC
+                        // emite ya en el primer frame, pero su equivalente
+                        // para AMF (`query_timeout`) no existe en todos los
+                        // builds de FFmpeg, asi que AMF conserva su buffer y
+                        // fallaba siempre en maquinas AMD.
+                        //
+                        // Darle unos frames mas es la misma concesion que ya
+                        // se le hacia a macOS. Solo relaja el descarte: un
+                        // encoder que ya pasaba sigue pasando en el primer
+                        // intento, y uno realmente roto tarda unos ms mas en
+                        // descartarse.
+                        let max_attempts = 4;
                         for attempt in 0..max_attempts {
                             let pts = (attempt as i64) * 33; // 33ms is an approximation for 30 FPS (1000 / 30)
                             let start = std::time::Instant::now();
