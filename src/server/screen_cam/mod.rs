@@ -28,6 +28,7 @@ mod preview;
 mod rtp;
 mod rtsp;
 
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
@@ -1653,7 +1654,20 @@ fn encode_screen_cam_input(
                 }
             }
         }
-        Err(error) => log::error!("[screencam] encode error: {error:?}"),
+        // "no valid frame" no es un fallo: significa que el encoder no
+        // devolvio paquete en ESTA llamada. Un encoder por hardware tiene
+        // pipeline y puede tardar unos frames en entregar, cosa habitual en
+        // AMF. Registrarlo como ERROR por frame llenaba el log a la velocidad
+        // de los fps y hacia parecer averiado un equipo que transmitia bien.
+        // El resto de errores de codificacion si son reales y se mantienen.
+        Err(error) => {
+            let message = error.to_string();
+            if message.contains("no valid frame") {
+                log_encoder_pipeline_wait_throttled(&message);
+            } else {
+                log::error!("[screencam] encode error: {error:?}");
+            }
+        }
     }
 }
 
@@ -1679,6 +1693,54 @@ fn log_display_inventory<D>(displays: &display::DisplayInventory<D>) {
 /// sin limite un rechazo sistematico llenaria el log a la velocidad de los fps.
 static LAST_PREVIEW_REJECT_WARN_SECS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+/// Antepone en Annex-B los SPS/PPS cacheados que le falten a este access unit.
+/// `None` cuando el descriptor todavia no tiene los que hacen falta, o cuando
+/// pertenece a otra epoca: mezclar parametros de un stream con el video de
+/// otro produciria basura, y es justo lo que el epoch distingue.
+fn prepend_parameter_sets(
+    state: &SharedState,
+    stream_epoch: u64,
+    has_sps: bool,
+    has_pps: bool,
+    data: &[u8],
+) -> Option<Vec<u8>> {
+    const START_CODE: [u8; 4] = [0, 0, 0, 1];
+    let descriptor = state.stream_descriptor();
+    if descriptor.epoch != stream_epoch {
+        return None;
+    }
+    let sps = descriptor.sps?;
+    let pps = descriptor.pps?;
+    let mut completed = Vec::with_capacity(data.len() + sps.len() + pps.len() + 8);
+    if !has_sps {
+        completed.extend_from_slice(&START_CODE);
+        completed.extend_from_slice(&sps);
+    }
+    if !has_pps {
+        completed.extend_from_slice(&START_CODE);
+        completed.extend_from_slice(&pps);
+    }
+    completed.extend_from_slice(data);
+    Some(completed)
+}
+
+static LAST_ENCODER_WAIT_WARN_SECS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Mismo limitador que el resto: esto ocurre una vez por frame en el peor caso.
+fn log_encoder_pipeline_wait_throttled(message: &str) {
+    use std::sync::atomic::Ordering as O;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_ENCODER_WAIT_WARN_SECS.load(O::Relaxed);
+    if now.saturating_sub(last) >= 30 {
+        LAST_ENCODER_WAIT_WARN_SECS.store(now, O::Relaxed);
+        log::debug!("[screencam] encoder produced no packet this call ({message})");
+    }
+}
 
 fn log_preview_rejection_throttled(error: &preview::tap::AccessUnitError, pts_ms: i64) {
     use std::sync::atomic::Ordering as O;
@@ -1750,13 +1812,37 @@ fn handle_access_unit(
     // preview con el PTS del encoder. Sin este aviso, el sintoma era una
     // conexion SRT viva que no transmitia un solo byte, sin nada en el log que
     // explicara por que.
+    // El preview solo puede arrancar en un keyframe que traiga sus propios
+    // SPS/PPS, porque el receptor entra a mitad de stream y sin esos
+    // parametros no puede decodificar nada. No todos los encoders los repiten:
+    // NVENC y QSV si, AMF no, y AV_CODEC_FLAG2_LOCAL_HEADER no lo cambia
+    // (comprobado en un Radeon Vega 11: los IDR salen con
+    // keyframe=true sps=false pps=false indefinidamente).
+    //
+    // Se completan aqui, con los que el descriptor ya cacheo de esta misma
+    // epoca. Es el sitio correcto: los parametros estan a mano, solo se toca
+    // la copia que va al preview y RTSP no se entera. El coste es una
+    // asignacion por keyframe -- uno cada dos segundos, y solo mientras hay
+    // preview activo.
+    let (payload, sps_present, pps_present) = if keyframe && !(has_sps && has_pps) {
+        match prepend_parameter_sets(state, stream_epoch, has_sps, has_pps, data) {
+            Some(completed) => (Cow::Owned(completed), true, true),
+            // Sin parametros cacheados todavia no hay nada que completar; el
+            // access unit sigue su camino y la puerta lo rechazara, que es lo
+            // correcto mientras el stream no sea decodificable.
+            None => (Cow::Borrowed(data), has_sps, has_pps),
+        }
+    } else {
+        (Cow::Borrowed(data), has_sps, has_pps)
+    };
+
     if let Err(error) = state.preview_tap.push_annexb_copy_if_active(
         stream_epoch,
         pts_ms,
         keyframe,
-        has_sps,
-        has_pps,
-        data,
+        sps_present,
+        pps_present,
+        &payload,
     ) {
         log_preview_rejection_throttled(&error, pts_ms);
     }

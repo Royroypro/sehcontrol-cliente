@@ -59,6 +59,9 @@ const RECONNECT_BACKOFF: [Duration; 5] = [
 /// close in microseconds; this only exists so a wedged socket cannot keep the
 /// worker thread alive.
 const CLOSE_BUDGET: Duration = Duration::from_secs(2);
+/// Cada cuanto avisar de que el publicador sigue esperando su primer keyframe
+/// utilizable. Corre una vez por access unit, de ahi el limite.
+const WAIT_LOG_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Budget `PreviewControl` gives a worker to finish after being told to stop.
 /// Deliberately short: it is spent outside the control mutex, but it is still
@@ -881,6 +884,10 @@ async fn stream_until_done<T: PreviewTransport>(
     // Nothing is published until the stream is decodable from scratch: a
     // keyframe that carries its own SPS and PPS.
     let mut awaiting_keyframe = true;
+    // Diagnostico de la espera de arranque, limitado para no llenar el log al
+    // ritmo de los fps cuando la puerta se queda cerrada.
+    let mut waiting_since: Option<Instant> = None;
+    let mut last_wait_log: Option<Instant> = None;
 
     loop {
         let unit = tokio::select! {
@@ -921,9 +928,29 @@ async fn stream_until_done<T: PreviewTransport>(
 
         if awaiting_keyframe {
             if !(unit.keyframe && unit.has_sps && unit.has_pps) {
+                // Esta puerta descartaba en silencio, y ese silencio costo caro:
+                // un encoder que no repite SPS/PPS en cada IDR la deja cerrada
+                // para siempre, y el sintoma desde fuera es una conexion SRT
+                // viva que no publica nada, sin una sola linea que lo explique.
+                // Publicar de verdad empieza aqui, asi que aqui tiene que
+                // notarse cuando no empieza.
+                waiting_since.get_or_insert_with(Instant::now);
+                if last_wait_log.map_or(true, |at: Instant| at.elapsed() >= WAIT_LOG_INTERVAL) {
+                    last_wait_log = Some(Instant::now());
+                    log::warn!(
+                        "[screencam] preview waiting for a keyframe with in-band SPS/PPS \
+                         ({:?} so far; last unit: keyframe={} sps={} pps={})",
+                        waiting_since.map(|at| at.elapsed()).unwrap_or_default(),
+                        unit.keyframe,
+                        unit.has_sps,
+                        unit.has_pps,
+                    );
+                }
                 continue;
             }
             awaiting_keyframe = false;
+            waiting_since = None;
+            last_wait_log = None;
         }
 
         let packets = match muxer.mux_access_unit(unit.pts_ms, unit.keyframe, &unit.annexb) {
