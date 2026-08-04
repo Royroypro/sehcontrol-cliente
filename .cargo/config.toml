@@ -36,7 +36,25 @@ git-fetch-with-cli = true
 [target.aarch64-linux-android]
 linker = "C:/Users/rdrf-/AppData/Local/Android/Sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/windows-x86_64/bin/myclang-arm64.cmd"
 
+# Toolchain nativo de Windows. Aqui y no como variables de entorno del
+# sistema para que cargo las lea venga de donde venga la invocacion: la
+# consola preparada, VS Code, una terminal cualquiera o un proceso en
+# segundo plano. Mismo criterio que las de Android de abajo.
+#
+# `force = true` es imprescindible, no cosmetico: por defecto una entrada de
+# [env] NO pisa una variable que ya venga del entorno, y estas tres estan
+# definidas a nivel de Usuario/Maquina con valores que ya no existen
+# (LIBCLANG_PATH a un LLVM sin libclang.dll, VCPKG_ROOT de maquina a D:\vcpkg
+# y BINDGEN_EXTRA_CLANG_ARGS a un E:\vcpkg de otra instalacion). Sin force
+# ganarian esas y el fallo de bindgen seria el de siempre.
+#
+# BINDGEN_EXTRA_CLANG_ARGS se deja vacia a proposito: las cabeceras tienen
+# que salir de VCPKG_ROOT y de vcvars64, no de una tercera instalacion.
 [env]
+LIBCLANG_PATH = { value = "C:/LLVM15/bin", force = true }
+VCPKG_ROOT = { value = "C:/vcpkg-sehcontrol", force = true }
+BINDGEN_EXTRA_CLANG_ARGS = { value = "", force = true }
+
 CC_aarch64_linux_android = "C:/Users/rdrf-/AppData/Local/Android/Sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/windows-x86_64/bin/myclang-arm64.cmd"
 CXX_aarch64_linux_android = "C:/Users/rdrf-/AppData/Local/Android/Sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/windows-x86_64/bin/myclangxx-arm64.cmd"
 AR_aarch64_linux_android = "C:/Users/rdrf-/AppData/Local/Android/Sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"

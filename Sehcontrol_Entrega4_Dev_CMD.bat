@@ -22,26 +22,7 @@ endlocal
 title Sehcontrol Entrega 4 - Entorno de compilacion
 color 0A
 
-rem  El repositorio es la carpeta donde vive este .bat, no una ruta fija: asi
-rem  el entorno sigue funcionando si el clon se mueve o se renombra.
-rem  %~dp0 termina en "\", que hay que quitar para poder concatenar rutas.
-set "SEHCONTROL_ROOT=%~dp0"
-if "%SEHCONTROL_ROOT:~-1%"=="\" set "SEHCONTROL_ROOT=%SEHCONTROL_ROOT:~0,-1%"
-set "SEHCONTROL_LAUNCHER=%~f0"
-set "VS_VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-set "VCPKG_ROOT=C:\vcpkg-sehcontrol"
-set "LLVM_HOME=C:\LLVM15"
-set "LIBCLANG_PATH=C:\LLVM15\bin"
-set "FLUTTER_ROOT=C:\tools\flutter"
-set "CARGO_BUILD_JOBS=4"
-
-rem  Android. No son obligatorias: si faltan, solo se desactivan los
-rem  comandos android-* y build-android, el resto del entorno sigue igual.
-rem  Las rutas coinciden con las que build_android.py busca por defecto.
-set "ANDROID_SDK_ROOT=%LOCALAPPDATA%\Android\Sdk"
-set "ANDROID_HOME=%LOCALAPPDATA%\Android\Sdk"
-set "ANDROID_NDK_HOME=%LOCALAPPDATA%\Android\Sdk\ndk\25.2.9519653"
-set "MSYS_BIN=C:\msys64\usr\bin"
+call :DEFINIR_ENTORNO
 
 rem ---------------------------------------------------------------------
 rem  Validaciones sin bloques entre parentesis.
@@ -83,15 +64,7 @@ call "%VS_VCVARS%"
 if errorlevel 1 goto VS_ERROR
 
 rem vcvars64.bat reemplaza VCPKG_ROOT; restaurarlo siempre despues.
-set "VCPKG_ROOT=C:\vcpkg-sehcontrol"
-set "LLVM_HOME=C:\LLVM15"
-set "LIBCLANG_PATH=C:\LLVM15\bin"
-set "FLUTTER_ROOT=C:\tools\flutter"
-set "CARGO_BUILD_JOBS=4"
-set "ANDROID_SDK_ROOT=%LOCALAPPDATA%\Android\Sdk"
-set "ANDROID_HOME=%LOCALAPPDATA%\Android\Sdk"
-set "ANDROID_NDK_HOME=%LOCALAPPDATA%\Android\Sdk\ndk\25.2.9519653"
-set "MSYS_BIN=C:\msys64\usr\bin"
+call :DEFINIR_ENTORNO
 set "PATH=%LLVM_HOME%\bin;%FLUTTER_ROOT%\bin;%ANDROID_SDK_ROOT%\platform-tools;%PATH%"
 
 cd /d "%SEHCONTROL_ROOT%"
@@ -237,6 +210,11 @@ echo.
 pause
 
 :PREGUNTAR_VERSION_FIN
+rem  choice deja en ERRORLEVEL el numero de la opcion elegida, y por defecto
+rem  responde N, que es 2. Sin esto el arranque termina con codigo de salida 2
+rem  aunque todo haya ido bien, y entonces "call ...bat && loquesea" no
+rem  encadena nunca y cualquier automatizacion lo lee como fallo.
+cmd /c exit 0
 cls
 goto :eof
 
@@ -244,6 +222,49 @@ goto :eof
 :VERSION
 powershell -NoProfile -ExecutionPolicy Bypass -File "%SEHCONTROL_ROOT%\scripts\cambiar-version.ps1"
 exit /b
+
+
+rem ---------------------------------------------------------------------
+rem  Definicion unica del entorno.
+rem
+rem  Se invoca dos veces en el arranque: antes de las validaciones y otra vez
+rem  despues de vcvars64.bat, que pisa VCPKG_ROOT. Estaba duplicada en esos
+rem  dos sitios y esa duplicacion ya costo una variable: se agrego en un
+rem  bloque y no en el otro. Con una sola definicion eso no puede repetirse.
+rem
+rem  PATH deliberadamente NO se toca aqui: solo interesa despues de vcvars, y
+rem  llamar dos veces lo antepondria dos veces.
+rem ---------------------------------------------------------------------
+:DEFINIR_ENTORNO
+rem  El repositorio es la carpeta donde vive este .bat, no una ruta fija: asi
+rem  el entorno sigue funcionando si el clon se mueve o se renombra.
+rem  %~dp0 termina en "\", que hay que quitar para poder concatenar rutas.
+set "SEHCONTROL_ROOT=%~dp0"
+if "%SEHCONTROL_ROOT:~-1%"=="\" set "SEHCONTROL_ROOT=%SEHCONTROL_ROOT:~0,-1%"
+set "SEHCONTROL_LAUNCHER=%~f0"
+set "VS_VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
+set "VCPKG_ROOT=C:\vcpkg-sehcontrol"
+set "LLVM_HOME=C:\LLVM15"
+set "LIBCLANG_PATH=C:\LLVM15\bin"
+set "FLUTTER_ROOT=C:\tools\flutter"
+set "CARGO_BUILD_JOBS=4"
+
+rem  bindgen (hwcodec, scrap, magnum-opus) agrega esto a los argumentos de
+rem  clang. Si quedo definida a nivel de Usuario apuntando a otro vcpkg -el
+rem  caso real que motivo esta linea era "-IE:\vcpkg\..."- clang recibe
+rem  cabeceras de una instalacion que no es la nuestra, o de una unidad que
+rem  ni existe. Vaciarla obliga a que las cabeceras salgan de VCPKG_ROOT y de
+rem  lo que deja vcvars64, que es lo que este entorno controla.
+set "BINDGEN_EXTRA_CLANG_ARGS="
+
+rem  Android. No son obligatorias: si faltan, solo se desactivan los
+rem  comandos android-* y build-android, el resto del entorno sigue igual.
+rem  Las rutas coinciden con las que build_android.py busca por defecto.
+set "ANDROID_SDK_ROOT=%LOCALAPPDATA%\Android\Sdk"
+set "ANDROID_HOME=%LOCALAPPDATA%\Android\Sdk"
+set "ANDROID_NDK_HOME=%LOCALAPPDATA%\Android\Sdk\ndk\25.2.9519653"
+set "MSYS_BIN=C:\msys64\usr\bin"
+goto :eof
 
 
 :PANEL_INICIAL
@@ -406,10 +427,34 @@ exit /b
 :ESTADO
 endlocal
 @echo off
+rem ---------------------------------------------------------------------
+rem  Llamado desde la consola preparada, el entorno ya existe. Ejecutado en
+rem  frio (doble clic, otra cmd) no existia, y este informe imprimia rutas
+rem  vacias mas el LIBCLANG_PATH heredado del sistema, que suele ser justo el
+rem  valor roto que se esta intentando diagnosticar. Rellenarlo con la misma
+rem  definicion que usa el arranque hace que las rutas mostradas sean siempre
+rem  las que el entorno configura; el aviso de abajo explica por que las
+rem  herramientas de MSVC apareceran como FALTA en ese caso.
+rem ---------------------------------------------------------------------
+set "SEH_ESTADO_FRIO="
+if defined SEHCONTROL_ROOT goto ESTADO_CABECERA
+set "SEH_ESTADO_FRIO=1"
+call :DEFINIR_ENTORNO
+
+:ESTADO_CABECERA
 echo.
 echo =========================================================================
 echo                 ESTADO DEL ENTORNO - SEHCONTROL ENTREGA 4
 echo =========================================================================
+if not defined SEH_ESTADO_FRIO goto ESTADO_RUTAS
+echo.
+echo  [AVISO] Ejecutado fuera de la consola preparada.
+echo  Las rutas de abajo son las que este entorno configura, pero vcvars64
+echo  no se ha cargado en esta ventana: cl.exe y link.exe apareceran como
+echo  FALTA aunque esten bien instalados. Para un informe real, abrir el
+echo  entorno y escribir: estado
+
+:ESTADO_RUTAS
 echo.
 echo  Repositorio   : %SEHCONTROL_ROOT%
 echo  VCPKG_ROOT    : %VCPKG_ROOT%
