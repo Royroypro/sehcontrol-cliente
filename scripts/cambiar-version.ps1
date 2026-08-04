@@ -177,7 +177,8 @@ Write-Output ''
 Write-Output "Version cambiada: $actual  ->  $Version"
 Write-Output "  Cargo.toml            version = `"$Version`""
 Write-Output "  flutter/pubspec.yaml  version: $Version+$($build + 1)"
-Write-Output "  Cargo.lock            sincronizado"
+Write-Output "  libs/portable         version = `"$Version`""
+Write-Output "  Cargo.lock            sincronizado (sehcontrol y portable-packer)"
 Write-Output "  src/version.rs        se regenera solo al compilar"
 Write-Output ''
 Write-Output 'Recorda: al publicar en el panel hay que declarar EXACTAMENTE esta misma version.'
