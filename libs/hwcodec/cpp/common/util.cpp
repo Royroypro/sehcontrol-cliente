@@ -43,7 +43,22 @@ void set_av_codec_ctx(AVCodecContext *c, const std::string &name, int kbs,
   /* frames per second */
   c->time_base = av_make_q(1, 1000);
   c->framerate = av_make_q(fps, 1);
-  c->flags |= AV_CODEC_FLAG2_LOCAL_HEADER;
+  // OJO: LOCAL_HEADER es un flag de `flags2`, no de `flags`. Estaba puesto en
+  // `flags`, donde ese mismo bit (1 << 3) es AV_CODEC_FLAG_OUTPUT_CORRUPT --
+  // una opcion de decodificacion que aqui no hace nada. Resultado: la
+  // intencion ("cabeceras en cada keyframe") no se aplicaba en NINGUN encoder.
+  //
+  // Se notaba solo fuera de NVIDIA, porque NVENC repite SPS/PPS por su cuenta.
+  // En AMD los parametros salian una unica vez al principio, asi que cualquier
+  // consumidor que empezara a mitad del stream se quedaba sin poder decodificar
+  // -- el preview por SRT esperaba indefinidamente un keyframe con SPS/PPS en
+  // banda que nunca llegaba, y un cliente RTSP que conectara tarde dependia de
+  // los sprop-parameter-sets del SDP para arrancar.
+  //
+  // Puesto en el campo correcto es la via estandar de FFmpeg y no depende del
+  // fabricante, que es justo lo que hace falta para que valga en cualquier
+  // equipo.
+  c->flags2 |= AV_CODEC_FLAG2_LOCAL_HEADER;
   c->flags |= AV_CODEC_FLAG_LOW_DELAY;
   c->slices = 1;
   c->thread_type = FF_THREAD_SLICE;
