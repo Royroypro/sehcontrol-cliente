@@ -211,7 +211,35 @@ Map<String, String> screenCamHistoricalPolicyValues(Map screenCam) {
     final rtspPassword = screenCam['rtsp_password'];
     values['screencam-rtsp-pass'] = rtspPassword is String ? rtspPassword : '';
   }
+  // Port overrides. The device defaults to the standard 554/80 an NVR assumes
+  // when an operator adds it by IP; these exist for hosts where something else
+  // already holds those ports. An explicit null clears the override and
+  // returns the device to its own configuration, same as for the credentials.
+  //
+  // The `_override` suffix is not decoration: the *heartbeat* block already
+  // carries `rtsp_port` meaning "the port this device reports it is serving
+  // on", which the panel stores to build the RTSP URL it displays. Reusing
+  // that name for policy would put two different meanings in one field, and
+  // the device's own report would overwrite the administrator's choice.
+  if (screenCam.containsKey('rtsp_port_override')) {
+    values['screencam-policy-rtsp-port'] =
+        _screenCamPortValue(screenCam['rtsp_port_override']);
+  }
+  if (screenCam.containsKey('onvif_port_override')) {
+    values['screencam-policy-onvif-port'] =
+        _screenCamPortValue(screenCam['onvif_port_override']);
+  }
   return values;
+}
+
+/// Normalises a policy port to what the daemon parses, or to the empty string
+/// meaning "no override". Anything outside 1-65535 — including 0, which the
+/// daemon would otherwise have to reject as an ephemeral port — is dropped
+/// here so an invalid panel value can't take the RTSP listener down.
+String _screenCamPortValue(dynamic raw) {
+  final port = raw is int ? raw : int.tryParse(raw?.toString() ?? '');
+  if (port == null || port < 1 || port > 65535) return '';
+  return port.toString();
 }
 
 /// Returns only independently valid display-policy fields. Absent or invalid

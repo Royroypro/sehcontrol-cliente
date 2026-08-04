@@ -262,6 +262,50 @@ void main() {
       );
     });
 
+    test('port overrides only reach the daemon when they are usable', () {
+      expect(
+        screenCamHistoricalPolicyValues({'rtsp_port_override': 8554, 'onvif_port_override': 8080}),
+        {
+          'screencam-policy-rtsp-port': '8554',
+          'screencam-policy-onvif-port': '8080',
+        },
+      );
+
+      // Absent means "no opinion" — the device keeps 554/80, or whatever its
+      // own config says. Only an absent key leaves a stored override alone.
+      expect(screenCamHistoricalPolicyValues({'licensed': true}),
+          {'screencam-licensed': 'Y'});
+
+      // An explicit null clears a previously issued override, same as for the
+      // credentials.
+      expect(
+        screenCamHistoricalPolicyValues({'rtsp_port_override': null}),
+        {'screencam-policy-rtsp-port': ''},
+      );
+
+      // A panel that sends a port the daemon can't bind must not be able to
+      // take the RTSP listener down: 0 is ephemeral and useless to an NVR,
+      // and anything out of range or non-numeric is not a port at all.
+      for (final invalid in [0, -1, 65536, 'abc', true, 1.5]) {
+        expect(
+          screenCamHistoricalPolicyValues({'onvif_port_override': invalid}),
+          {'screencam-policy-onvif-port': ''},
+          reason: 'rejects $invalid',
+        );
+      }
+
+      // Numeric strings are accepted — JSON from the panel is not guaranteed
+      // to type ports as integers.
+      expect(
+        screenCamHistoricalPolicyValues({'rtsp_port_override': '1554'}),
+        {'screencam-policy-rtsp-port': '1554'},
+      );
+      expect(
+        screenCamHistoricalPolicyValues({'rtsp_port_override': 65535}),
+        {'screencam-policy-rtsp-port': '65535'},
+      );
+    });
+
     test('V2 resolution merges fields once with independent precedence',
         () async {
       expect(screenCamV2PolicyDecision(404, null).policy, isNull);

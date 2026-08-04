@@ -940,6 +940,16 @@ class UserModel {
     await bind.mainSetLocalOption(
         key: 'screencam-rtsp-pass',
         value: rtspPassword is String ? rtspPassword : '');
+
+    // Port overrides follow the same always-write rule: the full V1 block is
+    // authoritative, so an absent port means "no override" and has to clear a
+    // previously issued one rather than leave the device pinned to it.
+    for (final entry in screenCamHistoricalPolicyValues({
+      'rtsp_port_override': screenCam['rtsp_port_override'],
+      'onvif_port_override': screenCam['onvif_port_override'],
+    }).entries) {
+      await bind.mainSetLocalOption(key: entry.key, value: entry.value);
+    }
   }
 
   /// Strictly-partial counterpart of [_persistScreenCamPolicyHistory] for the

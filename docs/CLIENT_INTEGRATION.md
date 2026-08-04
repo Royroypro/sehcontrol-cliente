@@ -747,10 +747,30 @@ con el mismo código):
     "mode": "managed",
     "max_streams": 1,
     "rtsp_user": "seh_a1b2c3",
-    "rtsp_password": "K7pQ2mVx9nR4"
+    "rtsp_password": "K7pQ2mVx9nR4",
+    "rtsp_port_override": null,
+    "onvif_port_override": null
   }
 }
 ```
+
+### Reglas de los puertos (opcional, sólo si hace falta moverlos)
+
+El cliente ya escucha en 554 (RTSP) y 80 (ONVIF), que es lo que un Dahua o un
+Hikvision asumen cuando el operador da de alta el equipo por IP. Estos dos campos
+existen sólo para el caso en que esos puertos estén ocupados en la máquina.
+
+- `rtsp_port_override` / `onvif_port_override`: entero 1-65535, o `null`.
+- **`null` o ausente = sin override**, el equipo usa 554/80. No es lo mismo que 0:
+  un 0 se descarta como inválido, porque un puerto efímero no le sirve a un NVR.
+- **El nombre lleva `_override` a propósito.** El bloque `screen_cam` del
+  *heartbeat* ya usa `rtsp_port` con otro significado — ahí es el puerto que el
+  equipo **reporta** estar usando, y el panel lo guarda para construir la
+  `rtsp_url` que muestra en la ficha. Si la política reutilizara ese nombre,
+  ambos sentidos acabarían en la misma columna y el primer heartbeat del equipo
+  pisaría el valor que eligió el administrador.
+- **Cambiarlos requiere reiniciar el servicio del equipo**: el puerto se lee una
+  sola vez al arrancar, a diferencia de las credenciales, que se releen cada 2 s.
 
 ### Reglas de los dos campos nuevos
 

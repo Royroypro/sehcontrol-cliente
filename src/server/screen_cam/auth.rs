@@ -125,11 +125,20 @@ impl Challenge {
 
     /// Both schemes, strongest first — RTSP clients pick the first one they
     /// understand, so Digest must be listed before Basic.
+    ///
+    /// `algorithm` and `qop` are stated explicitly rather than left implicit:
+    /// some NVR firmwares refuse a challenge that names neither, and others
+    /// send `qop=auth` with a cnonce regardless of what was offered — which
+    /// [`verify_digest`](Self::verify_digest) also accepts, so both the
+    /// RFC 2069 and the RFC 2617 response formulas work either way.
     pub fn www_authenticate_headers(&self) -> [(&'static str, String); 2] {
         [
             (
                 "WWW-Authenticate",
-                format!("Digest realm=\"{REALM}\", nonce=\"{}\"", self.nonce),
+                format!(
+                    "Digest realm=\"{REALM}\", nonce=\"{}\", algorithm=MD5, qop=\"auth\"",
+                    self.nonce
+                ),
             ),
             ("WWW-Authenticate", format!("Basic realm=\"{REALM}\"")),
         ]
@@ -153,7 +162,12 @@ impl Challenge {
 
     fn verify_digest(&self, creds: &Credentials, method: &str, params: &str) -> bool {
         let params = parse_digest_params(params);
-        let get = |k: &str| params.iter().find(|(pk, _)| pk == k).map(|(_, v)| v.as_str());
+        let get = |k: &str| {
+            params
+                .iter()
+                .find(|(pk, _)| pk == k)
+                .map(|(_, v)| v.as_str())
+        };
 
         if get("username") != Some(creds.user.as_str()) {
             return false;
@@ -173,7 +187,23 @@ impl Challenge {
 
         let ha1 = md5_hex(&format!("{}:{}:{}", creds.user, REALM, creds.pass));
         let ha2 = md5_hex(&format!("{}:{}", method, uri));
-        let expected = md5_hex(&format!("{}:{}:{}", ha1, self.nonce, ha2));
+
+        // Two response formulas exist and clients pick without asking. A
+        // client that echoes qop/nc/cnonce computed the RFC 2617 form; one
+        // that doesn't computed the older RFC 2069 form. Validating only the
+        // second (which is what this did before) rejected every client that
+        // sends qop unprompted, permanently and with no useful log.
+        let expected = match (get("qop"), get("nc"), get("cnonce")) {
+            (Some(qop), Some(nc), Some(cnonce)) if qop == "auth" || qop == "auth-int" => {
+                // auth-int would hash the body into HA2; no RTSP method this
+                // server accepts carries one, so the two coincide here.
+                md5_hex(&format!(
+                    "{}:{}:{}:{}:{}:{}",
+                    ha1, self.nonce, nc, cnonce, qop, ha2
+                ))
+            }
+            _ => md5_hex(&format!("{}:{}:{}", ha1, self.nonce, ha2)),
+        };
         constant_time_eq(expected.as_bytes(), response.as_bytes())
     }
 }

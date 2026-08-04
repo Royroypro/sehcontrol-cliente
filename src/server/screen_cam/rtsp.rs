@@ -7,12 +7,30 @@
 // has issued credentials (see auth.rs). No multiple routes — see
 // docs/SCREENCAM_PLAN.md Fase 1/3 for what's intentionally deferred.
 //
+// Compatibility notes for real DVR/NVR hardware (Dahua, Hikvision and the
+// live555-derived stacks most of the market ships), all of which this server
+// now accommodates and none of which VLC or ZoneMinder's FFmpeg client ever
+// exercised:
+//   - RTCP Sender Reports go out every RTCP_INTERVAL on both transports (UDP
+//     to the client's RTCP port, TCP on the interleaved channel paired with
+//     RTP). Several firmwares tear a session down if the sender never reports.
+//   - RTCP Receiver Reports coming *back* over an interleaved connection are
+//     recognised and skipped instead of being fed to the request parser. Both
+//     Dahua and Hikvision send them, and mistaking one for a request used to
+//     desynchronise the connection.
+//   - SET_PARAMETER is accepted as a keep-alive (it is the one most NVRs use,
+//     more than GET_PARAMETER) and PAUSE is answered rather than refused.
+//   - DESCRIBE carries Content-Base, and the SDP uses `trackID=0` control
+//     URLs, so a client that resolves the control attribute against the base
+//     builds a SETUP URL this server recognises.
+//   - PLAY carries RTP-Info (url/seq/rtptime), which live555-based clients
+//     want before they will start their decoder.
+//
 // Known simplifications (tracked in docs/SCREENCAM_PLAN.md, not silently
-// hidden): no RTCP Sender Reports are sent on the UDP path (some strict NVRs
-// may eventually want them); a TCP-interleaved session that receives
-// unexpected non-RTSP bytes after PLAY (e.g. a client sending RTCP back over
-// the same socket) will simply have that request parse fail and the
-// connection close, it will not corrupt other sessions.
+// hidden): incoming RTCP is skipped, not parsed — this server does not adapt
+// its bitrate to the receiver reports it gets. There is still only one stream
+// and one track, so there is no sub-stream profile for NVRs that would prefer
+// a low-resolution channel for their live wall.
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -25,12 +43,25 @@ use std::time::Duration;
 use hbb_common::{anyhow::anyhow, bail, log, ResultType};
 
 use super::auth;
+use super::rtp;
 use super::SharedState;
 
 const RTSP_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 const TCP_ACCESS_UNIT_QUEUE_CAPACITY: usize = 2;
 const TCP_WRITER_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const UDP_WOULD_BLOCK_LIMIT: u8 = 3;
+/// Advertised in the SETUP response. NVRs use it to decide how often to send
+/// their keep-alive; 60 s is what ONVIF cameras conventionally report and what
+/// `GetStreamUri` already advertises as `PT60S`.
+const SESSION_TIMEOUT_SECS: u32 = 60;
+/// How often each session gets a Sender Report. RFC 3550 wants the RTCP
+/// bandwidth held to ~5% of the session bandwidth; for a single video sender
+/// with no receiver reports to schedule around, a fixed 5 s is well inside
+/// that and is what most camera firmwares emit.
+const RTCP_INTERVAL: Duration = Duration::from_secs(5);
+/// SDP media-level control attribute, and therefore the suffix an NVR appends
+/// to the Content-Base when it issues SETUP.
+const TRACK_CONTROL: &str = "trackID=0";
 
 pub(super) struct RtpAccessUnit {
     packets: Vec<Vec<u8>>,
@@ -53,13 +84,17 @@ enum WriterMessage {
 enum Transport {
     Tcp {
         sender: SyncSender<WriterMessage>,
+        /// Shared with the interleaved RTP writer and with every RTSP
+        /// response, so the mutex is what keeps a Sender Report from landing
+        /// in the middle of somebody else's frame.
+        stream: Arc<Mutex<TcpStream>>,
+        rtcp_channel: u8,
     },
     Udp {
         rtp_socket: UdpSocket,
-        // Kept open (and never written to in this MVP) purely so the client's
-        // RTCP receiver reports land somewhere sane instead of getting an
-        // ICMP port-unreachable back. See module docs.
-        _rtcp_socket: UdpSocket,
+        // Also where the client's own receiver reports land, instead of
+        // getting an ICMP port-unreachable back.
+        rtcp_socket: UdpSocket,
     },
 }
 
@@ -95,9 +130,43 @@ impl Session {
             Transport::Udp { rtp_socket, .. } => {
                 self.dispatch_udp_access_unit_with(&access_unit, |packet| rtp_socket.send(packet))
             }
-            Transport::Tcp { sender } => sender
+            Transport::Tcp { sender, .. } => sender
                 .try_send(WriterMessage::AccessUnit { epoch, access_unit })
                 .map_err(map_tcp_queue_error),
+        }
+    }
+
+    /// Sends one RTCP compound packet out-of-band of the access-unit queue.
+    /// Deliberately best-effort: a report that cannot go out says nothing
+    /// about whether video still can, so the caller logs and keeps the session.
+    fn send_rtcp(&self, packet: &[u8]) -> io::Result<()> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "RTSP session is closed",
+            ));
+        }
+        match &self.transport {
+            Transport::Udp { rtcp_socket, .. } => rtcp_socket.send(packet).map(|_| ()),
+            Transport::Tcp {
+                stream,
+                rtcp_channel,
+                ..
+            } => {
+                let len = u16::try_from(packet.len()).map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "RTCP packet exceeds RTSP interleaved frame limit",
+                    )
+                })?;
+                let len = len.to_be_bytes();
+                let header = [b'$', *rtcp_channel, len[0], len[1]];
+                let mut stream = stream.lock().map_err(|_| {
+                    io::Error::new(io::ErrorKind::Other, "RTSP stream lock poisoned")
+                })?;
+                stream.write_all(&header)?;
+                stream.write_all(packet)
+            }
         }
     }
 
@@ -109,7 +178,7 @@ impl Session {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            if let Transport::Tcp { sender } = &self.transport {
+            if let Transport::Tcp { sender, .. } = &self.transport {
                 let _ = sender.try_send(WriterMessage::Close);
             }
             // This clone is independent from the writer's serialization mutex,
@@ -344,13 +413,14 @@ struct RtspRequest {
 pub fn start_listener(port: u16, state: Arc<SharedState>) -> ResultType<()> {
     let listener = TcpListener::bind(("0.0.0.0", port))?;
     log::info!("[screencam] RTSP listening on 0.0.0.0:{port}");
+    start_rtcp_reporter(Arc::downgrade(&state));
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
                     let state = state.clone();
                     std::thread::spawn(move || {
-                        if let Err(e) = handle_connection(stream, state) {
+                        if let Err(e) = handle_connection(stream, port, state) {
                             log::debug!("[screencam] rtsp connection ended: {e:?}");
                         }
                     });
@@ -362,11 +432,61 @@ pub fn start_listener(port: u16, state: Arc<SharedState>) -> ResultType<()> {
     Ok(())
 }
 
-fn handle_connection(stream: TcpStream, state: Arc<SharedState>) -> ResultType<()> {
+/// Periodically emits an RTCP Sender Report to every live session. A single
+/// thread rather than one per session: the reports are 5 s apart and derived
+/// from one shared snapshot, so there is nothing per-session to schedule.
+///
+/// Failures never retire a session. RTCP is advisory — a report that can't go
+/// out (a full UDP buffer, a client that closed only its RTCP port) says
+/// nothing about whether video is still flowing, and the RTP path already has
+/// its own removal logic for the case where it isn't.
+///
+/// Reports are emitted in sequence, and an interleaved one has to take the
+/// session's write mutex, so a TCP peer that has stopped reading can hold this
+/// loop for up to `RTSP_WRITE_TIMEOUT` and delay the other sessions' reports by
+/// that much. Acceptable while the interval is an order of magnitude larger
+/// than the timeout; if that stops holding, this wants a thread per session
+/// rather than a shorter interval.
+fn start_rtcp_reporter(state: Weak<SharedState>) {
+    std::thread::Builder::new()
+        .name("screencam-rtcp".to_owned())
+        .spawn(move || loop {
+            std::thread::sleep(RTCP_INTERVAL);
+            let Some(state) = state.upgrade() else {
+                break;
+            };
+            let sessions = state.sessions.lock().unwrap().clone();
+            for session in sessions {
+                let Some(snapshot) = state.rtp_stats.snapshot_for_epoch(session.epoch()) else {
+                    continue;
+                };
+                // Nothing has actually been sent yet for this epoch, so there
+                // is no clock mapping worth reporting.
+                if snapshot.ntp == 0 {
+                    continue;
+                }
+                let packet = rtp::build_sender_report(&snapshot, RTCP_CNAME);
+                if let Err(error) = session.send_rtcp(&packet) {
+                    log::debug!(
+                        "[screencam] RTCP report not sent for session {}: {error}",
+                        session.id
+                    );
+                }
+            }
+        })
+        .ok();
+}
+
+/// Canonical name carried in the RTCP SDES item. Constant on purpose: it only
+/// has to be stable and unique per source, and this server has exactly one.
+const RTCP_CNAME: &str = "screencam@sehcontrol";
+
+fn handle_connection(stream: TcpStream, rtsp_port: u16, state: Arc<SharedState>) -> ResultType<()> {
     let mut session_id = None;
     let mut registered_sessions = Vec::new();
     let result = handle_connection_inner(
         stream,
+        rtsp_port,
         state.clone(),
         &mut session_id,
         &mut registered_sessions,
@@ -414,6 +534,7 @@ fn configure_write_timeout(stream: &TcpStream, timeout: Duration) -> io::Result<
 
 fn handle_connection_inner(
     stream: TcpStream,
+    rtsp_port: u16,
     state: Arc<SharedState>,
     session_id: &mut Option<String>,
     registered_sessions: &mut Vec<Arc<Session>>,
@@ -442,7 +563,7 @@ fn handle_connection_inner(
         // asked for credentials, and it reveals nothing but a method list.
         // GET_PARAMETER/TEARDOWN only act on a session the caller already
         // holds, which it could only have obtained by authenticating.
-        if matches!(req.method.as_str(), "DESCRIBE" | "SETUP" | "PLAY") {
+        if matches!(req.method.as_str(), "DESCRIBE" | "SETUP" | "PLAY" | "PAUSE") {
             let creds = auth::credentials();
             let authorization = req.headers.get("authorization").map(|s| s.as_str());
             if creds.is_set() && !challenge.verify(&creds, &req.method, authorization) {
@@ -468,7 +589,8 @@ fn handle_connection_inner(
                     &cseq,
                     &[(
                         "Public",
-                        "OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER",
+                        "OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN, \
+                         GET_PARAMETER, SET_PARAMETER",
                     )],
                     None,
                 )?;
@@ -476,11 +598,19 @@ fn handle_connection_inner(
             "DESCRIBE" => {
                 match build_sdp(&state, peer_addr) {
                     Some((epoch, sdp)) => {
+                        // Content-Base is what the client resolves the SDP's
+                        // relative `a=control:` attribute against. Without it
+                        // a strict client guesses from the request URI and can
+                        // produce a SETUP URL that doesn't round-trip.
+                        let content_base = content_base_for(&req.uri, peer_addr, rtsp_port);
                         write_response(
                             &write_half,
                             "200 OK",
                             &cseq,
-                            &[("Content-Type", "application/sdp")],
+                            &[
+                                ("Content-Type", "application/sdp"),
+                                ("Content-Base", &content_base),
+                            ],
                             Some(sdp.as_bytes()),
                         )?;
                         described_epoch = Some(epoch);
@@ -532,11 +662,19 @@ fn handle_connection_inner(
                             replaced_session.close();
                         }
                         registered_sessions.push(registered_session.clone());
+                        // The timeout tells the NVR how often it has to send a
+                        // keep-alive; without it firmwares fall back to their
+                        // own default, which is sometimes longer than the idle
+                        // window an intermediate firewall allows.
+                        let session_hdr = format!("{id};timeout={SESSION_TIMEOUT_SECS}");
                         write_response(
                             &write_half,
                             "200 OK",
                             &cseq,
-                            &[("Transport", &resp_transport_hdr), ("Session", &id)],
+                            &[
+                                ("Transport", &resp_transport_hdr),
+                                ("Session", &session_hdr),
+                            ],
                             None,
                         )?;
                         if let Some(writer_start) = writer_start {
@@ -558,20 +696,53 @@ fn handle_connection_inner(
             }
             "PLAY" => {
                 let id = session_id.clone().unwrap_or_default();
-                write_response(
-                    &write_half,
-                    "200 OK",
-                    &cseq,
-                    &[("Session", &id), ("Range", "npt=0.000-")],
-                    None,
-                )?;
+                // live555-derived clients (the bulk of the NVR market) want
+                // the first sequence number and RTP timestamp up front so they
+                // can prime their jitter buffer instead of waiting to infer
+                // both from the stream. Omitted only when the session's epoch
+                // has no published stream yet, where any value would be a lie.
+                //
+                // Declared before `headers`, which borrows it: locals drop in
+                // reverse order, so the other way round leaves the header list
+                // outliving the string it points at.
+                let rtp_info = registered_sessions
+                    .last()
+                    .and_then(|session| state.rtp_stats.snapshot_for_epoch(session.epoch()))
+                    .map(|snapshot| {
+                        format!(
+                            "url={};seq={};rtptime={}",
+                            track_url_for(&req.uri, peer_addr, rtsp_port),
+                            snapshot.next_seq,
+                            snapshot.timestamp_90k,
+                        )
+                    });
+                let mut headers: Vec<(&str, &str)> =
+                    vec![("Session", id.as_str()), ("Range", "npt=0.000-")];
+                if let Some(rtp_info) = rtp_info.as_deref() {
+                    headers.push(("RTP-Info", rtp_info));
+                }
+                write_response(&write_half, "200 OK", &cseq, &headers, None)?;
             }
-            "GET_PARAMETER" => {
-                // Used by many clients/NVRs purely as a keep-alive ping.
-                write_response(&write_half, "200 OK", &cseq, &[], None)?;
+            // Both are keep-alive pings in practice. SET_PARAMETER is the one
+            // most NVR firmwares reach for — answering 501 to it, as this
+            // server used to, reads as a dead session and triggers a reconnect
+            // loop. Neither carries a body we act on; read_request already
+            // drained any Content-Length the client sent.
+            "GET_PARAMETER" | "SET_PARAMETER" => {
+                let id = session_id.clone().unwrap_or_default();
+                write_response(&write_half, "200 OK", &cseq, &[("Session", &id)], None)?;
+            }
+            // Nothing to pause — this is a live source with no seek support,
+            // so the stream simply keeps running. Answering 200 rather than
+            // 501 keeps clients that PAUSE before TEARDOWN from treating the
+            // teardown as a failure.
+            "PAUSE" => {
+                let id = session_id.clone().unwrap_or_default();
+                write_response(&write_half, "200 OK", &cseq, &[("Session", &id)], None)?;
             }
             "TEARDOWN" => {
-                write_response(&write_half, "200 OK", &cseq, &[], None)?;
+                let id = session_id.clone().unwrap_or_default();
+                write_response(&write_half, "200 OK", &cseq, &[("Session", &id)], None)?;
                 break;
             }
             other => {
@@ -594,20 +765,29 @@ fn setup_transport(
     write_half: &Arc<Mutex<TcpStream>>,
 ) -> ResultType<(Transport, String, Option<TcpWriterStart>)> {
     if transport_hdr.contains("TCP") || transport_hdr.contains("interleaved") {
-        // TCP interleaved: RTP shares this same connection, channel 0 (RTCP
-        // would be channel 1, unused here — see module docs).
+        // TCP interleaved: RTP and RTCP share this same connection. Echo back
+        // the channel pair the client asked for rather than forcing 0-1 —
+        // clients are entitled to pick, and one that gets a different pair
+        // than it requested will route our RTP to a track it isn't decoding.
+        let (rtp_channel, rtcp_channel) = extract_param(transport_hdr, "interleaved=")
+            .and_then(|range| parse_channel_range(&range))
+            .unwrap_or((0, 1));
         let (sender, receiver) = mpsc::sync_channel(TCP_ACCESS_UNIT_QUEUE_CAPACITY);
-        let transport = Transport::Tcp { sender };
+        let transport = Transport::Tcp {
+            sender,
+            stream: write_half.clone(),
+            rtcp_channel,
+        };
         let writer_start = TcpWriterStart {
             receiver,
             writer: Box::new(TcpInterleavedWriter {
                 stream: write_half.clone(),
-                rtp_channel: 0,
+                rtp_channel,
             }),
         };
         Ok((
             transport,
-            "RTP/AVP/TCP;unicast;interleaved=0-1".to_owned(),
+            format!("RTP/AVP/TCP;unicast;interleaved={rtp_channel}-{rtcp_channel}"),
             Some(writer_start),
         ))
     } else {
@@ -630,12 +810,24 @@ fn setup_transport(
         Ok((
             Transport::Udp {
                 rtp_socket,
-                _rtcp_socket: rtcp_socket,
+                rtcp_socket,
             },
             resp,
             None,
         ))
     }
+}
+
+fn parse_channel_range(s: &str) -> Option<(u8, u8)> {
+    let mut parts = s.trim().split('-');
+    let rtp: u8 = parts.next()?.trim().parse().ok()?;
+    // RFC 2326 pairs RTP with the next channel up; a client that only names
+    // one is asking for that default pair.
+    let rtcp: u8 = match parts.next() {
+        Some(value) => value.trim().parse().ok()?,
+        None => rtp.checked_add(1)?,
+    };
+    Some((rtp, rtcp))
 }
 
 fn extract_param(header: &str, key: &str) -> Option<String> {
@@ -652,9 +844,36 @@ fn parse_port_range(s: &str) -> ResultType<(u16, u16)> {
     Ok((a.parse()?, b.parse()?))
 }
 
+/// Consumes any `$`-framed interleaved packets sitting in front of the next
+/// request (RFC 2326 §10.12). On a TCP-interleaved session these are the
+/// client's own RTCP receiver reports — both Dahua and Hikvision send them
+/// while playing — and handing one to the line reader below would splice
+/// binary data into a request line and desynchronise the connection for good.
+///
+/// Returns `false` at EOF. The frames themselves are discarded: this server
+/// does not act on receiver reports (see module docs).
+fn skip_interleaved_frames(reader: &mut BufReader<TcpStream>) -> ResultType<bool> {
+    loop {
+        if reader.fill_buf()?.first() != Some(&b'$') {
+            // Also covers EOF, where fill_buf yields an empty slice; the
+            // caller's read_line then observes it and returns cleanly.
+            return Ok(true);
+        }
+        let mut header = [0u8; 4];
+        reader.read_exact(&mut header)?;
+        let len = u16::from_be_bytes([header[2], header[3]]) as u64;
+        if io::copy(&mut reader.by_ref().take(len), &mut io::sink())? != len {
+            return Ok(false); // truncated frame, the peer is gone
+        }
+    }
+}
+
 fn read_request(reader: &mut BufReader<TcpStream>) -> ResultType<Option<RtspRequest>> {
     let mut request_line = String::new();
     loop {
+        if !skip_interleaved_frames(reader)? {
+            return Ok(None); // EOF mid-frame
+        }
         request_line.clear();
         let n = reader.read_line(&mut request_line)?;
         if n == 0 {
@@ -724,6 +943,36 @@ fn write_response(
     Ok(())
 }
 
+/// The absolute URL a relative SDP `a=control:` attribute resolves against.
+/// Built from the URI the client actually asked for whenever that is already
+/// absolute, so an NVR that reached this server through a NAT/port-forward
+/// gets its own address back rather than a LAN address it cannot route to.
+fn content_base_for(uri: &str, peer_addr: SocketAddr, rtsp_port: u16) -> String {
+    let base = if uri.len() > 7 && uri[..7].eq_ignore_ascii_case("rtsp://") {
+        uri.to_owned()
+    } else {
+        let local_ip = local_ip_for_peer(peer_addr).unwrap_or_else(|| "0.0.0.0".to_owned());
+        let path = if uri.starts_with('/') {
+            uri
+        } else {
+            "/live/main"
+        };
+        format!("rtsp://{local_ip}:{rtsp_port}{path}")
+    };
+    if base.ends_with('/') {
+        base
+    } else {
+        format!("{base}/")
+    }
+}
+
+fn track_url_for(uri: &str, peer_addr: SocketAddr, rtsp_port: u16) -> String {
+    format!(
+        "{}{TRACK_CONTROL}",
+        content_base_for(uri, peer_addr, rtsp_port)
+    )
+}
+
 fn build_sdp(state: &SharedState, peer_addr: SocketAddr) -> Option<(u64, String)> {
     let local_ip = local_ip_for_peer(peer_addr).unwrap_or_else(|| "0.0.0.0".to_owned());
     build_sdp_for_ip(state, &local_ip)
@@ -738,8 +987,13 @@ fn build_sdp_for_ip(state: &SharedState, local_ip: &str) -> Option<(u64, String)
     let sps = descriptor.sps?;
     let pps = descriptor.pps?;
 
-    let profile_level_id = if sps.len() >= 3 {
-        format!("{:02X}{:02X}{:02X}", sps[0], sps[1], sps[2])
+    // RFC 6184 §8.1: profile-level-id is profile_idc / constraint flags /
+    // level_idc, which start at sps[1] — sps[0] is the NAL header byte (0x67).
+    // Reading from sps[0] advertised profile 0x67, which isn't a profile at
+    // all; FFmpeg (ZoneMinder) silently reparses the SPS and never noticed,
+    // but NVR firmwares that trust the fmtp line reject the DESCRIBE.
+    let profile_level_id = if sps.len() >= 4 {
+        format!("{:02X}{:02X}{:02X}", sps[1], sps[2], sps[3])
     } else {
         "42E01E".to_owned()
     };
@@ -755,11 +1009,15 @@ fn build_sdp_for_ip(state: &SharedState, local_ip: &str) -> Option<(u64, String)
          c=IN IP4 {ip}\r\n\
          t=0 0\r\n\
          a=tool:Sehcontrol ScreenCam\r\n\
+         a=type:broadcast\r\n\
+         a=range:npt=0-\r\n\
+         a=control:*\r\n\
          m=video 0 RTP/AVP 96\r\n\
          a=rtpmap:96 H264/90000\r\n\
          a=fmtp:96 packetization-mode=1;profile-level-id={plid};sprop-parameter-sets={sps},{pps}\r\n\
-         a=control:track1\r\n",
+         a=control:{track}\r\n",
         ip = local_ip,
+        track = TRACK_CONTROL,
         plid = profile_level_id,
         sps = sps_b64,
         pps = pps_b64,
@@ -826,7 +1084,11 @@ mod tests {
         let (sender, receiver) = mpsc::sync_channel(TCP_ACCESS_UNIT_QUEUE_CAPACITY);
         let session = Arc::new(Session {
             id: id.to_owned(),
-            transport: Transport::Tcp { sender },
+            transport: Transport::Tcp {
+                sender,
+                stream: write_stream.clone(),
+                rtcp_channel: 1,
+            },
             shutdown_stream: Arc::new(server.try_clone().unwrap()),
             epoch: 0,
             closed: AtomicBool::new(false),
@@ -1010,6 +1272,184 @@ mod tests {
             state.stream_epoch()
         ));
         assert_ne!(old_sdp, new_sdp);
+    }
+
+    /// SPS bytes here are `67 64 00 1F`: NAL header, then profile_idc=0x64
+    /// (High), constraint flags 0x00, level_idc=0x1F (level 3.1).
+    #[test]
+    fn profile_level_id_skips_the_nal_header_byte() {
+        let state = SharedState::new();
+        assert!(state.set_stream_dimensions(0, 1920, 1080));
+        assert!(state.apply_stream_access_unit(
+            0,
+            &[&[0x67, 0x64, 0x00, 0x1f], &[0x68, 0xee], &[0x65, 0x88]]
+        ));
+
+        let (_, sdp) = build_sdp_for_ip(&state, "127.0.0.1").expect("describes");
+
+        assert!(
+            sdp.contains("profile-level-id=64001F"),
+            "must report profile_idc/constraints/level_idc, got: {sdp}"
+        );
+        assert!(
+            !sdp.contains("profile-level-id=676400"),
+            "reading from the NAL header advertised a profile that doesn't exist"
+        );
+    }
+
+    #[test]
+    fn a_truncated_sps_falls_back_to_a_valid_baseline_profile() {
+        let state = SharedState::new();
+        assert!(state.set_stream_dimensions(0, 640, 480));
+        // Three bytes: enough for the descriptor, one short of a level_idc.
+        assert!(
+            state.apply_stream_access_unit(0, &[&[0x67, 0x64, 0x00], &[0x68, 0xee], &[0x65, 0x88]])
+        );
+
+        let (_, sdp) = build_sdp_for_ip(&state, "127.0.0.1").expect("describes");
+
+        assert!(sdp.contains("profile-level-id=42E01E"), "got: {sdp}");
+    }
+
+    #[test]
+    fn sdp_control_attributes_match_what_setup_urls_are_built_from() {
+        let state = SharedState::new();
+        assert!(state.set_stream_dimensions(0, 1280, 720));
+        assert!(state.apply_stream_access_unit(
+            0,
+            &[&[0x67, 0x42, 0xc0, 0x1e], &[0x68, 0xee], &[0x65, 0x88]]
+        ));
+
+        let (_, sdp) = build_sdp_for_ip(&state, "10.0.0.5").expect("describes");
+
+        assert!(sdp.contains("a=control:*\r\n"), "session-level control");
+        assert!(
+            sdp.contains(&format!("a=control:{TRACK_CONTROL}\r\n")),
+            "media-level control must be the track the SETUP URL names"
+        );
+        assert!(sdp.contains("a=range:npt=0-\r\n"), "live source range");
+    }
+
+    #[test]
+    fn content_base_echoes_an_absolute_request_uri_so_nat_survives() {
+        let peer = "203.0.113.9:5000".parse().unwrap();
+
+        // A client that reached us through a port-forward has to get its own
+        // address back, not whichever interface answered.
+        assert_eq!(
+            content_base_for("rtsp://public.example:8554/live/main", peer, 554),
+            "rtsp://public.example:8554/live/main/"
+        );
+        // Already-terminated bases are not doubled up.
+        assert_eq!(
+            content_base_for("rtsp://public.example/live/main/", peer, 554),
+            "rtsp://public.example/live/main/"
+        );
+        assert_eq!(
+            track_url_for("rtsp://public.example/live/main", peer, 554),
+            format!("rtsp://public.example/live/main/{TRACK_CONTROL}")
+        );
+    }
+
+    #[test]
+    fn content_base_reconstructs_an_absolute_url_from_a_bare_path() {
+        let peer = "127.0.0.1:5000".parse().unwrap();
+
+        // Dahua appends its own query string; it stays part of the base, which
+        // is what the client will echo back on SETUP.
+        let base = content_base_for("/cam/realmonitor?channel=1&subtype=0", peer, 554);
+        assert!(
+            base.starts_with("rtsp://127.0.0.1:554/cam/realmonitor?"),
+            "got: {base}"
+        );
+        assert!(base.ends_with('/'));
+
+        // `OPTIONS *` and other non-path URIs fall back to the served route
+        // rather than producing a malformed base.
+        let base = content_base_for("*", peer, 554);
+        assert_eq!(base, "rtsp://127.0.0.1:554/live/main/");
+    }
+
+    #[test]
+    fn interleaved_channels_are_echoed_back_as_the_client_asked() {
+        assert_eq!(parse_channel_range("0-1"), Some((0, 1)));
+        assert_eq!(parse_channel_range("2-3"), Some((2, 3)));
+        assert_eq!(parse_channel_range(" 4 - 5 "), Some((4, 5)));
+        // RFC 2326 pairs RTP with the next channel up.
+        assert_eq!(parse_channel_range("6"), Some((6, 7)));
+        assert_eq!(parse_channel_range(""), None);
+        assert_eq!(parse_channel_range("a-b"), None);
+        assert_eq!(parse_channel_range("300-301"), None);
+        // No channel left for RTCP; fall back rather than wrap around to 0.
+        assert_eq!(parse_channel_range("255"), None);
+    }
+
+    fn reader_over(bytes: &[u8]) -> BufReader<TcpStream> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        peer.write_all(bytes).unwrap();
+        peer.shutdown(Shutdown::Write).unwrap();
+        BufReader::new(server)
+    }
+
+    fn interleaved_frame(channel: u8, payload: &[u8]) -> Vec<u8> {
+        let len = (payload.len() as u16).to_be_bytes();
+        let mut frame = vec![b'$', channel, len[0], len[1]];
+        frame.extend_from_slice(payload);
+        frame
+    }
+
+    /// The regression this exists for: an NVR sends RTCP receiver reports back
+    /// on the same socket it keeps sending RTSP on. Handing one of those to the
+    /// line reader spliced binary data into a request line and desynchronised
+    /// the connection permanently.
+    #[test]
+    fn a_receiver_report_before_a_request_does_not_corrupt_it() {
+        // A payload containing both a newline and something that looks like a
+        // request line — exactly what used to be mistaken for one.
+        let mut wire = interleaved_frame(1, b"\x81\xc9\x00\x07GET_PARAMETER * RTSP/1.0\r\n");
+        wire.extend_from_slice(b"OPTIONS rtsp://host/live/main RTSP/1.0\r\nCSeq: 4\r\n\r\n");
+        let mut reader = reader_over(&wire);
+
+        let request = read_request(&mut reader).unwrap().expect("request");
+
+        assert_eq!(request.method, "OPTIONS");
+        assert_eq!(request.uri, "rtsp://host/live/main");
+        assert_eq!(request.headers.get("cseq").map(String::as_str), Some("4"));
+    }
+
+    #[test]
+    fn several_queued_frames_are_all_skipped() {
+        let mut wire = interleaved_frame(0, &[0xAA; 1400]);
+        wire.extend_from_slice(&interleaved_frame(1, &[0xBB; 60]));
+        wire.extend_from_slice(&interleaved_frame(1, &[]));
+        wire.extend_from_slice(b"TEARDOWN rtsp://host/live/main RTSP/1.0\r\nCSeq: 9\r\n\r\n");
+        let mut reader = reader_over(&wire);
+
+        let request = read_request(&mut reader).unwrap().expect("request");
+
+        assert_eq!(request.method, "TEARDOWN");
+        assert_eq!(request.headers.get("cseq").map(String::as_str), Some("9"));
+    }
+
+    #[test]
+    fn a_truncated_frame_ends_the_connection_instead_of_being_parsed() {
+        // Header promises 100 bytes, only 4 arrive before the peer goes away.
+        let mut wire = vec![b'$', 1, 0x00, 0x64];
+        wire.extend_from_slice(&[0xCC; 4]);
+        let mut reader = reader_over(&wire);
+
+        // Reported as a finished connection, not as a request built out of
+        // whatever the partial frame happened to contain.
+        assert!(read_request(&mut reader).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_clean_eof_is_still_reported_as_a_finished_connection() {
+        let mut reader = reader_over(b"");
+
+        assert!(read_request(&mut reader).unwrap().is_none());
     }
 
     #[test]

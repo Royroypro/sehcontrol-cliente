@@ -1,7 +1,7 @@
 // Sehcontrol ScreenCam — Fase 1 MVP (see docs/SCREENCAM_PLAN.md).
 //
 // Turns one monitor of this machine into an RTSP source a DVR/NVR (or, for
-// this MVP, VLC) can pull directly: `rtsp://<this-machine-ip>:8554/live/main`.
+// this MVP, VLC) can pull directly: `rtsp://<this-machine-ip>:554/live/main`.
 // Video never goes through the Sehcontrol panel/server — this module only
 // captures, encodes and serves RTP. Panel policy is applied through the
 // service IPC; it controls capture selection but never carries video data.
@@ -114,6 +114,11 @@ lazy_static::lazy_static! {
 pub struct ScreenCamConfig {
     pub monitor_index: usize,
     pub fps: u32,
+    /// Defaults to the standard RTSP port. Dahua and Hikvision NVRs assume 554
+    /// when adding a device by IP and several of their firmwares don't offer a
+    /// port field at all on the "generic/ONVIF" channel form, so anything else
+    /// makes the device un-addable without going through discovery. The panel
+    /// can still override it — see [`resolve_ports_from_policy`].
     pub rtsp_port: u16,
     /// 0.0-1.0, forwarded to the same quality->bitrate curve the remote
     /// desktop encoders already use (see HwRamEncoder::bitrate in
@@ -121,10 +126,11 @@ pub struct ScreenCamConfig {
     /// the plan's UI mock calls for.
     pub quality: f32,
     /// HTTP port for the ONVIF device/media SOAP services (docs/SCREENCAM_PLAN.md
-    /// Fase 6). Deliberately not 80 — that's what most ONVIF cameras use, but
-    /// it risks colliding with something else already on the host, and NVR
-    /// software is expected to read the real address from WS-Discovery's
-    /// `XAddrs` rather than assume a fixed port.
+    /// Fase 6). 80 is what ONVIF cameras conventionally use and what an NVR
+    /// assumes when the operator types an IP instead of running discovery.
+    /// It can collide with an existing web server on the host, which is why
+    /// [`resolve_ports_from_policy`] lets the panel move it, and why a bind
+    /// failure here only disables ONVIF rather than taking video down.
     pub onvif_port: u16,
     /// Stable device identity for WS-Discovery's `EndpointReference` and
     /// ONVIF's `GetDeviceInformation` (`SerialNumber`). Generated once (see
@@ -139,11 +145,54 @@ impl Default for ScreenCamConfig {
         Self {
             monitor_index: 0,
             fps: 10,
-            rtsp_port: 8554,
+            rtsp_port: 554,
             quality: 0.5,
-            onvif_port: 8080,
+            onvif_port: 80,
             device_uuid: String::new(),
         }
+    }
+}
+
+/// Panel-issued port overrides. Same one-way flow as the RTSP credentials in
+/// auth.rs: the panel writes them through Dart into `LocalConfig`, this
+/// machine only reads them. Absent or unparseable means "leave the local
+/// config alone", so a panel that says nothing about ports never moves a
+/// working deployment off the port its NVRs are already pointed at.
+const POLICY_RTSP_PORT_OPTION_KEY: &str = "screencam-policy-rtsp-port";
+const POLICY_ONVIF_PORT_OPTION_KEY: &str = "screencam-policy-onvif-port";
+
+/// Applies those overrides on top of a loaded config. Port 0 is rejected
+/// rather than treated as "let the OS pick": an ephemeral port is useless to
+/// an NVR that has to be told where to connect.
+fn resolve_ports_from_policy(cfg: &mut ScreenCamConfig) {
+    apply_policy_port(
+        &mut cfg.rtsp_port,
+        &read_policy_option(POLICY_RTSP_PORT_OPTION_KEY),
+        "RTSP",
+    );
+    apply_policy_port(
+        &mut cfg.onvif_port,
+        &read_policy_option(POLICY_ONVIF_PORT_OPTION_KEY),
+        "ONVIF",
+    );
+}
+
+fn read_policy_option(key: &str) -> String {
+    hbb_common::config::LocalConfig::get_option_from_file(key)
+}
+
+fn apply_policy_port(current: &mut u16, raw: &str, label: &str) {
+    if raw.is_empty() {
+        return;
+    }
+    match raw.parse::<u16>() {
+        Ok(port) if port > 0 => {
+            if *current != port {
+                log::info!("[screencam] {label} port overridden by panel policy: {port}");
+                *current = port;
+            }
+        }
+        _ => log::warn!("[screencam] ignoring invalid {label} port from panel policy: '{raw}'"),
     }
 }
 
@@ -167,6 +216,11 @@ impl ScreenCamConfig {
             cfg.device_uuid = uuid::Uuid::new_v4().to_string();
             cfg.store();
         }
+        // Applied after the store above on purpose: a panel override steers
+        // this run, it does not get written back into the local file. That
+        // keeps the operator's own configuration recoverable by clearing the
+        // policy, and keeps `store()` from fighting the panel on every load.
+        resolve_ports_from_policy(&mut cfg);
         cfg
     }
 
@@ -261,6 +315,10 @@ pub struct SharedState {
     /// since C1, the SRT publisher that drains it. Nothing it does can reach
     /// the capture loop: it only ever opens and closes the tap.
     preview_control: Arc<PreviewControl>,
+    /// Published by the capture loop, read by the RTSP threads for `RTP-Info`
+    /// and by the RTCP reporter. Lives here rather than next to the payloader
+    /// because both readers outlive any single `capture_loop` run.
+    pub(super) rtp_stats: rtp::RtpStreamStats,
 }
 
 impl SharedState {
@@ -289,6 +347,7 @@ impl SharedState {
             reconfigure_generation: AtomicU64::new(0),
             preview_tap,
             preview_control,
+            rtp_stats: rtp::RtpStreamStats::new(),
         }
     }
 
@@ -1388,6 +1447,12 @@ fn capture_loop(cfg: ScreenCamConfig, state: Arc<SharedState>) -> ResultType<Cap
     );
 
     let mut payloader = rtp::H264Payloader::new();
+    // Published before the first frame so a client that describes and plays
+    // during the gap still gets an RTP-Info describing the stream it is about
+    // to receive, rather than the header being silently dropped.
+    state
+        .rtp_stats
+        .begin_epoch(stream_epoch, payloader.ssrc(), payloader.next_seq());
     let spf = Duration::from_secs_f64(1.0 / cfg.fps as f64);
     let start = Instant::now();
     let mut yuv = Vec::new();
@@ -1613,11 +1678,20 @@ fn handle_access_unit(
         return; // no one watching; still update SPS/PPS above so DESCRIBE works once someone connects
     }
     let timestamp_90k = (elapsed.as_secs_f64() * 90_000.0) as u32;
-    let access_unit = Arc::new(rtsp::RtpAccessUnit::new(payloader.packetize(
-        &nals,
+    let packets = payloader.packetize(&nals, timestamp_90k, mtu);
+    // Recorded before dispatch so the counters an RTCP Sender Report carries
+    // describe what was handed to the transports, which is the same thing the
+    // sequence numbers already describe. Per-session drops (a full UDP buffer,
+    // a stalled TCP queue) are deliberately not subtracted: RFC 3550's sender
+    // counters are per-source, not per-receiver.
+    state.rtp_stats.record_access_unit(
+        stream_epoch,
+        payloader.ssrc(),
+        payloader.next_seq(),
         timestamp_90k,
-        mtu,
-    )));
+        &packets,
+    );
+    let access_unit = Arc::new(rtsp::RtpAccessUnit::new(packets));
     let failed = dispatch_access_unit_to_sessions(sessions, access_unit, |session, access_unit| {
         session.dispatch_access_unit(stream_epoch, access_unit)
     });
