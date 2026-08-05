@@ -775,6 +775,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("screencam_status_starting", "Iniciando..."),
         ("screencam_status_error", "Error"),
         ("screencam_status_disabled", "Apagado"),
+        ("screencam_status_unsupported", "Este equipo no cumple los requisitos minimos"),
         ("screencam_status_not_configured", "No disponible en este equipo"),
         ("screencam_managed_from_panel_tip", "Administrado desde el panel web de tu cuenta."),
         ("screencam_auth_required_tip", "Esta transmisión pide usuario y contraseña"),

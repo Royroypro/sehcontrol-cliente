@@ -1122,6 +1122,16 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
             : translate('screencam_status_error');
         statusColor = Colors.red;
         break;
+      // El equipo no tiene codificacion H.264 por hardware. Se separa de
+      // 'error' a proposito: un error invita a reintentar o a revisar la
+      // configuracion, y aqui no hay nada que hacer. Naranja y no rojo porque
+      // no es una averia, es una limitacion del equipo.
+      case 'unsupported':
+        statusText = lastError.isNotEmpty
+            ? lastError
+            : translate('screencam_status_unsupported');
+        statusColor = Colors.orange;
+        break;
       case 'disabled':
         statusText = translate('screencam_status_disabled');
         statusColor = Colors.grey;

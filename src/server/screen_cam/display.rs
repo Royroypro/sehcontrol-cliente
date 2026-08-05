@@ -689,6 +689,34 @@ fn resolve_monitor_name(
     }
 }
 
+/// Nombre del primer adaptador grafico, para poder nombrarlo en el mensaje que
+/// ve el operador cuando el equipo no puede codificar. Es lo primero que
+/// pregunta quien lo lee, y sin el, "no cumple los requisitos" no dice nada
+/// accionable.
+///
+/// Se aprovecha la misma enumeracion que ya se usa para los monitores, en vez
+/// de sumar una consulta WMI: `DeviceString` del adaptador ES la descripcion
+/// de la GPU ("Intel(R) HD Graphics 3000").
+#[cfg(windows)]
+pub(super) fn primary_adapter_name() -> Option<String> {
+    let mut adapter: DISPLAY_DEVICEW = unsafe { mem::zeroed() };
+    adapter.cb = mem::size_of::<DISPLAY_DEVICEW>() as _;
+    if unsafe { EnumDisplayDevicesW(ptr::null(), 0, &mut adapter, 0) } == FALSE {
+        return None;
+    }
+    let name = wide_string(&adapter.DeviceString).trim().to_owned();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
+#[cfg(not(windows))]
+pub(super) fn primary_adapter_name() -> Option<String> {
+    None
+}
+
 fn wide_string(value: &[u16]) -> String {
     let end = value
         .iter()

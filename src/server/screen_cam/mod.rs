@@ -969,6 +969,10 @@ enum CaptureExit {
     /// como averiado en el panel. Solo si no consigue rehacerse varias veces
     /// seguidas pasa a ser un error de verdad.
     Invalidated(String),
+    /// El equipo no tiene codificacion H.264 por hardware. No es un fallo que
+    /// se pueda reintentar: solo cambia instalando otro hardware o un driver
+    /// que lo exponga, y ambas cosas implican reiniciar.
+    Unsupported,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -977,6 +981,8 @@ enum WatchdogDisposition {
     RemainDisabled,
     /// Rehacer el capturador informando "arrancando", no "error".
     Rebuild,
+    /// Informar que el equipo no cumple y dejar de insistir.
+    ReportUnsupported,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1039,8 +1045,14 @@ fn watchdog_disposition(exit: &CaptureExit) -> WatchdogDisposition {
         CaptureExit::Reconfigure => WatchdogDisposition::RestartImmediately,
         CaptureExit::Disabled => WatchdogDisposition::RemainDisabled,
         CaptureExit::Invalidated(_) => WatchdogDisposition::Rebuild,
+        CaptureExit::Unsupported => WatchdogDisposition::ReportUnsupported,
     }
 }
+
+/// Cada cuanto se vuelve a mirar en un equipo que no cumple. Largo a
+/// proposito: lo unico que cambia ese veredicto es hardware o drivers nuevos,
+/// y eso llega con un reinicio. Reintentar cada 30 s solo llenaria el log.
+const UNSUPPORTED_RECHECK_INTERVAL: Duration = Duration::from_secs(600);
 
 /// Cuantas invalidaciones seguidas se toleran antes de considerarlo averiado.
 /// Un cambio de escritorio produce exactamente una; encadenar varias significa
@@ -1103,6 +1115,10 @@ pub fn start(cfg: ScreenCamConfig) {
         let mut backoff = MIN_BACKOFF;
         // Invalidaciones encadenadas sin que ninguna llegue a sostenerse.
         let mut consecutive_rebuilds: u32 = 0;
+        // El veredicto se registra una sola vez: se re-comprueba cada 10 min y
+        // sin esto quedaria una linea de error por cada comprobacion, para
+        // siempre, diciendo lo mismo.
+        let mut reported_unsupported = false;
         loop {
             if !is_enabled() {
                 set_status("disabled");
@@ -1141,6 +1157,24 @@ pub fn start(cfg: ScreenCamConfig) {
                             backoff = MIN_BACKOFF;
                             continue;
                         }
+                    }
+                    // Se informa una vez y se deja de insistir. El mensaje dice
+                    // que el equipo no puede, no que falte un driver: en una
+                    // GPU sin soporte de codificacion no hay nada que instalar,
+                    // y sugerirlo manda al operador a buscar algo inexistente.
+                    WatchdogDisposition::ReportUnsupported => {
+                        state.deactivate_display();
+                        state.invalidate_stream();
+                        let message = unsupported_hardware_message();
+                        if !reported_unsupported {
+                            reported_unsupported = true;
+                            log::error!("[screencam] {message}");
+                        }
+                        set_status("unsupported");
+                        set_last_error(&message);
+                        consecutive_rebuilds = 0;
+                        std::thread::sleep(UNSUPPORTED_RECHECK_INTERVAL);
+                        continue;
                     }
                     WatchdogDisposition::RestartImmediately => {
                         state.deactivate_display();
@@ -1442,6 +1476,13 @@ fn capture_loop(cfg: ScreenCamConfig, state: Arc<SharedState>) -> ResultType<Cap
         }
     };
 
+    // Antes de esperar por un encoder: si el sondeo ya termino y no hay nada,
+    // esperar 35 s no lo va a cambiar. Se corta aqui para no repetir esa espera
+    // en cada reintento del watchdog en un equipo que nunca va a poder.
+    if hardware_h264_support() == HardwareSupport::Unsupported {
+        return Ok(CaptureExit::Unsupported);
+    }
+
     let stream_epoch = state.stream_epoch();
     let (encoder_name, encoder_mc_name) =
         match wait_for_encoder_for_resolved_display(&plan.resolution, || {
@@ -1450,6 +1491,11 @@ fn capture_loop(cfg: ScreenCamConfig, state: Arc<SharedState>) -> ResultType<Cap
             Some(EncoderWait::Found(encoder)) => encoder,
             Some(EncoderWait::Disabled) => return Ok(CaptureExit::Disabled),
             Some(EncoderWait::TimedOut) | None => {
+                // La espera se agoto. Si mientras tanto el sondeo confirmo que
+                // no hay hardware capaz, se dice eso y no "falta un driver".
+                if hardware_h264_support() == HardwareSupport::Unsupported {
+                    return Ok(CaptureExit::Unsupported);
+                }
                 return Err(anyhow!(
                     "no_h264_encoder: no hardware H.264 encoder detected on this machine \
                  (needs a working NVENC/QuickSync/AMF/VAAPI driver — see \
@@ -1897,6 +1943,71 @@ fn handle_access_unit(
 /// and nothing else in this codebase names it either (see e.g. `codec.rs`'s
 /// `HwRamEncoder::try_get(...).map_or(None, |c| Some(c.name))`), so this
 /// follows the same pattern instead of reaching into scrap's internals.
+/// Lo que se sabe del hardware de este equipo respecto a H.264.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HardwareSupport {
+    /// El sondeo termino y no encontro codificacion H.264 por ninguna via.
+    /// No es cuestion de esperar: hace falta otro hardware u otro driver.
+    Unsupported,
+    /// El sondeo aun no ha dejado resultados. Puede que este en marcha.
+    Unknown,
+    /// Hay al menos un encoder utilizable.
+    Available,
+}
+
+/// Distingue "este equipo no puede" de "todavia no lo sabemos".
+///
+/// Importa porque el tratamiento es opuesto. Un sondeo a medias solo pide
+/// esperar; un equipo sin hardware capaz no mejora por reintentar, y hasta
+/// ahora ambos daban el mismo `no_h264_encoder`, un mensaje que invita a
+/// buscar un driver que en algunos equipos no existe. Un Intel HD 3000, por
+/// ejemplo: Intel nunca publico Media SDK para esa generacion, asi que no hay
+/// nada que instalar.
+///
+/// Se mira tambien la ruta VRAM aunque ScreenCam no la use: si ahi hay algo,
+/// el hardware si sabe codificar y el problema es de software, que es un
+/// diagnostico muy distinto del que se le quiere dar al operador.
+fn hardware_h264_support() -> HardwareSupport {
+    use scrap::hwcodec::HwCodecConfig;
+
+    // La misma consulta que hace el arranque, para que no puedan discrepar.
+    if HwRamEncoder::try_get(CodecFormat::H264).is_some() {
+        return HardwareSupport::Available;
+    }
+    let config = HwCodecConfig::get();
+
+    // Un sondeo que corrio deja siempre decodificadores, aunque no encuentre
+    // un solo encoder. Sin ninguna entrada, lo mas probable es que todavia no
+    // haya corrido, y afirmar que el equipo no sirve seria precipitado.
+    let probed = HwCodecConfig::already_set() || !config.ram_decode.is_empty();
+    if !probed {
+        return HardwareSupport::Unknown;
+    }
+
+    #[cfg(feature = "vram")]
+    if !config.vram_encode.is_empty() {
+        // El hardware codifica, pero por una via que ScreenCam no usa. Ese es
+        // el caso AMD que costo dos arreglos: llamar "incapaz" a un equipo que
+        // si sabe codificar mandaria a cambiar hardware que no hace falta.
+        return HardwareSupport::Unknown;
+    }
+
+    HardwareSupport::Unsupported
+}
+
+/// Mensaje para el operador, en el panel y en la tarjeta de ajustes. Nombra la
+/// GPU porque es lo primero que se pregunta quien lo lee, y dice explicitamente
+/// que el escritorio remoto no se ve afectado: sin eso, "no cumple los
+/// requisitos" se lee como que el equipo entero deja de servir.
+fn unsupported_hardware_message() -> String {
+    let gpu = display::primary_adapter_name().unwrap_or_else(|| "GPU no identificada".to_owned());
+    format!(
+        "unsupported_hardware: este equipo no tiene codificacion H.264 por hardware ({gpu}). \
+         ScreenCam necesita NVENC, QuickSync o AMF y no puede funcionar aqui. \
+         El escritorio remoto sigue funcionando con normalidad."
+    )
+}
+
 fn wait_for_h264_encoder(timeout: Duration) -> EncoderWait<(String, Option<String>)> {
     wait_for_encoder_with(
         timeout,
