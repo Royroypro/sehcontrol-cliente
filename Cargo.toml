@@ -1,6 +1,6 @@
 [package]
 name = "sehcontrol"
-version = "1.4.13"
+version = "1.4.14"
 authors = ["sehcontrol <info@sehcontrol.com>"]
 edition = "2021"
 build= "build.rs"
