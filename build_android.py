@@ -120,6 +120,40 @@ def build_native_android(project_dir: Path) -> int:
     if duplicate.exists():
         duplicate.unlink()
     print(f"Núcleo Android actualizado: {source}", flush=True)
+
+    # libsehcontrol.so enlaza contra la runtime de C++ del NDK, y Android NO la
+    # trae: de las seis dependencias que declara, cinco las aporta el sistema
+    # (liblog, libdl, libm, libc, libOpenSLES) y libc++_shared.so la tiene que
+    # empaquetar la propia app.
+    #
+    # Sin ella el APK instala sin quejarse y la app muere al abrirse, en
+    # MainApplication.onCreate, antes de pintar nada:
+    #
+    #   java.lang.UnsatisfiedLinkError: dlopen failed:
+    #   library "libc++_shared.so" not found: needed by .../libsehcontrol.so
+    #
+    # Se copia del mismo NDK con el que se acaba de compilar, no de una ruta
+    # fija: usar otra version que la del toolchain es justo como se llega a
+    # incompatibilidades de ABI dificiles de rastrear.
+    if sys.platform == "win32":
+        cxx_shared = (
+            toolchain
+            / "sysroot"
+            / "usr"
+            / "lib"
+            / "aarch64-linux-android"
+            / "libc++_shared.so"
+        )
+        if not cxx_shared.is_file():
+            print(
+                f"Error: no se encontró {cxx_shared}. El APK se instalaría pero "
+                "la app no abriría.",
+                file=sys.stderr,
+            )
+            return 1
+        shutil.copy2(cxx_shared, destination / "libc++_shared.so")
+        print(f"Runtime de C++ empaquetada: {cxx_shared}", flush=True)
+
     return 0
 
 

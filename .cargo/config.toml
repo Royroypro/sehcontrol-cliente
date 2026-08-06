@@ -58,4 +58,16 @@ BINDGEN_EXTRA_CLANG_ARGS = { value = "", force = true }
 CC_aarch64_linux_android = "C:/Users/rdrf-/AppData/Local/Android/Sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/windows-x86_64/bin/myclang-arm64.cmd"
 CXX_aarch64_linux_android = "C:/Users/rdrf-/AppData/Local/Android/Sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/windows-x86_64/bin/myclangxx-arm64.cmd"
 AR_aarch64_linux_android = "C:/Users/rdrf-/AppData/Local/Android/Sdk/ndk/25.2.9519653/toolchains/llvm/prebuilt/windows-x86_64/bin/llvm-ar.exe"
-SODIUM_LIB_DIR = "C:/Users/rdrf-/AppData/Local/Temp/libsodium-build/out-arm64"
+# libsodium para ARM64, que el build.rs parcheado de libsodium-sys busca aqui
+# para emitir `rustc-link-lib=static=sodium`.
+#
+# Apuntaba a %TEMP%\libsodium-build\out-arm64. Windows limpia %TEMP% por
+# diseno, asi que el .a acababa desapareciendo y el build de Android moria con
+# "could not find native static library `sodium`" -- despues de compilar unos
+# 500 crates, y sin que el mensaje mencione %TEMP% por ningun lado.
+#
+# Ahora vive en el vcpkg del proyecto, junto a los otros paquetes del mismo
+# triplete (aom, libvpx, opus, oboe...), que es donde se resuelve todo lo demas
+# de arm64-android y no lo borra nadie. Se instala con:
+#   vcpkg install libsodium:arm64-android
+SODIUM_LIB_DIR = "C:/vcpkg-sehcontrol/installed/arm64-android/lib"
