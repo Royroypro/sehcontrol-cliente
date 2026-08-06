@@ -11,6 +11,7 @@ if /I "%~1"=="__AYUDA__" goto AYUDA
 if /I "%~1"=="__MENU__" goto MENU
 if /I "%~1"=="__ESTADO__" goto ESTADO
 if /I "%~1"=="__VERSION__" goto VERSION
+if /I "%~1"=="__APK_INSTALL__" goto APK_INSTALL
 
 start "Sehcontrol Entrega 4 Dev CMD" cmd.exe /k ""%~f0" __CONFIGURAR__"
 exit /b
@@ -157,7 +158,10 @@ doskey buildandroid=python .\build_android.py
 doskey build-android-rust=cargo build --locked --lib --target aarch64-linux-android --release --features flutter
 doskey buildandroidrust=cargo build --locked --lib --target aarch64-linux-android --release --features flutter
 doskey android-devices=adb devices -l
-doskey android-install=adb install -r "%SEHCONTROL_ROOT%\flutter\build\app\outputs\flutter-apk\app-release.apk"
+rem  El APK ya no se llama app-release.apk: build_android.py lo renombra a
+rem  sehcontrol-<version>.apk. Se delega en un punto de entrada porque hay que
+rem  buscar el mas reciente, y un doskey no puede llevar logica.
+doskey android-install=call "%SEHCONTROL_LAUNCHER%" __APK_INSTALL__
 doskey android-log=adb logcat -v time ^| findstr /I /C:"sehcontrol" /C:"flutter"
 doskey android-log-limpiar=adb logcat -c
 doskey android-desinstalar=adb uninstall com.carriez.sehcontrol
@@ -221,6 +225,49 @@ goto :eof
 
 :VERSION
 powershell -NoProfile -ExecutionPolicy Bypass -File "%SEHCONTROL_ROOT%\scripts\cambiar-version.ps1"
+exit /b
+
+
+rem ---------------------------------------------------------------------
+rem  Instala el APK mas reciente. Se busca en vez de fijar el nombre porque
+rem  build_android.py lo renombra con la version (sehcontrol-1.4.14.apk), y
+rem  un nombre fijo obligaria a editar esto en cada release.
+rem
+rem  Se acepta tambien app-release.apk: es como se llamaba antes, y un APK
+rem  compilado con una version anterior del script sigue estando ahi.
+rem ---------------------------------------------------------------------
+:APK_INSTALL
+endlocal
+@echo off
+if not defined SEHCONTROL_ROOT call :DEFINIR_ENTORNO
+set "APK_DIR=%SEHCONTROL_ROOT%\flutter\build\app\outputs\flutter-apk"
+set "APK_FILE="
+for /f "delims=" %%A in ('dir /b /o-d "%APK_DIR%\sehcontrol-*.apk" 2^>nul') do if not defined APK_FILE set "APK_FILE=%%A"
+if not defined APK_FILE for /f "delims=" %%A in ('dir /b /o-d "%APK_DIR%\app-release.apk" 2^>nul') do if not defined APK_FILE set "APK_FILE=%%A"
+if not defined APK_FILE goto APK_NO_ENCONTRADO
+rem  En la consola preparada adb esta en el PATH. Ejecutado en frio no, asi
+rem  que se recurre a la ruta del SDK antes de rendirse.
+set "ADB=adb"
+where adb >nul 2>&1
+if errorlevel 1 set "ADB=%ANDROID_SDK_ROOT%\platform-tools\adb.exe"
+if not exist "%ADB%" if not "%ADB%"=="adb" goto APK_SIN_ADB
+echo Instalando %APK_FILE% ...
+"%ADB%" install -r "%APK_DIR%\%APK_FILE%"
+exit /b
+
+:APK_SIN_ADB
+echo.
+echo No se encontro adb. Instala Platform-Tools del SDK de Android o abre
+echo el entorno preparado, que lo agrega al PATH.
+echo.
+exit /b
+
+:APK_NO_ENCONTRADO
+echo.
+echo No se encontro ningun APK en:
+echo   %APK_DIR%
+echo Compilalo primero con: build-android
+echo.
 exit /b
 
 
@@ -617,7 +664,7 @@ cargo build --locked --lib --target aarch64-linux-android --release --features f
 goto MENU_PAUSA
 
 :MENU_ANDROID_INSTALL
-adb install -r "%SEHCONTROL_ROOT%\flutter\build\app\outputs\flutter-apk\app-release.apk"
+call "%SEHCONTROL_LAUNCHER%" __APK_INSTALL__
 goto MENU_PAUSA
 
 :MENU_ANDROID_LOG

@@ -10,6 +10,24 @@ import os
 from pathlib import Path
 
 
+def read_version(project_dir: Path) -> str:
+    """Version del paquete, de la misma fuente que usa build.py.
+
+    Se lee Cargo.toml y no pubspec.yaml porque es la que scripts/
+    cambiar-version.ps1 trata como canonica y desde la que sincroniza el
+    resto. Solo la primera coincidencia: las que vienen despues son de
+    dependencias.
+    """
+    try:
+        with open(project_dir / "Cargo.toml", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("version"):
+                    return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        pass
+    return ""
+
+
 def build_native_android(project_dir: Path) -> int:
     """Build and stage the ARM64 Rust library used by the Android APK."""
     target = "aarch64-linux-android"
@@ -225,7 +243,47 @@ def main() -> int:
         return result.returncode
 
     apk = flutter_dir / "build" / "app" / "outputs" / "flutter-apk" / "app-release.apk"
-    print(f"APK generado: {apk}", flush=True)
+    if not apk.is_file():
+        print(f"Error: no se generó {apk}", file=sys.stderr)
+        return 1
+
+    # Se renombra con la version, igual que build.py hace con el instalador de
+    # Windows (sehcontrol-<version>-install.exe). Sin esto todos los APK se
+    # llaman app-release.apk y, una vez fuera de la carpeta de build, no hay
+    # forma de saber cual es cual -- ni al subirlo al panel, ni al mandarselo a
+    # alguien, ni en la carpeta de descargas de un telefono.
+    #
+    # Se hace aqui y no en build.gradle a proposito: Gradle es el que Flutter
+    # espera que produzca app-release.apk, y cambiarlo ahi puede confundir a
+    # `flutter install` y a cualquier herramienta que asuma el nombre estandar.
+    # Renombrar despues deja el proceso de Flutter intacto.
+    version = read_version(project_dir)
+    if not version:
+        print(
+            "Aviso: no se pudo leer la version de Cargo.toml; el APK conserva "
+            "su nombre original.",
+            file=sys.stderr,
+        )
+        print(f"APK generado: {apk}", flush=True)
+        return 0
+
+    destino = apk.with_name(f"sehcontrol-{version}.apk")
+    # os.replace y no rename: en Windows rename falla si el destino existe, asi
+    # que recompilar la misma version rompia el build al final de todo.
+    os.replace(apk, destino)
+    print(f"APK generado: {destino}", flush=True)
+
+    # Copia en binarios/, misma convencion que build.py: la carpeta de build de
+    # Flutter se limpia sola y ahi el archivo sobrevive entre compilaciones.
+    try:
+        binarios = project_dir / "binarios"
+        binarios.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(destino, binarios / destino.name)
+        print(f"archivado en: {binarios / destino.name}", flush=True)
+    except OSError as error:
+        # Archivar es una comodidad; que falle no invalida el APK recien hecho.
+        print(f"Aviso: no se pudo archivar en binarios/: {error}", file=sys.stderr)
+
     return 0
 
 
