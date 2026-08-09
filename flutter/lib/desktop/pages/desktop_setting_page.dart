@@ -127,6 +127,7 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
   final RxBool _block = false.obs;
   final RxBool _canBeBlocked = false.obs;
   Timer? _videoConnTimer;
+  String _screenCamUiSignature = '';
 
   _DesktopSettingPageState(SettingsTabKey initialTabkey) {
     var initialIndex = DesktopSettingPage.tabKeys.indexOf(initialTabkey);
@@ -165,6 +166,17 @@ class _DesktopSettingPageState extends State<DesktopSettingPage>
         return;
       }
       _canBeBlocked.value = await canBeBlocked();
+
+      final screenCamUiSignature = [
+        bind.mainGetLocalOption(key: 'screencam-actual-state'),
+        bind.mainGetLocalOption(key: 'screencam-last-error'),
+        bind.mainGetLocalOption(key: 'screencam-local-ip'),
+        bind.mainGetLocalOption(key: 'screencam-rtsp-port'),
+      ].join('|');
+      if (_screenCamUiSignature != screenCamUiSignature) {
+        _screenCamUiSignature = screenCamUiSignature;
+        setState(() {});
+      }
     });
   }
 
@@ -947,6 +959,8 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
                 _Card(title: '2FA', children: [tfa()]),
                 if (!isChangeIdDisabled())
                   _Card(title: 'ID', children: [changeId()]),
+                if (isWindows)
+                  _Card(title: 'ScreenCam', children: [screenCamToggle()]),
                 more(context),
               ]),
             ),
@@ -1071,6 +1085,115 @@ class _SafetyState extends State<_Safety> with AutomaticKeepAliveClientMixin {
     }
 
     return tmpWrapper();
+  }
+
+  /// Read-only status for Sehcontrol ScreenCam (docs/SCREENCAM_PLAN.md,
+  /// "Fase 4b" section). There used to be a local on/off checkbox here, but
+  /// once licensing/activation moved to the quota system driven entirely by
+  /// the server (`licensed`/`desired_state` from `client-policy`, selected
+  /// per-device from the client's own web panel — see plan section 12), a
+  /// second control point inside this app would just let a user fight the
+  /// panel's decision and be confusing about who's actually in charge. The
+  /// panel is now the only place to turn it on/off; this card only shows
+  /// what Rust already reports (same `LocalConfig` keys the heartbeat reads
+  /// in `UserModel._readScreenCamStatus`), so someone with the PIN can still
+  /// see what's going on and grab the RTSP URL without opening the panel.
+  Widget screenCamToggle() {
+    final state = bind.mainGetLocalOption(key: 'screencam-actual-state');
+    final lastError = bind.mainGetLocalOption(key: 'screencam-last-error');
+    final localIp = bind.mainGetLocalOption(key: 'screencam-local-ip');
+    final rtspPort = bind.mainGetLocalOption(key: 'screencam-rtsp-port');
+    final rtspUser = bind.mainGetLocalOption(key: 'screencam-rtsp-user');
+
+    String statusText;
+    Color statusColor;
+    switch (state) {
+      case 'running':
+        statusText = translate('screencam_status_running');
+        statusColor = Colors.green;
+        break;
+      case 'starting':
+        statusText = translate('screencam_status_starting');
+        statusColor = Colors.orange;
+        break;
+      case 'error':
+        statusText = lastError.isNotEmpty
+            ? '${translate('screencam_status_error')}: $lastError'
+            : translate('screencam_status_error');
+        statusColor = Colors.red;
+        break;
+      // El equipo no tiene codificacion H.264 por hardware. Se separa de
+      // 'error' a proposito: un error invita a reintentar o a revisar la
+      // configuracion, y aqui no hay nada que hacer. Naranja y no rojo porque
+      // no es una averia, es una limitacion del equipo.
+      case 'unsupported':
+        statusText = lastError.isNotEmpty
+            ? lastError
+            : translate('screencam_status_unsupported');
+        statusColor = Colors.orange;
+        break;
+      case 'disabled':
+        statusText = translate('screencam_status_disabled');
+        statusColor = Colors.grey;
+        break;
+      default:
+        statusText = translate('screencam_status_not_configured');
+        statusColor = Colors.grey;
+    }
+
+    final rtspUrl =
+        (state == 'running' && localIp.isNotEmpty && rtspPort.isNotEmpty)
+            ? 'rtsp://$localIp:$rtspPort/live/main'
+            : null;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            Icon(Icons.circle, size: 10, color: statusColor)
+                .marginOnly(right: 8),
+            Expanded(
+                child: Text(
+              statusText,
+              style: TextStyle(color: disabledTextColor(context, true)),
+            ))
+          ],
+        ),
+        if (rtspUrl != null)
+          Row(
+            children: [
+              Expanded(
+                child: SelectableText(rtspUrl,
+                    style: const TextStyle(fontSize: 12)),
+              ),
+              IconButton(
+                icon: const Icon(Icons.copy, size: 16),
+                tooltip: translate('Copy'),
+                onPressed: () {
+                  Clipboard.setData(ClipboardData(text: rtspUrl));
+                  showToast(translate('Copied'));
+                },
+              ),
+            ],
+          ).marginOnly(top: 4),
+        // Tells the operator the stream will ask for credentials and which
+        // user to type, so they aren't left guessing why VLC/the NVR prompts.
+        // The password is deliberately never shown here: it comes from the
+        // panel and the panel is where it stays visible.
+        if (rtspUrl != null && rtspUser.isNotEmpty)
+          Text(
+            '${translate('screencam_auth_required_tip')} ($rtspUser)',
+            style: TextStyle(
+                color: disabledTextColor(context, false), fontSize: 12),
+          ).marginOnly(top: 4),
+        Text(
+          translate('screencam_managed_from_panel_tip'),
+          style:
+              TextStyle(color: disabledTextColor(context, false), fontSize: 12),
+        ).marginOnly(top: 4),
+      ],
+    ).marginOnly(left: _kCheckBoxLeftMargin);
   }
 
   Widget changeId() {
@@ -2217,7 +2340,7 @@ class _AccountState extends State<_Account> {
       final expiresAt = gFFI.userModel.membershipExpiresAt.value;
       final expiresText = expiresAt == null
           ? '-'
-          : '${expiresAt.year}-${expiresAt.month.toString().padLeft(2, '0')}-${expiresAt.day.toString().padLeft(2, '0')}';
+          : '${expiresAt.day.toString().padLeft(2, '0')}/${expiresAt.month.toString().padLeft(2, '0')}/${expiresAt.year}';
       final deviceCount = gFFI.userModel.membershipDeviceCount.value;
       final maxDevices = gFFI.userModel.membershipMaxDevices.value;
       return Container(

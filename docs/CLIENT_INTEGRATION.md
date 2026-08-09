@@ -683,3 +683,162 @@ en que el servidor decide si el equipo es "nuevo" o no.
 Implementación de referencia: `src/deviceClaim.js`
 (`findDeviceByMachineId`, `migrateDeviceId`) y `src/routes/hbbsHttp.js`
 (`normalizeMachineId`, handler de `/api/login`) del repo `rustdesk-admin-panel`.
+
+---
+
+## 11. Nuevo campo requerido: `whatsapp_number` en `/api/client-policy` (27/07)
+
+**El problema que resuelve:** el número de WhatsApp de soporte estaba **hardcodeado en el
+cliente** (`flutter/lib/desktop/pages/support_sidebar.dart`) — cambiar el número exigía una
+release nueva. Además, se agregó un aviso de vencimiento con botón de WhatsApp en el header
+de la app (`flutter/lib/common.dart::buildMembershipBanner`) que necesita el mismo número.
+
+**Lo que necesitamos que agreguen a `GET /api/client-policy`** (mismo endpoint que ya
+devuelve `force_login`/`server_key`/`screen_cam`, sin autenticación):
+
+```json
+{
+  "force_login": true,
+  "server_key": { "...": "..." },
+  "whatsapp_number": "51948793154",
+  "screen_cam": { "...": "..." }
+}
+```
+
+- `whatsapp_number`: string, **sin el `+`** (ej. `"51948793154"`, no `"+51948793154"`) — el
+  cliente arma el link `https://wa.me/{whatsapp_number}` directamente con ese valor.
+- Si no lo mandan o viene vacío/ausente, el cliente **oculta** el botón de WhatsApp en los
+  dos lugares donde se usa (no muestra un número viejo/incorrecto como respaldo) — así que
+  no rompe nada un deployment que todavía no lo haya configurado.
+- Es un valor único, global de la instalación del panel (no depende de la cuenta ni del
+  plan) — un solo número de soporte para todos los clientes de este servidor.
+- Se lee una sola vez por consulta a `client-policy` (arranque de la app, y cada vez que el
+  WebSocket reconecta — ya lo hacíamos para `screen_cam`), así que un cambio del número
+  tarda como máximo hasta la próxima reconexión en propagarse a un cliente ya abierto.
+
+**Dónde lo usa el cliente:**
+1. `Ajustes → Soporte → WhatsApp` (enlace directo a la conversación).
+2. Banner de aviso de vencimiento (header de la app), botón "Contactar por WhatsApp" —
+   solo visible cuando el plan está por vencer (`days_left <= 7`, mismo umbral que ya
+   usan para `expiry_warning`).
+
+Implementación de referencia esperada: agregar `whatsapp_number` a la config global del
+panel (tabla de settings/configuración de instancia) y devolverlo tal cual en el handler
+de `GET /api/client-policy`, junto al resto de los campos que ya arma ese endpoint.
+
+## 12. Nuevos campos requeridos: credenciales RTSP de ScreenCam (27/07)
+
+**El problema que resuelve:** hasta ahora el stream RTSP de ScreenCam
+(`rtsp://{local_ip}:{rtsp_port}/live/main`) estaba **abierto**: cualquiera en la misma
+red LAN que supiera la IP y el puerto podía ver la pantalla del equipo sin credenciales.
+Ya implementamos autenticación RTSP en el cliente (Basic + Digest MD5, RFC 2617), pero
+**las credenciales las tiene que generar y enviar el servidor** — el cliente no las
+inventa ni permite editarlas localmente, igual que el resto de la política de ScreenCam.
+
+**Lo que necesitamos que agreguen al bloque `screen_cam` de `GET /api/client-policy`**
+(y al mismo bloque del evento WebSocket `screen_cam.update`, que el cliente ya procesa
+con el mismo código):
+
+```json
+{
+  "screen_cam": {
+    "licensed": true,
+    "desired_state": "running",
+    "mode": "managed",
+    "max_streams": 1,
+    "rtsp_user": "seh_a1b2c3",
+    "rtsp_password": "K7pQ2mVx9nR4",
+    "rtsp_port_override": null,
+    "onvif_port_override": null
+  }
+}
+```
+
+### Reglas de los puertos (opcional, sólo si hace falta moverlos)
+
+El cliente ya escucha en 554 (RTSP) y 80 (ONVIF), que es lo que un Dahua o un
+Hikvision asumen cuando el operador da de alta el equipo por IP. Estos dos campos
+existen sólo para el caso en que esos puertos estén ocupados en la máquina.
+
+- `rtsp_port_override` / `onvif_port_override`: entero 1-65535, o `null`.
+- **`null` o ausente = sin override**, el equipo usa 554/80. No es lo mismo que 0:
+  un 0 se descarta como inválido, porque un puerto efímero no le sirve a un NVR.
+- **El nombre lleva `_override` a propósito.** El bloque `screen_cam` del
+  *heartbeat* ya usa `rtsp_port` con otro significado — ahí es el puerto que el
+  equipo **reporta** estar usando, y el panel lo guarda para construir la
+  `rtsp_url` que muestra en la ficha. Si la política reutilizara ese nombre,
+  ambos sentidos acabarían en la misma columna y el primer heartbeat del equipo
+  pisaría el valor que eligió el administrador.
+- **Cambiarlos requiere reiniciar el servicio del equipo**: el puerto se lee una
+  sola vez al arrancar, a diferencia de las credenciales, que se releen cada 2 s.
+
+### Reglas de los dos campos nuevos
+
+- `rtsp_user`: string. Es el usuario que el operador escribirá en el DVR/NVR o en VLC.
+- `rtsp_password`: string. Idem para la contraseña.
+- **Ambos por dispositivo, no por cuenta.** Lo ideal es una credencial distinta por
+  equipo: así revocar/rotar un equipo comprometido no obliga a reconfigurar los demás
+  NVR de ese cliente. Si por ahora les resulta más simple una por cuenta, funciona igual
+  — el cliente no asume nada sobre cómo las generan.
+- **Generación:** que las genere el panel, aleatorias. Sugerencia: usuario
+  `seh_` + 6-8 caracteres hex, contraseña de 12+ caracteres alfanuméricos.
+  **Eviten `:` en el usuario** (Basic auth separa usuario y contraseña con `:`, y el
+  cliente parte en el *primer* `:`, así que un `:` en el usuario rompería el login; en la
+  contraseña sí está soportado, pero mejor evitarlo también). Sin espacios ni comillas.
+- **Ausente/`null`/vacío = sin autenticación.** El cliente lo trata como "el panel todavía
+  no configuró credenciales" y deja el stream abierto, igual que hoy. Es deliberado para
+  no romper los equipos ya desplegados antes de que ustedes suban este cambio — **pero
+  significa que hasta que lo implementen, el stream sigue sin protección.**
+- **Borrarlas debe funcionar:** si mandan `null`/`""`, el cliente **apaga** la
+  autenticación (no se queda con el último par que recibió). Ya está implementado así,
+  aprendiendo del caso de `whatsapp_number`.
+- **Rotación en caliente:** el cliente re-lee las credenciales cada 2 segundos desde su
+  configuración local, así que un cambio en el panel se aplica sin reiniciar la app ni el
+  servicio. Las conexiones RTSP ya establecidas siguen vivas hasta que el NVR reconecte
+  (no cortamos sesiones activas al rotar).
+
+### Lo que el cliente les devuelve en el heartbeat
+
+Al bloque `screen_cam` de `POST /api/heartbeat` le agregamos dos campos, para que el panel
+pueda confirmar que las credenciales que emitió efectivamente llegaron al equipo:
+
+```json
+{
+  "screen_cam": {
+    "actual_state": "running",
+    "encoder": "h264_nvenc",
+    "last_error": null,
+    "rtsp_clients": 1,
+    "local_ip": "192.168.0.3",
+    "rtsp_port": 8554,
+    "auth_enabled": true,
+    "rtsp_user": "seh_a1b2c3"
+  }
+}
+```
+
+- `auth_enabled`: bool. `false` significa que ese equipo tiene el stream **abierto**.
+  Si el panel cree que le mandó credenciales y el equipo reporta `false`, es una
+  desconfiguración que conviene mostrarle al admin.
+- `rtsp_user`: string, solo el usuario. **La contraseña nunca vuelve al servidor.**
+
+### Qué implementa el cliente (ya hecho, para su referencia)
+
+- `src/server/screen_cam/auth.rs` — nuevo. Digest MD5 y Basic; ambos se ofrecen en cada
+  desafío `401` y se acepta cualquiera de los dos (Digest primero, porque es el que
+  eligen los NVR y no manda la contraseña en claro; Basic queda como respaldo para
+  equipos baratos que solo implementan eso). Nonce aleatorio por conexión, comparación
+  en tiempo constante.
+- Se exige autenticación en `DESCRIBE`, `SETUP` y `PLAY`. `OPTIONS` queda abierto a
+  propósito (los NVR lo usan para descubrir capacidades antes de tener credenciales y no
+  revela nada).
+- El operador puede seguir usando la forma habitual `rtsp://usuario:clave@ip:8554/live/main`.
+
+### Pendiente que conviene que sepan
+
+El **ONVIF sigue sin autenticación** (`src/server/screen_cam/onvif.rs`). Expone metadatos
+del dispositivo y la *URL* del stream, pero **no el video** — quien consulte ONVIF sin
+credenciales igual no puede ver nada sin el usuario/clave de arriba. Lo dejamos así a
+propósito en esta etapa para no arriesgar el auto-descubrimiento de NVR (que es todo el
+sentido de la Fase 6); agregar WS-Security UsernameToken ahí es el paso natural siguiente
+y no requiere ningún campo nuevo de su lado: reutilizaría estas mismas credenciales.

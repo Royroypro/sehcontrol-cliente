@@ -214,7 +214,7 @@ void runMobileApp() async {
 bool _enforcingRequiredLogin = false;
 
 Future<void> _enforceLoginIfRequired() async {
-  if (_enforcingRequiredLogin || gFFI.userModel.isLogin) return;
+  if (_enforcingRequiredLogin) return;
   _enforcingRequiredLogin = true;
   try {
     // Sehcontrol for Android is account-gated unconditionally. The remote
@@ -222,7 +222,7 @@ Future<void> _enforceLoginIfRequired() async {
     // expose the application while logged out or while the policy endpoint
     // is unavailable.
     final loginRequired = isAndroid || await UserModel.fetchForceLogin();
-    if (!loginRequired) return;
+    if (gFFI.userModel.isLogin || !loginRequired) return;
     while (!gFFI.userModel.isLogin) {
       final loggedIn = await loginDialog();
       if (loggedIn != true) {

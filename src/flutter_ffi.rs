@@ -21,6 +21,8 @@ use hbb_common::{
     rendezvous_proto::ConnType,
     ResultType,
 };
+#[cfg(all(windows, feature = "screencam"))]
+use std::sync::atomic::AtomicBool;
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -1200,6 +1202,39 @@ pub fn main_http_request(url: String, method: String, body: Option<String>, head
 }
 
 pub fn main_get_local_option(key: String) -> SyncReturn<String> {
+    // ScreenCam runs inside the --server process, which can use a different
+    // Windows profile (LocalService). Read its screencam-* values through
+    // the authenticated main IPC instead of this Flutter process's profile.
+    if key.starts_with("screencam-") {
+        // Nunca se cae al perfil de ESTE proceso para estas claves: seria
+        // contradecir el motivo mismo de preguntar por IPC. El daemon corre en
+        // otro perfil de Windows, asi que la copia local es de otra epoca y
+        // puede no tener nada que ver con la realidad.
+        //
+        // El caso que lo hacia visible: `set_option` con cadena vacia BORRA la
+        // clave (ver LocalConfig en hbb_common). Cuando ScreenCam se recupera
+        // llama a set_last_error("") y la clave desaparece, asi que el daemon
+        // responde Ok(None) -- que es la respuesta correcta, "ya no hay error".
+        // Tratarlo como fallo y caer al perfil local resucitaba el ultimo error
+        // que hubiera quedado ahi, y la tarjeta de ajustes seguia mostrando un
+        // fallo ya resuelto indefinidamente.
+        return SyncReturn(match crate::ipc::get_config(&key) {
+            Ok(Some(value)) => value,
+            // El daemon contesto y no tiene valor. Eso ES el valor.
+            Ok(None) => String::new(),
+            Err(err) => {
+                // Aqui no sabemos nada. Vacio hace que la UI muestre "sin
+                // configurar" en vez de inventarse un estado a partir de datos
+                // viejos, que es la unica salida honesta.
+                log::warn!(
+                    "[screencam] failed to read {} from daemon via IPC: {}",
+                    key,
+                    err
+                );
+                String::new()
+            }
+        });
+    }
     SyncReturn(get_local_option(key))
 }
 
@@ -1243,7 +1278,49 @@ pub fn main_set_env(key: String, value: Option<String>) -> SyncReturn<()> {
 pub fn main_set_local_option(key: String, value: String) {
     let is_texture_render_key = key.eq(config::keys::OPTION_TEXTURE_RENDER);
     let is_d3d_render_key = key.eq(config::keys::OPTION_ALLOW_D3D_RENDER);
-    set_local_option(key, value.clone());
+
+    // These policy values must be written by the --server process so that
+    // ScreenCam reads them from the same LocalConfig/profile it owns.
+    let is_screen_cam_policy = matches!(
+        key.as_str(),
+        "screencam-licensed"
+            | "screencam-desired-state"
+            | "screencam-mode"
+            | "screencam-rtsp-user"
+            | "screencam-rtsp-pass"
+    );
+
+    // The panel session token is mirrored to the --server process, which needs
+    // it to open its own channel to the panel (ScreenCam previews must work
+    // with this window closed). `access_token` itself cannot be read there:
+    // this process writes it into the interactive user's profile, while
+    // --server runs as SYSTEM and resolves LocalConfig to
+    // ServiceProfiles\LocalService — a different file, where it is absent.
+    //
+    // Mirrored here rather than at the call sites because there are several
+    // (two login paths and a logout), and one of them being forgotten is a
+    // channel that silently never opens. An empty value is the logout and must
+    // propagate, so this is not conditional on the token being present.
+    #[cfg(all(windows, feature = "screencam"))]
+    if key == "access_token" {
+        if let Err(err) = crate::ipc::set_config("screencam-panel-token", value.clone()) {
+            // Not fatal: the daemon may simply not be up yet. It re-reads the
+            // mirrored value on its own schedule once it is.
+            log::warn!("[screencam] could not mirror panel session to daemon: {err}");
+        }
+    }
+
+    if is_screen_cam_policy {
+        if let Err(err) = crate::ipc::set_config(&key, value.clone()) {
+            log::error!(
+                "[screencam] failed to write {} to daemon via IPC: {}",
+                key,
+                err
+            );
+        }
+    } else {
+        set_local_option(key, value.clone());
+    }
     let is_render_target =
         |session: &crate::flutter::FlutterSession| session.is_default() || session.is_view_camera();
     if is_texture_render_key {
@@ -1264,6 +1341,411 @@ pub fn main_set_local_option(key: String, value: String) {
             }
             session.update_supported_decodings();
         }
+    }
+}
+
+/// Applies the composite ScreenCam display policy through the Windows service
+/// and returns its bounded JSON ACK/NACK. This is deliberately separate from
+/// fire-and-forget local options so Flutter cannot report a send as an apply.
+///
+/// `unsupported` means *this binary* cannot apply the policy at all (a build
+/// without `windows + screencam`, or the web stub). A service that predates the
+/// `screencam-display-policy` request does **not** produce it: that branch
+/// simply never answers, so the client's `next_timeout` elapses and the result
+/// is `ipc_unavailable`, exactly like any other unreachable daemon.
+pub fn main_apply_screencam_display_policy(value: String) -> String {
+    #[cfg(all(windows, feature = "screencam"))]
+    {
+        static IPC_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
+        return match crate::ipc::set_screencam_display_policy_with_ack(value) {
+            Ok(response) => response,
+            Err(_) => {
+                if !IPC_WARNING_EMITTED.swap(true, Ordering::Relaxed) {
+                    log::warn!("[screencam] display policy IPC failed");
+                }
+                r#"{"applied":false,"changed":false,"error":"ipc_unavailable"}"#.to_owned()
+            }
+        };
+    }
+    #[cfg(not(all(windows, feature = "screencam")))]
+    {
+        let _ = value;
+        r#"{"applied":false,"changed":false,"error":"unsupported"}"#.to_owned()
+    }
+}
+
+fn screencam_preview_ffi_error_ack(session_id: &str, error: &str) -> String {
+    serde_json::json!({
+        "applied": false,
+        "changed": false,
+        "session_id": session_id.trim(),
+        "error": error,
+    })
+    .to_string()
+}
+
+/// Decides what the lifecycle poller should hand to Dart, and remembers only
+/// what actually got there.
+///
+/// Split out of the polling loop so the delivery bookkeeping can be tested
+/// without a Flutter event channel. The rule it enforces: a snapshot is
+/// consumed **only** when the push reports `Some(true)`. `None` means the
+/// `APP_TYPE_MAIN` channel does not exist yet (the UI is still starting), and
+/// `Some(false)` means the sink refused it — in both cases the state is still
+/// owed, and the next 400 ms cycle re-reads the same snapshot and tries again.
+#[cfg(all(windows, feature = "screencam"))]
+#[derive(Default)]
+struct PreviewLifecycleForwarder {
+    /// `session_id:generation:sequence:event`, not the sequence alone: the
+    /// daemon can restart and begin counting from zero again, and a bare
+    /// sequence would then make a brand new session look like one already
+    /// delivered.
+    last_delivered_identity: Option<String>,
+}
+
+#[cfg(all(windows, feature = "screencam"))]
+impl PreviewLifecycleForwarder {
+    /// Returns `(identity, payload)` for a snapshot worth forwarding, or `None`
+    /// for `{"state":"idle"}`, malformed JSON, or something already delivered.
+    fn prepare(&self, status: &str) -> Option<(String, String)> {
+        let mut event = serde_json::from_str::<serde_json::Value>(status).ok()?;
+        // Every field is required and typed: a partial snapshot has no identity
+        // that can be compared, so forwarding it could only cause duplicates.
+        let session_id = event["session_id"].as_str()?;
+        let generation = event["generation"].as_u64()?;
+        let sequence = event["sequence"].as_u64()?;
+        let event_name = event["event"].as_str()?;
+        if session_id.is_empty() || event_name.is_empty() {
+            return None;
+        }
+        let identity = format!("{session_id}:{generation}:{sequence}:{event_name}");
+        if self.last_delivered_identity.as_deref() == Some(identity.as_str()) {
+            return None;
+        }
+        event["name"] = serde_json::json!("screencam_preview_lifecycle");
+        Some((identity, event.to_string()))
+    }
+
+    /// One poll. `push` returns what `push_global_event` returns.
+    fn forward(&mut self, status: &str, push: impl FnOnce(String) -> Option<bool>) -> bool {
+        let Some((identity, payload)) = self.prepare(status) else {
+            return false;
+        };
+        if push(payload) != Some(true) {
+            // Still owed. Deliberately not logged: this runs every 400 ms and
+            // the UI simply not being up yet is the ordinary case.
+            return false;
+        }
+        self.last_delivered_identity = Some(identity);
+        true
+    }
+}
+
+/// Forwards the publisher's lifecycle from the daemon to Dart.
+///
+/// The worker lives in the daemon and the authenticated WebSocket lives here, so
+/// something has to cross that gap. This polls the existing IPC rather than
+/// holding a pushed stream because the snapshot is a *state*, not a queue:
+/// missing a poll costs nothing, the daemon restarting costs nothing, and the
+/// same read is what lets the state be re-sent after a WebSocket reconnect.
+///
+/// Started once, on the first START, and left running — a second poller would
+/// double every event.
+#[cfg(all(windows, feature = "screencam"))]
+fn ensure_preview_lifecycle_poller() {
+    use std::sync::Once;
+
+    static POLLER: Once = Once::new();
+    POLLER.call_once(|| {
+        let spawned = std::thread::Builder::new()
+            .name("screencam-preview-lifecycle".to_owned())
+            .spawn(|| {
+                // Fast enough that the panel's state feels immediate, slow
+                // enough to be invisible: the daemon answers from a mutex read.
+                const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
+                let mut forwarder = PreviewLifecycleForwarder::default();
+                loop {
+                    std::thread::sleep(POLL_INTERVAL);
+                    // A failure here is normally just the daemon not being up.
+                    // Deliberately not logged: this loop runs forever.
+                    let Ok(status) = crate::ipc::get_screencam_preview_status() else {
+                        continue;
+                    };
+                    forwarder.forward(&status, |payload| {
+                        crate::flutter::push_global_event(
+                            crate::flutter::APP_TYPE_MAIN,
+                            payload,
+                        )
+                    });
+                }
+            })
+            .is_ok();
+        if !spawned {
+            log::warn!("[screencam] could not start the preview lifecycle poller");
+        }
+    });
+}
+
+#[cfg(all(test, windows, feature = "screencam"))]
+mod preview_lifecycle_forwarder_tests {
+    use super::PreviewLifecycleForwarder;
+
+    fn snapshot(session: &str, generation: u64, sequence: u64, event: &str) -> String {
+        serde_json::json!({
+            "sequence": sequence,
+            "generation": generation,
+            "session_id": session,
+            "rustdesk_id": "485236790",
+            "event": event,
+        })
+        .to_string()
+    }
+
+    fn started() -> String {
+        snapshot("pv_8f12ab34c5", 3, 7, "screen_cam.preview.started")
+    }
+
+    #[test]
+    fn a_missing_channel_does_not_consume_the_snapshot() {
+        let mut forwarder = PreviewLifecycleForwarder::default();
+
+        // `None` is what push_global_event returns when APP_TYPE_MAIN has no
+        // sink yet, which is exactly the window right after START.
+        assert!(!forwarder.forward(&started(), |_| None));
+        assert!(forwarder.last_delivered_identity.is_none());
+
+        // The very next cycle reads the same snapshot and must retry it.
+        let mut delivered = Vec::new();
+        assert!(forwarder.forward(&started(), |payload| {
+            delivered.push(payload);
+            Some(true)
+        }));
+        assert_eq!(delivered.len(), 1);
+    }
+
+    #[test]
+    fn a_refused_push_does_not_consume_the_snapshot() {
+        let mut forwarder = PreviewLifecycleForwarder::default();
+
+        assert!(!forwarder.forward(&started(), |_| Some(false)));
+        assert!(forwarder.last_delivered_identity.is_none());
+
+        let mut attempts = 0;
+        assert!(forwarder.forward(&started(), |_| {
+            attempts += 1;
+            Some(true)
+        }));
+        assert_eq!(attempts, 1, "the same snapshot had to be retried");
+    }
+
+    #[test]
+    fn a_delivered_snapshot_is_not_sent_again() {
+        let mut forwarder = PreviewLifecycleForwarder::default();
+        let mut sends = 0;
+        let mut push = |_: String| {
+            sends += 1;
+            Some(true)
+        };
+
+        assert!(forwarder.forward(&started(), &mut push));
+        assert!(!forwarder.forward(&started(), &mut push));
+        assert!(!forwarder.forward(&started(), &mut push));
+
+        assert_eq!(sends, 1);
+    }
+
+    #[test]
+    fn two_sessions_sharing_a_counter_are_told_apart() {
+        // The daemon restarting resets `sequence` and `generation`, so the two
+        // snapshots below differ only by session. Keying on the counter alone
+        // would silently drop the second one.
+        let mut forwarder = PreviewLifecycleForwarder::default();
+        let first = snapshot("pv_first", 1, 1, "screen_cam.preview.started");
+        let second = snapshot("pv_second", 1, 1, "screen_cam.preview.started");
+
+        let mut delivered = Vec::new();
+        let mut push = |payload: String| {
+            delivered.push(payload);
+            Some(true)
+        };
+        assert!(forwarder.forward(&first, &mut push));
+        assert!(forwarder.forward(&second, &mut push));
+
+        assert_eq!(delivered.len(), 2);
+        assert!(delivered[0].contains("pv_first"));
+        assert!(delivered[1].contains("pv_second"));
+    }
+
+    #[test]
+    fn a_restarted_daemon_does_not_silence_the_new_session() {
+        let mut forwarder = PreviewLifecycleForwarder::default();
+        let mut delivered = Vec::new();
+        let mut push = |payload: String| {
+            delivered.push(payload);
+            Some(true)
+        };
+
+        // A long-lived session gets well past sequence 1...
+        assert!(forwarder.forward(
+            &snapshot("pv_old", 4, 9, "screen_cam.preview.started"),
+            &mut push
+        ));
+        // ...the daemon restarts, counters start over, and a new session
+        // reports its first transition.
+        assert!(forwarder.forward(
+            &snapshot("pv_new", 1, 1, "screen_cam.preview.connecting"),
+            &mut push
+        ));
+        assert!(forwarder.forward(
+            &snapshot("pv_new", 1, 2, "screen_cam.preview.started"),
+            &mut push
+        ));
+
+        assert_eq!(delivered.len(), 3);
+    }
+
+    #[test]
+    fn the_same_session_advancing_state_is_forwarded_each_time() {
+        let mut forwarder = PreviewLifecycleForwarder::default();
+        let mut events = Vec::new();
+        let mut push = |payload: String| {
+            let value: serde_json::Value = serde_json::from_str(&payload).unwrap();
+            events.push(value["event"].as_str().unwrap().to_owned());
+            Some(true)
+        };
+
+        for (sequence, event) in [
+            (1, "screen_cam.preview.connecting"),
+            (2, "screen_cam.preview.failed"),
+            (3, "screen_cam.preview.connecting"),
+            (4, "screen_cam.preview.started"),
+        ] {
+            assert!(forwarder.forward(&snapshot("pv_1", 2, sequence, event), &mut push));
+        }
+
+        assert_eq!(
+            events,
+            vec![
+                "screen_cam.preview.connecting",
+                "screen_cam.preview.failed",
+                "screen_cam.preview.connecting",
+                "screen_cam.preview.started",
+            ]
+        );
+    }
+
+    #[test]
+    fn idle_and_malformed_snapshots_are_ignored() {
+        let mut forwarder = PreviewLifecycleForwarder::default();
+        let mut pushes = 0;
+        let mut push = |_: String| {
+            pushes += 1;
+            Some(true)
+        };
+
+        for status in [
+            r#"{"state":"idle"}"#,
+            r#"{"state":"unsupported"}"#,
+            "not json",
+            // Each of these is missing exactly one required field.
+            r#"{"generation":1,"sequence":1,"event":"screen_cam.preview.started"}"#,
+            r#"{"session_id":"pv","sequence":1,"event":"screen_cam.preview.started"}"#,
+            r#"{"session_id":"pv","generation":1,"event":"screen_cam.preview.started"}"#,
+            r#"{"session_id":"pv","generation":1,"sequence":1}"#,
+            // Present but the wrong type or empty.
+            r#"{"session_id":"","generation":1,"sequence":1,"event":"screen_cam.preview.started"}"#,
+            r#"{"session_id":"pv","generation":"1","sequence":1,"event":"screen_cam.preview.started"}"#,
+        ] {
+            assert!(!forwarder.forward(status, &mut push), "{status}");
+        }
+
+        assert_eq!(pushes, 0);
+        assert!(forwarder.last_delivered_identity.is_none());
+    }
+
+    #[test]
+    fn the_payload_carries_the_dart_event_name_and_no_secret() {
+        let mut forwarder = PreviewLifecycleForwarder::default();
+        let mut payload = String::new();
+        forwarder.forward(&started(), |value| {
+            payload = value;
+            Some(true)
+        });
+
+        assert!(payload.contains(r#""name":"screencam_preview_lifecycle""#));
+        assert!(payload.contains(r#""event":"screen_cam.preview.started""#));
+        assert!(!payload.contains("token"));
+        assert!(!payload.contains("srt://"));
+        assert!(!payload.contains("publish:"));
+    }
+}
+
+pub fn main_start_screencam_preview(
+    session_id: String,
+    rustdesk_id: String,
+    publish_url: String,
+    publish_token: String,
+    stream_name: String,
+    expires_in: u32,
+) -> String {
+    #[cfg(all(windows, feature = "screencam"))]
+    {
+        static IPC_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
+        ensure_preview_lifecycle_poller();
+        return match crate::ipc::set_screencam_preview_start_with_ack(
+            session_id.clone(),
+            rustdesk_id,
+            publish_url,
+            publish_token,
+            stream_name,
+            expires_in,
+        ) {
+            Ok(response) => {
+                log::info!("[screencam] preview START ACK {}", response);
+                response
+            },
+            Err(_) => {
+                if !IPC_WARNING_EMITTED.swap(true, Ordering::Relaxed) {
+                    log::warn!("[screencam] preview START IPC failed");
+                }
+                screencam_preview_ffi_error_ack(&session_id, "ipc unavailable")
+            }
+        };
+    }
+    #[cfg(not(all(windows, feature = "screencam")))]
+    {
+        let _ = (
+            rustdesk_id,
+            publish_url,
+            publish_token,
+            stream_name,
+            expires_in,
+        );
+        screencam_preview_ffi_error_ack(&session_id, "unsupported")
+    }
+}
+
+pub fn main_stop_screencam_preview(session_id: String, rustdesk_id: String) -> String {
+    #[cfg(all(windows, feature = "screencam"))]
+    {
+        static IPC_WARNING_EMITTED: AtomicBool = AtomicBool::new(false);
+        return match crate::ipc::set_screencam_preview_stop_with_ack(
+            session_id.clone(),
+            rustdesk_id,
+        ) {
+            Ok(response) => response,
+            Err(_) => {
+                if !IPC_WARNING_EMITTED.swap(true, Ordering::Relaxed) {
+                    log::warn!("[screencam] preview STOP IPC failed");
+                }
+                screencam_preview_ffi_error_ack(&session_id, "ipc unavailable")
+            }
+        };
+    }
+    #[cfg(not(all(windows, feature = "screencam")))]
+    {
+        let _ = rustdesk_id;
+        screencam_preview_ffi_error_ack(&session_id, "unsupported")
     }
 }
 
@@ -2374,6 +2856,11 @@ pub fn main_get_new_version() -> SyncReturn<String> {
     SyncReturn(get_new_version())
 }
 
+// The panel's release notes and download URL are reached through
+// `main_get_common_sync` instead of getting their own bridge functions: those
+// would need flutter_rust_bridge codegen re-run, and the generated bridge is
+// checked in. See the "update-notes"/"update-download-url" keys below.
+
 pub fn main_update_me() -> SyncReturn<bool> {
     update_me("".to_owned());
     SyncReturn(true)
@@ -2860,6 +3347,15 @@ pub fn main_get_common(key: String) -> String {
         return crate::platform::linux::has_gnome_shortcuts_inhibitor_permission().to_string();
         #[cfg(not(target_os = "linux"))]
         return false.to_string();
+    } else if key == "update-notes" {
+        // What the operator wrote about the published version. Empty when the
+        // update did not come from a panel, which is how the UI decides
+        // whether it has anything to explain.
+        return ui_interface::get_new_version_notes();
+    } else if key == "update-download-url" {
+        // The exact URL the panel published. Empty means "there is none", and
+        // the caller composes a GitHub release URL the old way instead.
+        return ui_interface::get_new_version_download_url();
     } else if key == "permanent-password-set" {
         return ui_interface::is_permanent_password_set().to_string();
     } else if key == "local-permanent-password-set" {
@@ -3050,8 +3546,7 @@ pub fn main_set_common(_key: String, _value: String) {
 
 pub fn session_set_common(session_id: SessionID, key: String, value: String) {
     if let Some(s) = sessions::get_session_by_session_id(&session_id) {
-        if key == "continue-insecure-connection"
-        {
+        if key == "continue-insecure-connection" {
             s.continue_insecure_connection(value == "Y");
             return;
         }

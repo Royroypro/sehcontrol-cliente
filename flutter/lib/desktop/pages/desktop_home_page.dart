@@ -256,7 +256,6 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     final isOutgoingOnly = bind.isOutgoingOnly();
     final children = <Widget>[
       if (!isOutgoingOnly) buildPresetPasswordWarning(),
-      buildMembershipBanner(),
       if (bind.isCustomClient())
         Align(
           alignment: Alignment.center,
@@ -480,7 +479,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
       final expiresAt = gFFI.userModel.membershipExpiresAt.value;
       final expiresText = expiresAt == null
           ? '-'
-          : '${expiresAt.year}-${expiresAt.month.toString().padLeft(2, '0')}-${expiresAt.day.toString().padLeft(2, '0')}';
+          : '${expiresAt.day.toString().padLeft(2, '0')}/${expiresAt.month.toString().padLeft(2, '0')}/${expiresAt.year}';
       final deviceCount = gFFI.userModel.membershipDeviceCount.value;
       final maxDevices = gFFI.userModel.membershipMaxDevices.value;
       Widget row(String label, String value) => Padding(

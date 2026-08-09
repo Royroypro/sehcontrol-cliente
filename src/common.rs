@@ -965,10 +965,137 @@ pub fn check_software_update() {
     }
 }
 
+/// What the operator's own panel answered, when there is one. Kept apart from
+/// `SOFTWARE_UPDATE_URL` because that one is a *release page* whose last path
+/// segment happens to be the version (see `get_new_version`), a shape only
+/// GitHub has. The panel serves a fixed filename instead, so the version, the
+/// download URL and the notes have to be carried explicitly.
+#[derive(Clone, Debug, Default)]
+pub struct PanelUpdate {
+    pub version: String,
+    pub download_url: String,
+    pub notes: String,
+    /// SHA-256 en hexadecimal del binario publicado, tal y como lo declara el
+    /// panel. Vacio cuando el panel es anterior a publicarlo, en cuyo caso la
+    /// descarga se comprueba solo por tamano, que es lo que se hacia antes.
+    pub sha256: String,
+    /// Tamano declarado. Redundante con el Content-Length de la descarga a
+    /// proposito: si no coinciden, algo esta reescribiendo la respuesta.
+    pub size_bytes: u64,
+}
+
+lazy_static::lazy_static! {
+    pub static ref PANEL_UPDATE: Arc<Mutex<Option<PanelUpdate>>> = Default::default();
+}
+
+/// Asks the configured panel what it publishes for this platform.
+///
+/// Returns `Ok(true)` when the panel answered — whether or not it offered an
+/// update — so the caller knows not to fall back. That fallback matters: this
+/// is a rebranded client, and asking api.rustdesk.com would offer upstream
+/// RustDesk builds to a fleet that must only ever run what its own operator
+/// published.
+async fn check_panel_software_update(api: &str) -> hbb_common::ResultType<bool> {
+    let platform = if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "android") {
+        "android"
+    } else {
+        // The panel only publishes these two; nothing to ask about.
+        return Ok(false);
+    };
+    let url = format!("{api}/api/public/client-version/{platform}");
+    let client = create_http_client_async(TlsType::Rustls, false);
+    let response = client.get(&url).send().await?;
+    if !response.status().is_success() {
+        // A panel that predates this endpoint answers 404. That is "no update
+        // information", not an error worth retrying differently, and still not
+        // a reason to go ask upstream.
+        *PANEL_UPDATE.lock().unwrap() = None;
+        *SOFTWARE_UPDATE_URL.lock().unwrap() = "".to_owned();
+        return Ok(true);
+    }
+    let body = response.bytes().await?;
+    let parsed = serde_json::from_slice::<serde_json::Value>(&body)?;
+    let version = parsed["version"].as_str().unwrap_or_default().to_owned();
+    let download_url = parsed["url"].as_str().unwrap_or_default().to_owned();
+    let notes = parsed["notes"].as_str().unwrap_or_default().to_owned();
+    // Aditivos: un panel anterior a estos campos los omite y se leen vacios,
+    // que significa "no hay con que verificar" y no rompe la actualizacion.
+    let sha256 = parsed["sha256"]
+        .as_str()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    let size_bytes = parsed["size_bytes"].as_u64().unwrap_or_default();
+
+    // Strictly greater: an equal or older published version must not offer
+    // anything, so re-publishing the running version cannot loop a client
+    // through a pointless reinstall.
+    let offer = !version.is_empty()
+        && !download_url.is_empty()
+        && get_version_number(&version) > get_version_number(crate::VERSION);
+    if offer {
+        log::info!("[update] panel publishes {version}");
+        if sha256.is_empty() {
+            log::warn!(
+                "[update] panel published {version} without a checksum; \
+                 the download can only be checked by size"
+            );
+        }
+        *PANEL_UPDATE.lock().unwrap() = Some(PanelUpdate {
+            version: version.clone(),
+            download_url: download_url.clone(),
+            notes: notes.clone(),
+            sha256,
+            size_bytes,
+        });
+        // Kept in sync so everything that already asks "is there an update?"
+        // through the old path keeps working.
+        *SOFTWARE_UPDATE_URL.lock().unwrap() = download_url.clone();
+        #[cfg(feature = "flutter")]
+        {
+            // The map holds &str, so every value has to outlive it: taking the
+            // URL from the mutex here instead would drop the guard's temporary
+            // before the map is serialized.
+            let mut m = HashMap::new();
+            m.insert("name", "check_software_update_finish");
+            m.insert("url", download_url.as_str());
+            m.insert("version", version.as_str());
+            m.insert("notes", notes.as_str());
+            if let Ok(data) = serde_json::to_string(&m) {
+                let _ = crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, data);
+            }
+        }
+    } else {
+        *PANEL_UPDATE.lock().unwrap() = None;
+        *SOFTWARE_UPDATE_URL.lock().unwrap() = "".to_owned();
+    }
+    Ok(true)
+}
+
 // No need to check `danger_accept_invalid_cert` for now.
 // Because the url is always `https://api.rustdesk.com/version/latest`.
 #[tokio::main(flavor = "current_thread")]
 pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
+    // The operator's panel wins when there is one: these clients are deployed
+    // by an operator who decides what they run.
+    let api = get_api_server(
+        Config::get_option("api-server"),
+        Config::get_option("custom-rendezvous-server"),
+    );
+    if !api.is_empty() && !is_public(&api) {
+        match check_panel_software_update(&api).await {
+            Ok(true) => return Ok(()),
+            // Unreachable panel: leave whatever was known alone rather than
+            // clearing it, and do NOT ask upstream instead.
+            Err(err) => {
+                log::debug!("[update] panel check failed: {err}");
+                return Ok(());
+            }
+            Ok(false) => {}
+        }
+    }
     let (request, url) =
         hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_CLIENT.to_string());
     let proxy_conf = Config::get_socks();
@@ -1121,6 +1248,20 @@ pub fn get_ipv6_punch_enabled() -> bool {
 }
 
 pub fn get_local_option(key: &str) -> String {
+    // ScreenCam's screencam-* keys are the one case in this app where a
+    // LocalConfig value is written by a *different* OS process than the one
+    // reading it: the --server process (src/server/screen_cam/mod.rs) writes
+    // status, the UI process (this function, via the Flutter bridge) reads
+    // it for the heartbeat. LocalConfig::get_option() only reflects whatever
+    // this process's own in-memory copy looked like at its own startup —
+    // cross-process writes never show up through it. get_option_from_file()
+    // re-parses the TOML from disk on every call instead, which is what
+    // actually keeps the two processes in sync. Scoped to this one prefix so
+    // every other (single-process) LocalConfig read in the app keeps using
+    // the cheap cached path — this key space is the only one that needs it.
+    if key.starts_with("screencam-") {
+        return LocalConfig::get_option_from_file(key);
+    }
     let v = LocalConfig::get_option(key);
     if key == keys::OPTION_ENABLE_UDP_PUNCH || key == keys::OPTION_ENABLE_IPV6_PUNCH {
         if v.is_empty() {

@@ -74,6 +74,11 @@ pub mod portable_service;
 mod service;
 mod video_qos;
 pub mod video_service;
+// Windows-only for now — Fase 1 was only audited/built against the DXGI
+// capture path (docs/SCREENCAM_PLAN.md). Extending to Linux/macOS capture
+// is future work, not a deliberate exclusion.
+#[cfg(all(windows, feature = "screencam"))]
+pub mod screen_cam;
 
 #[cfg(all(target_os = "windows", feature = "flutter"))]
 pub mod printer_service;
@@ -609,6 +614,13 @@ pub async fn start_server(is_server: bool, no_server: bool) {
         crate::platform::try_kill_broker();
         #[cfg(feature = "hwcodec")]
         scrap::hwcodec::start_check_process();
+        // Fase 1 MVP (docs/SCREENCAM_PLAN.md): no license/policy gating yet,
+        // starts unconditionally on any build compiled with this feature so
+        // it can be pointed at VLC/an NVR for validation. Runs here (the
+        // `--server` process) rather than the main window process so it
+        // doesn't depend on the UI being open, matching plan section 2.2.
+        #[cfg(all(windows, feature = "screencam"))]
+        screen_cam::start(screen_cam::ScreenCamConfig::load());
         crate::RendezvousMediator::start_all().await;
     } else {
         match crate::ipc::connect(1000, "").await {

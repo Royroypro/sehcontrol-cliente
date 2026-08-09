@@ -1,0 +1,184 @@
+# Cambia la version de Sehcontrol en los dos archivos que hay que tocar a mano.
+#
+# Por que dos y no uno: src/version.rs -de donde sale crate::VERSION, que es lo
+# que el cliente compara contra el panel- lo genera hbb_common::gen_version()
+# leyendo Cargo.toml en cada build, asi que no se edita. flutter/pubspec.yaml
+# en cambio es independiente y define la version del recurso de Windows (el
+# "1.4.9+67" que muestra Propiedades del .exe).
+#
+# Mantenerlos sincronizados a mano es justo lo que se desincroniza. Si la
+# version publicada en el panel no coincide con la que el binario reporta, los
+# equipos entran en un bucle: ofrecen la actualizacion, la instalan, siguen
+# viendo la misma version y la vuelven a ofrecer.
+#
+# El numero despues del "+" en pubspec es el build number: se incrementa solo.
+
+[CmdletBinding()]
+param(
+    # Sin valor, la pide de forma interactiva.
+    [string]$Version,
+    # Solo informa la version actual y sale.
+    [switch]$Mostrar
+)
+
+$ErrorActionPreference = 'Stop'
+
+# Leer y escribir UTF-8 sin BOM de forma explicita, en vez de confiar en
+# Get-Content/Set-Content.
+#
+# El .bat invoca "powershell", que es Windows PowerShell 5.1, no pwsh 7. Ahi
+# Get-Content lee como ANSI -y por lo tanto rompe cualquier acento o guion
+# largo de un archivo UTF-8- y Set-Content -Encoding UTF8 escribe CON BOM.
+# El resultado fue Cargo.toml con BOM y comentarios corrompidos ("—" quedo
+# como "â€""), que cargo tolera pero nadie quiere en el repo. Estas dos
+# funciones se comportan igual en 5.1 y en 7.
+$script:Utf8SinBom = New-Object System.Text.UTF8Encoding($false)
+
+function Read-TextLines([string]$Path) {
+    return [System.IO.File]::ReadAllLines($Path, [System.Text.Encoding]::UTF8)
+}
+
+function Write-TextLines([string]$Path, [string[]]$Lines) {
+    # ReadAllLines descarta el fin de linea final; se conserva el salto para
+    # no dejar el archivo sin nueva linea al final.
+    $texto = ($Lines -join "`r`n") + "`r`n"
+    [System.IO.File]::WriteAllText($Path, $texto, $script:Utf8SinBom)
+}
+
+$root = Split-Path -Parent $PSScriptRoot
+$cargoPath = Join-Path $root 'Cargo.toml'
+$pubspecPath = Join-Path $root 'flutter\pubspec.yaml'
+# El empaquetador portable declara su propia version y build.py la imprime al
+# compilarlo ("Compiling sehcontrol-portable-packer v..."). No viaja dentro del
+# instalador, pero al no actualizarse se quedaba anclada en una version vieja y
+# esa linea contradecia a la que se estaba compilando, justo cuando uno mira la
+# salida para confirmar que version salio.
+$packerPath = Join-Path $root 'libs\portable\Cargo.toml'
+
+foreach ($p in @($cargoPath, $pubspecPath, $packerPath)) {
+    if (-not (Test-Path -LiteralPath $p)) { throw "No se encontro $p" }
+}
+
+# Primera coincidencia: es la de [package]. Las de las dependencias vienen
+# despues y no deben tocarse.
+$cargo = Read-TextLines $cargoPath
+$cargoIdx = ($cargo | Select-String -Pattern '^version\s*=' | Select-Object -First 1).LineNumber - 1
+if ($cargoIdx -lt 0) { throw 'No se encontro la version en Cargo.toml' }
+$actual = [regex]::Match($cargo[$cargoIdx], '"([^"]+)"').Groups[1].Value
+
+$pubspec = Read-TextLines $pubspecPath
+$pubIdx = ($pubspec | Select-String -Pattern '^version:' | Select-Object -First 1).LineNumber - 1
+if ($pubIdx -lt 0) { throw 'No se encontro la version en pubspec.yaml' }
+$pubMatch = [regex]::Match($pubspec[$pubIdx], '^version:\s*([0-9.]+)(?:\+(\d+))?')
+$pubVersion = $pubMatch.Groups[1].Value
+$build = if ($pubMatch.Groups[2].Success) { [int]$pubMatch.Groups[2].Value } else { 0 }
+
+Write-Output "Version actual : $actual   (pubspec: $pubVersion+$build)"
+if ($actual -ne $pubVersion) {
+    Write-Warning "Cargo.toml y pubspec.yaml NO coinciden. Al cambiar la version quedan sincronizados."
+}
+if ($Mostrar) { return }
+
+if (-not $Version) {
+    # Sugerencia: sube el ultimo componente, que es el caso habitual.
+    $partes = $actual.Split('.')
+    $partes[-1] = [string]([int]$partes[-1] + 1)
+    $sugerida = $partes -join '.'
+    $Version = Read-Host "Nueva version (Enter para $sugerida)"
+    if ([string]::IsNullOrWhiteSpace($Version)) { $Version = $sugerida }
+}
+$Version = $Version.Trim()
+
+# Mismo formato que acepta el panel al declararla: numerica pura. Un valor con
+# sufijos no se puede ordenar de forma confiable contra la version instalada.
+if ($Version -notmatch '^\d+(\.\d+){1,3}$') {
+    throw "La version debe ser numerica, por ejemplo 1.5.0. Recibido: '$Version'"
+}
+if ($Version -eq $actual) {
+    Write-Output 'La version no cambio. No se toco ningun archivo.'
+    return
+}
+
+# Rechaza retroceder: una version menor no la ofreceria ningun cliente, y
+# descubrirlo despues de compilar y publicar cuesta una vuelta entera.
+$comparar = {
+    param($a, $b)
+    $pa = $a.Split('.'); $pb = $b.Split('.')
+    for ($i = 0; $i -lt [Math]::Max($pa.Length, $pb.Length); $i++) {
+        $va = if ($i -lt $pa.Length) { [int]$pa[$i] } else { 0 }
+        $vb = if ($i -lt $pb.Length) { [int]$pb[$i] } else { 0 }
+        if ($va -ne $vb) { return $va - $vb }
+    }
+    return 0
+}
+if ((& $comparar $Version $actual) -lt 0) {
+    throw "La version $Version es menor que la actual $actual. Ningun equipo instalado la ofreceria."
+}
+
+$cargo[$cargoIdx] = $cargo[$cargoIdx] -replace '"[^"]+"', "`"$Version`""
+$pubspec[$pubIdx] = "version: $Version+$($build + 1)"
+
+# Misma regla que arriba: la primera coincidencia es la de [package], las que
+# vienen despues son de dependencias y no se tocan.
+$packer = Read-TextLines $packerPath
+$packerIdx = ($packer | Select-String -Pattern '^version\s*=' | Select-Object -First 1).LineNumber - 1
+if ($packerIdx -lt 0) { throw 'No se encontro la version en libs\portable\Cargo.toml' }
+$packer[$packerIdx] = $packer[$packerIdx] -replace '"[^"]+"', "`"$Version`""
+
+Write-TextLines $cargoPath $cargo
+Write-TextLines $pubspecPath $pubspec
+Write-TextLines $packerPath $packer
+
+# Cargo.lock tambien registra la version del propio paquete, y build.py compila
+# con --locked: sin esto el build aborta con "the lock file needs to be updated
+# but --locked was passed", que no menciona en ningun lado que el motivo fue
+# haber cambiado la version un minuto antes.
+#
+# Se edita el archivo en vez de dejar que cargo lo reescriba. El primer intento
+# fue `cargo metadata --offline`, pero eso resuelve el grafo completo de
+# dependencias y falla si alguna no esta en la cache local ("failed to download
+# assert_matches"), escupiendo un error alarmante aunque el lock termine bien.
+# Cambiar la version de un miembro del workspace no requiere resolver nada: es
+# un solo campo, y este reemplazo es exactamente lo que hace cargo.
+$lockPath = Join-Path $root 'Cargo.lock'
+if (-not (Test-Path -LiteralPath $lockPath)) {
+    Write-Warning "No se encontro Cargo.lock. Se creara al compilar."
+} else {
+    $lock = [System.IO.File]::ReadAllText($lockPath, [System.Text.Encoding]::UTF8)
+    # Los dos paquetes del workspace que llevan esta version. Se anclan por
+    # nombre exacto y por separado: "sehcontrol" no puede coincidir con
+    # "sehcontrol-portable-packer" ni al reves.
+    #
+    # El packer se dejaba fuera antes porque su version tampoco se actualizaba.
+    # Ahora que si, tiene que actualizarse tambien aqui: build.py compila con
+    # --locked, y un lock que no coincide con el Cargo.toml aborta el build.
+    $entradas = @(
+        @{ Nombre = 'sehcontrol'; Patron = '(?m)^(name = "sehcontrol"\r?\nversion = ")[^"]+(")' },
+        @{ Nombre = 'sehcontrol-portable-packer'; Patron = '(?m)^(name = "sehcontrol-portable-packer"\r?\nversion = ")[^"]+(")' }
+    )
+    $modificado = $true
+    foreach ($entrada in $entradas) {
+        $coincidencias = ([regex]$entrada.Patron).Matches($lock).Count
+        if ($coincidencias -ne 1) {
+            Write-Warning "Cargo.lock: se esperaba una entrada de '$($entrada.Nombre)' y hay $coincidencias. No se modifico; corre 'cargo check' antes de compilar."
+            $modificado = $false
+            break
+        }
+        $lock = [regex]::Replace($lock, $entrada.Patron, "`${1}$Version`${2}")
+    }
+    if ($modificado) {
+        # Sin BOM y respetando los finales de linea que ya tenia: cargo
+        # reescribiria el lock entero si algo no le cuadra.
+        [System.IO.File]::WriteAllText($lockPath, $lock, (New-Object System.Text.UTF8Encoding($false)))
+    }
+}
+
+Write-Output ''
+Write-Output "Version cambiada: $actual  ->  $Version"
+Write-Output "  Cargo.toml            version = `"$Version`""
+Write-Output "  flutter/pubspec.yaml  version: $Version+$($build + 1)"
+Write-Output "  libs/portable         version = `"$Version`""
+Write-Output "  Cargo.lock            sincronizado (sehcontrol y portable-packer)"
+Write-Output "  src/version.rs        se regenera solo al compilar"
+Write-Output ''
+Write-Output 'Recorda: al publicar en el panel hay que declarar EXACTAMENTE esta misma version.'

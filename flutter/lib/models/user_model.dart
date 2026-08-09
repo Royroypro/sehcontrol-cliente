@@ -9,13 +9,47 @@ import 'package:get/get.dart';
 import 'package:web_socket_channel/web_socket_channel.dart';
 
 import '../common.dart';
+import '../common/realtime_channel.dart';
+import '../common/screen_cam_preview_lifecycle.dart';
+import '../common/screen_cam_preview_protocol.dart';
 import '../utils/http_service.dart' as http;
 import 'model.dart';
 import 'platform_model.dart';
+import 'screencam_policy.dart';
+
+/// Bridges `web_socket_channel` to the transport-agnostic interface the
+/// realtime controller drives. `WebSocketChannel.connect` returns before the
+/// handshake completes, so `ready` is what the controller waits on.
+class _WebSocketChannelAdapter implements RealtimeSocket {
+  _WebSocketChannelAdapter(Uri url) : _channel = WebSocketChannel.connect(url);
+
+  final WebSocketChannel _channel;
+
+  @override
+  Future<void> get ready => _channel.ready;
+
+  @override
+  Stream<dynamic> get stream => _channel.stream;
+
+  @override
+  void send(String data) => _channel.sink.add(data);
+
+  @override
+  Future<void> close() => _channel.sink.close();
+}
+
+/// Event name the Rust poller pushes on, and the handler key under it. Constants
+/// so registration and removal cannot drift apart.
+const _previewLifecycleEvent = 'screencam_preview_lifecycle';
+const _previewLifecycleHandler = 'user_model_preview_lifecycle';
 
 bool refreshingUser = false;
 const _trustedServerKeyOption = 'trusted-server-key';
 const _trustedServerKeyFingerprintOption = 'trusted-server-key-fingerprint';
+DateTime? _lastUnresolvedScreenCamPolicyWarning;
+DateTime? _lastEmptyScreenCamUuidWarning;
+DateTime? _lastScreenCamPolicyIpcWarning;
+DateTime? _lastScreenCamV2ErrorWarning;
 
 class ServerNotification {
   final String id;
@@ -47,6 +81,14 @@ class UserModel {
   final Rx<DateTime?> membershipExpiresAt = Rx<DateTime?>(null);
   final RxnInt membershipDeviceCount = RxnInt();
   final RxnInt membershipMaxDevices = RxnInt();
+
+  /// Support contact number (no leading "+", e.g. "51948793154"), from
+  /// `/api/client-policy`'s `whatsapp_number`. Server-configured on purpose —
+  /// used both by the "Soporte" sidebar link and the expiry-warning banner's
+  /// "Contactar por WhatsApp" button, so changing the number is an admin-side
+  /// change, not a client release. Empty when not configured; both call
+  /// sites hide the WhatsApp option entirely rather than show a wrong number.
+  final RxString whatsappNumber = ''.obs;
   // Messages received during this session. The server notification is acked
   // immediately, so retain its content locally for the notification bell.
   final RxInt unreadNotificationCount = 0.obs;
@@ -56,9 +98,8 @@ class UserModel {
   Timer? _heartbeatTimer;
   bool _heartbeatInFlight = false;
   bool _heartbeatConfirmed = false;
-  WebSocketChannel? _realtimeChannel;
-  Timer? _realtimePingTimer;
-  bool _realtimeReconnectScheduled = false;
+  RealtimeChannelController? _realtimeController;
+  ScreenCamPreviewLifecycleDispatcher? _previewLifecycle;
 
   bool get isLogin => userName.isNotEmpty;
   String get displayNameOrUserName =>
@@ -133,6 +174,15 @@ class UserModel {
       startMembershipPolling();
     } catch (e) {
       debugPrint('Failed to refreshCurrentUser: $e');
+      // A stored token plus an unreachable panel is exactly the startup this
+      // has to survive: without this the session machinery never started, so
+      // the realtime channel had nothing to reconnect from and stayed down for
+      // the whole run of the app even after the panel came back. A 401/400 is
+      // handled above and returns before reaching here, so this only covers
+      // transport failures.
+      if (bind.mainGetLocalOption(key: 'access_token').isNotEmpty) {
+        startMembershipPolling();
+      }
     } finally {
       refreshingUser = false;
       await updateOtherModels();
@@ -153,6 +203,39 @@ class UserModel {
     });
     _startHeartbeat();
     connectRealtimeChannel();
+    // The publisher's lifecycle is forwarded by the `--server` process now,
+    // over its own channel, for the same reason it receives the commands
+    // there: those transitions are what move the session to `ready` and get
+    // the browser a playback URL, and they cannot depend on this window being
+    // open. Forwarding from here too would duplicate every transition.
+  }
+
+  /// Bridges the daemon's preview publisher to the panel.
+  ///
+  /// Registered here rather than in the FFI constructor on purpose: this runs
+  /// for the one logged-in session that owns the authenticated WebSocket, while
+  /// the constructor runs for every remote session too and would forward each
+  /// transition once per session.
+  void _startPreviewLifecycleForwarding() {
+    _previewLifecycle ??=
+        ScreenCamPreviewLifecycleDispatcher(_sendRealtimeApplicationEvent);
+    // replace: true keeps a second startMembershipPolling() (a re-login,
+    // say) from stacking handlers.
+    platformFFI.registerEventHandler(
+      _previewLifecycleEvent,
+      _previewLifecycleHandler,
+      (evt) async {
+        _previewLifecycle?.handle(evt);
+      },
+      replace: true,
+    );
+  }
+
+  void _stopPreviewLifecycleForwarding() {
+    platformFFI.unregisterEventHandler(
+        _previewLifecycleEvent, _previewLifecycleHandler);
+    _previewLifecycle?.reset();
+    _previewLifecycle = null;
   }
 
   void stopMembershipPolling() {
@@ -171,6 +254,7 @@ class UserModel {
     membershipMaxDevices.value = null;
     clearNotifications();
     disconnectRealtimeChannel();
+    _stopPreviewLifecycleForwarding();
   }
 
   void _startHeartbeat() {
@@ -187,14 +271,17 @@ class UserModel {
     try {
       final url = (await bind.mainGetApiServer()).trim();
       if (url.isEmpty) return;
+      final body = <String, dynamic>{
+        'id': await bind.mainGetMyId(),
+        'uuid': await bind.mainGetUuid(),
+      };
+      final screenCam = _readScreenCamStatus();
+      if (screenCam != null) body['screen_cam'] = screenCam;
       final resp = await http
           .post(
             Uri.parse('$url/api/heartbeat'),
             headers: const {'Content-Type': 'application/json'},
-            body: jsonEncode({
-              'id': await bind.mainGetMyId(),
-              'uuid': await bind.mainGetUuid(),
-            }),
+            body: jsonEncode(body),
           )
           .timeout(const Duration(seconds: 10));
       if (resp.statusCode < 200 || resp.statusCode >= 300) {
@@ -208,6 +295,51 @@ class UserModel {
     } finally {
       _heartbeatInFlight = false;
     }
+  }
+
+  /// Reads the status Rust's screen_cam watchdog writes into LocalConfig
+  /// (`screencam-actual-state`/`-encoder`/`-last-error`/`-rtsp-clients`/
+  /// `-local-ip`/`-rtsp-port`) so the heartbeat above can forward it, per
+  /// docs/SCREENCAM_PLAN.md sections 11.2 and 12.3 (`local_ip`/`rtsp_port`
+  /// as separate raw fields — server dev's confirmed field names, so the
+  /// panel builds the rtsp:// URL itself rather than us pre-building it).
+  /// Returns null when `screencam-actual-state` was never set — e.g.
+  /// non-Windows builds, or the `screencam` Cargo feature wasn't compiled
+  /// in — so heartbeats don't carry a meaningless empty `screen_cam` object
+  /// on platforms where it doesn't apply.
+  Map<String, dynamic>? _readScreenCamStatus() {
+    final rawState = bind.mainGetLocalOption(key: 'screencam-actual-state');
+    if (rawState.isEmpty) return null;
+    // The server's documented contract only has two values for actual_state
+    // ("running"/"stopped" — docs/SCREENCAM_PLAN.md section 12, point 2).
+    // Rust tracks finer-grained states locally ("starting"/"disabled"/"error"
+    // — used for the read-only status card in Settings), but only "running"
+    // should ever cross the wire as-is; everything else collapses to
+    // "stopped" here so the heartbeat matches what was actually agreed,
+    // regardless of how much local detail we keep for the UI. `last_error`
+    // still carries the diagnostic detail for the "error" case.
+    final actualState = rawState == 'running' ? 'running' : 'stopped';
+    final status = <String, dynamic>{'actual_state': actualState};
+    final encoder = bind.mainGetLocalOption(key: 'screencam-encoder');
+    if (encoder.isNotEmpty) status['encoder'] = encoder;
+    final lastError = bind.mainGetLocalOption(key: 'screencam-last-error');
+    status['last_error'] = lastError.isEmpty ? null : lastError;
+    final rtspClients =
+        int.tryParse(bind.mainGetLocalOption(key: 'screencam-rtsp-clients'));
+    if (rtspClients != null) status['rtsp_clients'] = rtspClients;
+    final localIp = bind.mainGetLocalOption(key: 'screencam-local-ip');
+    if (localIp.isNotEmpty) status['local_ip'] = localIp;
+    final rtspPort =
+        int.tryParse(bind.mainGetLocalOption(key: 'screencam-rtsp-port'));
+    if (rtspPort != null) status['rtsp_port'] = rtspPort;
+    // Confirms back to the panel that the credentials it issued landed on this
+    // device. Username only — the password is never echoed back to the server
+    // that sent it. Kept in sync with the native heartbeat's equivalent block
+    // in src/hbbs_http/sync.rs (`screen_cam_status`).
+    final rtspUser = bind.mainGetLocalOption(key: 'screencam-rtsp-user');
+    status['auth_enabled'] = rtspUser.isNotEmpty;
+    if (rtspUser.isNotEmpty) status['rtsp_user'] = rtspUser;
+    return status;
   }
 
   void clearUnreadNotifications() {
@@ -332,70 +464,74 @@ class UserModel {
   /// started by [startMembershipPolling] is kept running regardless, as a
   /// low-frequency fallback for when this socket is down. No-op with no
   /// api_server or access_token available.
+  RealtimeChannelController _ensureRealtimeController() {
+    return _realtimeController ??= RealtimeChannelController(
+      apiServerProvider: () => bind.mainGetApiServer(),
+      tokenProvider: () => bind.mainGetLocalOption(key: 'access_token'),
+      socketFactory: (url) => _WebSocketChannelAdapter(url),
+      onEvent: _handleRealtimeEvent,
+      logger: debugPrint,
+    );
+  }
+
   void connectRealtimeChannel() {
-    disconnectRealtimeChannel();
-    unawaited(() async {
-      final url = await bind.mainGetApiServer();
-      final token = bind.mainGetLocalOption(key: 'access_token');
-      if (url.trim().isEmpty || token.isEmpty) return;
-      // Naive http->ws / https->wss: "http" is a prefix of "https", so
-      // replacing it with "ws" leaves the trailing "s" in place for TLS.
-      final wsUrl = '${url.replaceFirst('http', 'ws')}/api/ws?token=$token';
-      try {
-        final channel = WebSocketChannel.connect(Uri.parse(wsUrl));
-        _realtimeChannel = channel;
-        channel.stream.listen(
-          (raw) => _handleRealtimeEvent(raw),
-          onDone: _scheduleRealtimeReconnect,
-          onError: (e) {
-            debugPrint('Realtime channel error: $e');
-            _scheduleRealtimeReconnect();
-          },
-          cancelOnError: true,
-        );
-        _realtimePingTimer?.cancel();
-        _realtimePingTimer = Timer.periodic(const Duration(seconds: 30), (_) {
-          try {
-            _realtimeChannel?.sink.add('ping');
-          } catch (e) {
-            debugPrint('Failed to ping realtime channel: $e');
-          }
-        });
-      } catch (e) {
-        debugPrint('Failed to connect realtime channel: $e');
-        _scheduleRealtimeReconnect();
-      }
-    }());
+    _mirrorPanelSessionToDaemon();
+    _ensureRealtimeController().start();
+  }
+
+  /// Re-sends the stored panel token to the `--server` process, which opens
+  /// its own channel to the panel so ScreenCam previews survive this window
+  /// being closed.
+  ///
+  /// The write path in Rust already mirrors the token whenever it changes, but
+  /// a client that was already signed in never writes it again: it just starts
+  /// up with the value on disk. Without this, the daemon would only ever learn
+  /// the token on the next sign-in — which, with 90-day sessions, could be
+  /// months away. Re-sending the same value is harmless.
+  void _mirrorPanelSessionToDaemon() {
+    if (!isWindows) return;
+    final token = bind.mainGetLocalOption(key: 'access_token');
+    if (token.isEmpty) return;
+    // Goes through the same setter the login path uses, so the mirroring rule
+    // lives in exactly one place (main_set_local_option in src/flutter_ffi.rs).
+    unawaited(bind.mainSetLocalOption(key: 'access_token', value: token));
+  }
+
+  /// The persisted access token may have just changed, so the socket has to be
+  /// rebuilt: an open one is still authenticated with the previous credential.
+  void refreshRealtimeChannel() {
+    _ensureRealtimeController().restart();
   }
 
   void disconnectRealtimeChannel() {
-    _realtimePingTimer?.cancel();
-    _realtimePingTimer = null;
-    _realtimeChannel?.sink.close();
-    _realtimeChannel = null;
+    _realtimeController?.stop();
   }
 
-  void _scheduleRealtimeReconnect() {
-    if (_realtimeReconnectScheduled || _membershipTimer == null) return;
-    _realtimeReconnectScheduled = true;
-    Future.delayed(const Duration(seconds: 5), () {
-      _realtimeReconnectScheduled = false;
-      // Only reconnect if polling (i.e. a logged-in session) is still active;
-      // stopMembershipPolling()/logOut() may have run while we were waiting.
-      if (_membershipTimer != null) {
-        connectRealtimeChannel();
-      }
-    });
+  // Kept as the single safe path for Entrega E application events.
+  // ignore: unused_element
+  bool _sendRealtimeApplicationEvent(Map<String, Object?> payload) {
+    return _realtimeController?.send(payload) ?? false;
   }
 
-  void _handleRealtimeEvent(dynamic raw) {
+  /// Application events only: the controller has already decoded the frame and
+  /// consumed the transport-level `pong`.
+  void _handleRealtimeEvent(Map<Object?, Object?> event) {
     try {
-      if (raw is! String) return;
-      final event = jsonDecode(raw);
-      if (event is! Map) return;
       final data = event['data'];
       switch (event['type']) {
         case 'connected':
+          // The publisher may have connected while this socket was down, in
+          // which case its transition is still owed to the panel.
+          _previewLifecycle?.flush();
+          // Server dev confirmed (docs/SCREENCAM_PLAN.md section "Fase 4b",
+          // point 12.4): screen_cam.update only pushes on the *next* change,
+          // so a policy change that happened while this socket was down
+          // (reconnect gap) would otherwise sit unnoticed until this app
+          // restarts. Re-pulling client-policy on every fresh connection —
+          // which 'connected' fires for, both the first connect and every
+          // reconnect — closes that gap without needing a new endpoint.
+          unawaited(UserModel.fetchForceLogin());
+          break;
         case 'pong':
           break;
         case 'server_key_changed':
@@ -407,9 +543,88 @@ class UserModel {
         case 'message':
           if (data is Map) _showMessageAndAck(data);
           break;
+        case 'screen_cam.update':
+          // The event carries the policy block itself and is applied directly,
+          // without re-fetching (docs/SCREENCAM_PLAN.md, Fase 4c) — so no
+          // fetchForceLogin() is triggered here and there is no WS → HTTP → WS
+          // loop to debounce. It may however carry only a subset, so historical
+          // fields go through the strictly-partial persister (an absent field
+          // keeps its stored value) and selection/fallback keep going through
+          // the display persister that owns them.
+          if (data is Map) {
+            unawaited(() async {
+              await _persistScreenCamPolicyHistoryPartial(data);
+              await _persistScreenCamDisplayPolicy(data);
+            }());
+          }
+          break;
+        // ScreenCam preview no longer travels through here.
+        //
+        // This channel only exists while the window does, so a preview could
+        // only ever be started with someone looking at the app — useless for a
+        // feature whose whole point is unattended supervision. The `--server`
+        // process now owns its own channel to the panel
+        // (src/server/screen_cam/panel_link.rs), where capture already lives.
+        //
+        // Deliberately not handled here as well: the panel pushes to *every*
+        // connection a user has (`pushToUser` in its src/ws.js), so with the
+        // window open both channels would receive the same command and start
+        // the same session twice.
       }
-    } catch (e) {
-      debugPrint('Failed to handle realtime event: $e');
+    } catch (_) {
+      // Decoder errors can quote the source message, which may contain a
+      // short-lived ScreenCam Preview credential.
+      debugPrint('Failed to handle realtime event');
+    }
+  }
+
+  Future<void> _handleScreenCamPreviewStart(Object? data) {
+    return dispatchScreenCamPreviewStart(
+      data,
+      isWindowsPlatform: isWindows,
+      getLocalId: () async => (await bind.mainGetMyId()).trim(),
+      onValidated: _onScreenCamPreviewStartValidated,
+    );
+  }
+
+  Future<void> _handleScreenCamPreviewStop(Object? data) {
+    return dispatchScreenCamPreviewStop(
+      data,
+      isWindowsPlatform: isWindows,
+      getLocalId: () async => (await bind.mainGetMyId()).trim(),
+      onValidated: _onScreenCamPreviewStopValidated,
+    );
+  }
+
+  Future<void> _onScreenCamPreviewStartValidated(
+    ScreenCamPreviewStartMessage message,
+  ) async {
+    try {
+      final response = await bind.mainStartScreencamPreview(
+        sessionId: message.sessionId,
+        rustdeskId: message.rustdeskId,
+        publishUrl: message.publishUrl,
+        publishToken: message.publishToken,
+        streamName: message.streamName,
+        expiresIn: message.expiresIn,
+      );
+      _isValidScreenCamPreviewAck(response, message.sessionId);
+    } catch (_) {
+      // Publisher state events, including failures, belong to Entrega E.
+    }
+  }
+
+  Future<void> _onScreenCamPreviewStopValidated(
+    ScreenCamPreviewStopMessage message,
+  ) async {
+    try {
+      final response = await bind.mainStopScreencamPreview(
+        sessionId: message.sessionId,
+        rustdeskId: message.rustdeskId,
+      );
+      _isValidScreenCamPreviewAck(response, message.sessionId);
+    } catch (_) {
+      // Publisher state events, including failures, belong to Entrega E.
     }
   }
 
@@ -589,18 +804,184 @@ class UserModel {
   /// Whether the configured api_server requires a logged-in user before the
   /// app can be used at all. Returns false (never force) on any failure:
   /// no api_server configured, network error, or malformed response.
+  ///
+  /// Also fetches and persists the `screen_cam` licensing block (see
+  /// docs/SCREENCAM_PLAN.md section 11) while it's here — this endpoint is
+  /// the only one the server-side contract requires work without a login
+  /// (deliberately: a `supervised`-mode device must stay locked even with no
+  /// session, per the server dev's note in section 11.1), so it's the right
+  /// place to keep the licensing state fresh at every app start regardless
+  /// of whether login succeeds afterward.
   static Future<bool> fetchForceLogin() async {
+    String? url;
+    Map? v1ScreenCamPolicy;
+    var forceLogin = false;
     try {
-      final url = await bind.mainGetApiServer();
-      if (url.trim().isEmpty) return false;
-      final resp = await http.get(Uri.parse('$url/api/client-policy'));
-      if (resp.statusCode != 200) return false;
-      final data = jsonDecode(decode_http_response(resp));
-      return data['force_login'] == true;
+      final apiServer = await bind.mainGetApiServer();
+      if (apiServer.trim().isEmpty) return false;
+      url = apiServer;
+      final id = await bind.mainGetMyId();
+      final uri = Uri.parse('$apiServer/api/client-policy')
+          .replace(queryParameters: id.isEmpty ? null : {'id': id});
+      final resp = await http.get(uri);
+      if (resp.statusCode == 200) {
+        final data = jsonDecode(decode_http_response(resp));
+        if (data is Map && data['screen_cam'] is Map) {
+          v1ScreenCamPolicy = data['screen_cam'] as Map;
+          await _persistScreenCamPolicyHistory(v1ScreenCamPolicy);
+        }
+        // Server explicitly sends `null` (not just omits the field) when the
+        // admin hasn't configured a number or has cleared one that used to be
+        // set — must actively reset to '' in that case too, otherwise a
+        // previously-fetched number would keep showing the WhatsApp button
+        // after the admin removes it, since the `is String` check alone would
+        // just skip the assignment and leave the stale cached value in place.
+        if (data is Map) {
+          final whatsapp = data['whatsapp_number'];
+          gFFI.userModel.whatsappNumber.value =
+              whatsapp is String ? whatsapp : '';
+        }
+        forceLogin = data is Map && data['force_login'] == true;
+      }
     } catch (e) {
       debugPrint('Failed to fetchForceLogin: $e');
-      return false;
     }
+
+    // V2 identifies the physical client with the same stable, encoded UUID
+    // already used by login and native heartbeats (`mainGetUuid`), rather than
+    // the mutable RustDesk ID. It only governs display selection; V1 remains
+    // the authority for licensing, desired state, mode and credentials.
+    if (url != null && url.trim().isNotEmpty) {
+      final v2Decision = await _fetchScreenCamV2Policy(url);
+      final displayPolicy =
+          resolveScreenCamDisplayPolicy(v1ScreenCamPolicy, v2Decision);
+      if (displayPolicy.isNotEmpty) {
+        await _persistScreenCamDisplayPolicy(displayPolicy);
+      }
+    }
+    return forceLogin;
+  }
+
+  static Future<ScreenCamV2PolicyDecision> _fetchScreenCamV2Policy(
+      String url) async {
+    try {
+      final deviceUid = await bind.mainGetUuid();
+      if (deviceUid.isEmpty) {
+        final now = DateTime.now();
+        if (_lastEmptyScreenCamUuidWarning == null ||
+            now.difference(_lastEmptyScreenCamUuidWarning!) >=
+                const Duration(minutes: 5)) {
+          _lastEmptyScreenCamUuidWarning = now;
+          debugPrint('ScreenCam V2 policy omitted: device UID is unavailable');
+        }
+        return const ScreenCamV2PolicyDecision(unresolved: true);
+      }
+      final uri = Uri.parse('$url/api/v2/client/policy')
+          .replace(queryParameters: {'device_uid': deviceUid});
+      final response = await http.get(uri).timeout(const Duration(seconds: 5));
+      // A 404 is the expected compatibility response from a pre-V2 panel.
+      if (response.statusCode != 200) {
+        return screenCamV2PolicyDecision(response.statusCode, null);
+      }
+      final data = jsonDecode(decode_http_response(response));
+      final decision = screenCamV2PolicyDecision(response.statusCode, data);
+      if (decision.unresolved) {
+        final now = DateTime.now();
+        if (_lastUnresolvedScreenCamPolicyWarning == null ||
+            now.difference(_lastUnresolvedScreenCamPolicyWarning!) >=
+                const Duration(minutes: 5)) {
+          _lastUnresolvedScreenCamPolicyWarning = now;
+          debugPrint(
+              'ScreenCam V2 policy ignored: device UID was not resolved');
+        }
+        return decision;
+      }
+      return decision;
+    } catch (_) {
+      // V2 is additive. Network failures, timeouts and malformed responses
+      // must leave the last valid V1/display policy untouched.
+      final now = DateTime.now();
+      if (_lastScreenCamV2ErrorWarning == null ||
+          now.difference(_lastScreenCamV2ErrorWarning!) >=
+              const Duration(minutes: 5)) {
+        _lastScreenCamV2ErrorWarning = now;
+        debugPrint('ScreenCam V2 policy fetch failed; keeping previous policy');
+      }
+      return const ScreenCamV2PolicyDecision();
+    }
+  }
+
+  /// Persists the historical fields of a complete V1 `screen_cam` policy into
+  /// the same LocalConfig
+  /// key/value store that the Rust side
+  /// (`src/server/screen_cam/mod.rs`, `is_enabled()`/`is_supervised()`)
+  /// already reads directly. No new bridge function needed for this either
+  /// — `mainSetLocalOption` already exists.
+  static Future<void> _persistScreenCamPolicyHistory(Map screenCam) async {
+    final licensed = screenCam['licensed'] == true;
+    final desiredState = (screenCam['desired_state'] ?? 'stopped').toString();
+    final mode = (screenCam['mode'] ?? 'local').toString();
+    await bind.mainSetLocalOption(
+        key: 'screencam-licensed', value: licensed ? 'Y' : 'N');
+    await bind.mainSetLocalOption(
+        key: 'screencam-desired-state', value: desiredState);
+    await bind.mainSetLocalOption(key: 'screencam-mode', value: mode);
+
+    // RTSP credentials are issued by the panel and only ever flow in this
+    // direction — the client never generates or edits them (see
+    // src/server/screen_cam/auth.rs). Both fields are always written, even
+    // when absent/null, so clearing them in the panel actually turns auth off
+    // on the device instead of leaving the last pair cached forever — the
+    // same explicit-null trap already hit with `whatsapp_number`.
+    final rtspUser = screenCam['rtsp_user'];
+    final rtspPassword = screenCam['rtsp_password'];
+    await bind.mainSetLocalOption(
+        key: 'screencam-rtsp-user', value: rtspUser is String ? rtspUser : '');
+    await bind.mainSetLocalOption(
+        key: 'screencam-rtsp-pass',
+        value: rtspPassword is String ? rtspPassword : '');
+
+    // Port overrides follow the same always-write rule: the full V1 block is
+    // authoritative, so an absent port means "no override" and has to clear a
+    // previously issued one rather than leave the device pinned to it.
+    for (final entry in screenCamHistoricalPolicyValues({
+      'rtsp_port_override': screenCam['rtsp_port_override'],
+      'onvif_port_override': screenCam['onvif_port_override'],
+    }).entries) {
+      await bind.mainSetLocalOption(key: entry.key, value: entry.value);
+    }
+  }
+
+  /// Strictly-partial counterpart of [_persistScreenCamPolicyHistory] for the
+  /// WebSocket event, which may carry only a subset of the block. Only keys
+  /// actually present are written, so an absent field never becomes
+  /// `false`/`stopped`/`local` and an absent credential is never wiped. The
+  /// daemon validates every value again before storing it.
+  static Future<void> _persistScreenCamPolicyHistoryPartial(
+      Map screenCam) async {
+    for (final entry in screenCamHistoricalPolicyValues(screenCam).entries) {
+      await bind.mainSetLocalOption(key: entry.key, value: entry.value);
+    }
+  }
+
+  static Future<bool> _persistScreenCamDisplayPolicy(Map screenCam) async {
+    final result = await applyScreenCamDisplayPolicyUpdate(
+      screenCam,
+      (payload) async {
+        return bind.mainApplyScreencamDisplayPolicy(value: payload);
+      },
+    );
+    if (result.attempted && !result.applied) {
+      final now = DateTime.now();
+      if (_lastScreenCamPolicyIpcWarning == null ||
+          now.difference(_lastScreenCamPolicyIpcWarning!) >=
+              const Duration(minutes: 5)) {
+        _lastScreenCamPolicyIpcWarning = now;
+        debugPrint(
+            'ScreenCam display policy was not applied by the service (${result.error ?? 'nack'})');
+      }
+    }
+    return result.applied;
   }
 
   static Future<List<dynamic>> queryOidcLoginOptions() async {
@@ -626,5 +1007,18 @@ class UserModel {
           "queryOidcLoginOptions: jsonDecode resp body failed: ${e.toString()}");
       return [];
     }
+  }
+}
+
+bool _isValidScreenCamPreviewAck(String response, String sessionId) {
+  try {
+    final decoded = jsonDecode(response);
+    return decoded is Map &&
+        decoded['applied'] is bool &&
+        decoded['changed'] is bool &&
+        decoded['session_id'] == sessionId &&
+        (decoded['error'] == null || decoded['error'] is String);
+  } catch (_) {
+    return false;
   }
 }

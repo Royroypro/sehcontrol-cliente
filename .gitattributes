@@ -1,1 +1,5 @@
 * text=auto
+
+# Los .bat deben conservar CRLF: con LF, cmd.exe puede fallar al resolver
+# etiquetas y goto. No depende de core.autocrlf de cada maquina.
+*.bat text eol=crlf

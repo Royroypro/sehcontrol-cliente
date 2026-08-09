@@ -908,6 +908,12 @@ class SehcontrolImpl {
     return js.context.callMethod('getByName', ['option:local', key]);
   }
 
+  Future<String> mainApplyScreencamDisplayPolicy(
+      {required String value, dynamic hint}) {
+    return Future.value(
+        '{"applied":false,"changed":false,"error":"unsupported"}');
+  }
+
   // Do not return the real environment variables.
   // Use the global variable as the environment variable in web.
   String mainGetEnv({required String key, dynamic hint}) {

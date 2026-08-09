@@ -1,0 +1,98 @@
+diff --git a/libs/scrap/src/dxgi/mod.rs b/libs/scrap/src/dxgi/mod.rs
+index 1f5296954..1fd44044f 100644
+--- a/libs/scrap/src/dxgi/mod.rs
++++ b/libs/scrap/src/dxgi/mod.rs
+@@ -334,7 +334,23 @@ impl Capturer {
+         #[allow(invalid_value)]
+         let mut info = mem::MaybeUninit::uninit().assume_init();
+ 
+-        wrap_hresult((*self.duplication.0).AcquireNextFrame(timeout, &mut info, &mut frame))?;
++        let acquire_hr =
++            (*self.duplication.0).AcquireNextFrame(timeout, &mut info, &mut frame);
++        if acquire_hr != S_OK {
++            let kind = wrap_hresult(acquire_hr)
++                .unwrap_err()
++                .kind();
++            return Err(io::Error::new(
++                kind,
++                format!(
++                    "[scrap-dxgi-diag] AcquireNextFrame failed hr={:#010X} fastlane={} size={}x{}",
++                    acquire_hr as u32,
++                    self.fastlane,
++                    self.width,
++                    self.height
++                ),
++            ));
++        }
+         let frame = ComPtr(frame);
+ 
+         if *info.LastPresentTime.QuadPart() == 0 {
+@@ -344,10 +360,40 @@ impl Capturer {
+         #[allow(invalid_value)]
+         let mut rect = mem::MaybeUninit::uninit().assume_init();
+         if self.fastlane {
+-            wrap_hresult((*self.duplication.0).MapDesktopSurface(&mut rect))?;
++            let map_desktop_hr = (*self.duplication.0).MapDesktopSurface(&mut rect);
++            if map_desktop_hr != S_OK {
++                let kind = wrap_hresult(map_desktop_hr)
++                    .unwrap_err()
++                    .kind();
++                return Err(io::Error::new(
++                    kind,
++                    format!(
++                        "[scrap-dxgi-diag] MapDesktopSurface failed hr={:#010X} fastlane={} size={}x{}",
++                        map_desktop_hr as u32,
++                        self.fastlane,
++                        self.width,
++                        self.height
++                    ),
++                ));
++            }
+         } else {
+             self.surface = ComPtr(self.ohgodwhat(frame.0)?);
+-            wrap_hresult((*self.surface.0).Map(&mut rect, DXGI_MAP_READ))?;
++            let surface_map_hr = (*self.surface.0).Map(&mut rect, DXGI_MAP_READ);
++            if surface_map_hr != S_OK {
++                let kind = wrap_hresult(surface_map_hr)
++                    .unwrap_err()
++                    .kind();
++                return Err(io::Error::new(
++                    kind,
++                    format!(
++                        "[scrap-dxgi-diag] IDXGISurface::Map failed hr={:#010X} fastlane={} size={}x{}",
++                        surface_map_hr as u32,
++                        self.fastlane,
++                        self.width,
++                        self.height
++                    ),
++                ));
++            }
+         }
+         Ok((rect.pBits, rect.Pitch))
+     }
+diff --git a/src/server/screen_cam/mod.rs b/src/server/screen_cam/mod.rs
+index f0471280d..925b9b27c 100644
+--- a/src/server/screen_cam/mod.rs
++++ b/src/server/screen_cam/mod.rs
+@@ -1584,6 +1584,21 @@ fn handle_access_unit(
+     let has_pps = nals
+         .iter()
+         .any(|nal| rtp::nal_unit_type(nal) == rtp::NAL_TYPE_PPS);
++
++    // Diagn?stico temporal: confirma si los IDR posteriores reutilizan
++    // SPS/PPS almacenados pero no los incluyen dentro del access unit actual.
++    if state.preview_tap.is_active() && keyframe {
++        let descriptor = state.stream_descriptor();
++        log::info!(
++            "[screencam-preview-diag] keyframe epoch={} has_sps={} has_pps={} cached_sps={} cached_pps={} bytes={}",
++            stream_epoch,
++            has_sps,
++            has_pps,
++            descriptor.sps.is_some(),
++            descriptor.pps.is_some(),
++            data.len()
++        );
++    }
+     // Deliberately ignored. A frame the preview cannot take (a negative PTS
+     // from the encoder, say) is skipped for preview only — RTSP carries on
+     // untouched, nothing returns early, and nothing is logged, because this

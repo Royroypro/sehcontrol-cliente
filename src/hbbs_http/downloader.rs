@@ -159,6 +159,100 @@ pub fn download_file(
     Ok(id)
 }
 
+/// Comprueba que lo descargado es lo que el servidor dijo que era.
+///
+/// Dos comprobaciones, en orden de coste:
+///
+/// 1. El tamano contra el Content-Length. Detecta el corte a mitad, que es el
+///    fallo frecuente, y no cuesta nada.
+/// 2. El SHA-256 contra el que publica el panel, cuando lo publica. Detecta lo
+///    que el tamano no ve: una respuesta reescrita por un intermediario, un
+///    disco que devuelve basura, o una descarga que un proxy completo con su
+///    propia pagina de error.
+///
+/// Falla en vez de avisar: dejar pasar un instalador corrupto sale mucho mas
+/// caro que reintentar la descarga. Un fichero que no pasa se borra, para que
+/// el reintento no lo reutilice creyendolo bueno.
+async fn verify_download(id: &str, url: &str, path: &Option<PathBuf>) -> ResultType<()> {
+    let (total_size, downloaded_size) = {
+        let downloaders = DOWNLOADERS.lock().unwrap();
+        match downloaders.get(id) {
+            Some(downloader) => (downloader.total_size, downloader.downloaded_size),
+            None => return Ok(()),
+        }
+    };
+
+    let discard = || {
+        if let Some(p) = path {
+            if p.exists() {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    };
+
+    if let Some(total_size) = total_size {
+        if downloaded_size != total_size {
+            discard();
+            bail!(
+                "Incomplete download: expected {total_size} bytes, got {downloaded_size}"
+            );
+        }
+    }
+
+    // El panel es el unico que declara un hash, y solo para el binario que el
+    // mismo publica. Para cualquier otra descarga no hay contra que comparar.
+    let expected = crate::common::PANEL_UPDATE
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|update| update.download_url == url && !update.sha256.is_empty())
+        .map(|update| (update.sha256.clone(), update.size_bytes));
+    let Some((expected_sha256, expected_size)) = expected else {
+        return Ok(());
+    };
+
+    if expected_size > 0 && downloaded_size != expected_size {
+        discard();
+        bail!(
+            "Downloaded size {downloaded_size} does not match the {expected_size} bytes the panel published"
+        );
+    }
+
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    match path {
+        Some(p) => {
+            // Por bloques: el instalador ronda los 30 MB y no hay motivo para
+            // tenerlo entero en memoria una segunda vez.
+            let mut file = std::fs::File::open(p)?;
+            let mut buffer = vec![0u8; 64 * 1024];
+            loop {
+                let read = std::io::Read::read(&mut file, &mut buffer)?;
+                if read == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..read]);
+            }
+        }
+        None => {
+            let data = DOWNLOADERS
+                .lock()
+                .unwrap()
+                .get(id)
+                .map(|downloader| downloader.data.clone())
+                .unwrap_or_default();
+            hasher.update(&data);
+        }
+    }
+    let actual = hex::encode(hasher.finalize());
+    if actual != expected_sha256 {
+        discard();
+        bail!("Checksum mismatch: the panel published {expected_sha256}, the download hashes to {actual}");
+    }
+    log::info!("[update] download verified against the panel checksum");
+    Ok(())
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn do_download(
     id: &str,
@@ -168,6 +262,10 @@ async fn do_download(
     mut rx_cancel: UnboundedReceiver<()>,
 ) -> ResultType<bool> {
     let client = create_http_client_async_with_url(&url).await;
+    // Copias para la verificacion final: `url` se consume al lanzar el GET y
+    // `path` al abrir el destino.
+    let url_for_verification = url.clone();
+    let path_for_verification = path.clone();
 
     let mut is_all_downloaded = false;
     tokio::select! {
@@ -254,6 +352,12 @@ async fn do_download(
 
     if let Some(mut f) = dest.take() {
         f.flush().await?;
+    }
+
+    // Solo se comprueba una descarga que dice haber terminado: una cancelada
+    // esta incompleta por definicion y no es un fallo que reportar.
+    if is_all_downloaded {
+        verify_download(id, &url_for_verification, &path_for_verification).await?;
     }
 
     if let Some(ref mut downloader) = DOWNLOADERS.lock().unwrap().get_mut(id) {

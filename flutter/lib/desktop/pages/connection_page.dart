@@ -335,6 +335,8 @@ class _ConnectionPageState extends State<ConnectionPage>
                   const SizedBox(width: 16),
                   installTipCard,
                 ],
+                const SizedBox(width: 16),
+                buildMembershipBanner(context),
               ],
             ).marginOnly(top: 22, right: 12),
             SizedBox(height: 12),
