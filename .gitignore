@@ -64,3 +64,5 @@ flutter/web/
 *.dll
 *.zip
 flutter/devtools_options.yaml
+# libdrmtap is cloned at build time by build.py (not a submodule)
+/third_party/libdrmtap/

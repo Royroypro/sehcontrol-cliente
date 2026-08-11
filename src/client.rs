@@ -252,7 +252,7 @@ impl Client {
         (i32, String),
         bool,
     )> {
-        if config::is_incoming_only() {
+        if config::is_incoming_only() && !is_switch_sides_back(conn_type, &interface).await {
             bail!("Incoming only mode");
         }
         // to-do: remember the port for each peer, so that we can retry easier
@@ -392,89 +392,79 @@ impl Client {
     )> {
         let mut start = Instant::now();
 
-// Limpieza defensiva: quita espacios/vacíos antes de usar servers
-let mut servers: Vec<String> = servers
-    .into_iter()
-    .map(|s| s.trim().to_string())
-    .filter(|s| !s.is_empty())
-    .collect();
+        // Limpieza defensiva: quita espacios/vacíos antes de usar servers.
+        let mut servers: Vec<String> = servers
+            .into_iter()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
 
-// Conecta primero al primario
-let mut socket = connect_tcp(&*rendezvous_server, CONNECT_TIMEOUT).await;
+        let mut socket = connect_tcp(&*rendezvous_server, CONNECT_TIMEOUT).await;
+        servers.retain(|s| s != &rendezvous_server);
+        debug_assert!(!servers.contains(&rendezvous_server));
 
-// Asegura que servers NO contenga el primario (por seguridad)
-servers.retain(|s| s != &rendezvous_server);
-debug_assert!(!servers.contains(&rendezvous_server));
+        let rtt = start.elapsed();
+        log::debug!("TCP connection establishment time used: {:?}", rtt);
 
-let rtt = start.elapsed();
-log::debug!("TCP connection establishment time used: {:?}", rtt);
-
-// Solo si falla el primario, intenta fallbacks
-if socket.is_err() && !servers.is_empty() {
-    log::info!("try the other servers: {:?}", servers);
-
-    for server in servers {
-        let server = check_port(server, RENDEZVOUS_PORT);
-
-        // Si CONNECT_TIMEOUT es numérico (ej. u64 ms), puedes acelerar failover así:
-        // let fallback_timeout = (CONNECT_TIMEOUT / 2).max(1);
-
-        socket = connect_tcp(&*server, CONNECT_TIMEOUT).await;
-        if socket.is_ok() {
-            rendezvous_server = server;
-            break;
+        if socket.is_err() && !servers.is_empty() {
+            log::info!("try the other servers: {:?}", servers);
+            for server in servers {
+                let server = check_port(server, RENDEZVOUS_PORT);
+                socket = connect_tcp(&*server, CONNECT_TIMEOUT).await;
+                if socket.is_ok() {
+                    rendezvous_server = server;
+                    break;
+                }
+            }
+            crate::refresh_rendezvous_server();
+        } else if !contained {
+            crate::refresh_rendezvous_server();
         }
-    }
 
-    crate::refresh_rendezvous_server();
-} else if !contained {
-    crate::refresh_rendezvous_server();
-}
+        log::info!("rendezvous server: {}", rendezvous_server);
 
-log::info!("rendezvous server: {}", rendezvous_server);
+        let mut socket = socket?;
+        let my_addr = socket.local_addr();
+        let mut signed_id_pk = Vec::new();
+        let mut relay_server = "".to_owned();
+        let mut peer_addr = Config::get_any_listen_addr(true);
+        let mut peer_nat_type = NatType::UNKNOWN_NAT;
+        let my_nat_type = crate::get_nat_type(100).await;
+        let mut is_local = false;
+        let mut feedback = 0;
+        use hbb_common::protobuf::Enum;
 
-let mut socket = socket?;
-let my_addr = socket.local_addr();
-let mut signed_id_pk = Vec::new();
-let mut relay_server = "".to_owned();
-let mut peer_addr = Config::get_any_listen_addr(true);
-let mut peer_nat_type = NatType::UNKNOWN_NAT;
-let my_nat_type = crate::get_nat_type(100).await;
-let mut is_local = false;
-let mut feedback = 0;
-use hbb_common::protobuf::Enum;
+        let nat_type = if interface.is_force_relay() {
+            NatType::SYMMETRIC
+        } else {
+            NatType::from_i32(my_nat_type).unwrap_or(NatType::UNKNOWN_NAT)
+        };
 
-let nat_type = if interface.is_force_relay() {
-    NatType::SYMMETRIC
-} else {
-    NatType::from_i32(my_nat_type).unwrap_or(NatType::UNKNOWN_NAT)
-};
-
-if !key.is_empty() && !token.is_empty() {
-    // mainly for the security of token
-    log::info!(
-        "Secure rendezvous protocol: client_version={}, server={}, initial_application_bytes=0; \
-         waiting for server KeyExchange before sending PunchHoleRequest",
-        crate::VERSION,
-        rendezvous_server
-    );
-    secure_tcp(&mut socket, &key)
-        .await
-        .map_err(|e| anyhow!("Failed to secure tcp: {}", e))?;
-} else if let Some(udp) = udp.1.as_ref() {
-    let tm = Instant::now();
-    loop {
-        let port = *udp.lock().unwrap();
-        if port > 0 {
-            break;
+        let switch_code = interface.get_switch_code();
+        if !key.is_empty() && (!token.is_empty() || !switch_code.is_empty()) {
+            log::info!(
+                "Secure rendezvous protocol: client_version={}, server={}, initial_application_bytes=0; \
+                 waiting for server KeyExchange before sending PunchHoleRequest",
+                crate::VERSION,
+                rendezvous_server
+            );
+            secure_tcp(&mut socket, &key)
+                .await
+                .map_err(|e| anyhow!("Failed to secure tcp: {}", e))?;
+        } else if let Some(udp) = udp.1.as_ref() {
+            let tm = Instant::now();
+            loop {
+                let port = *udp.lock().unwrap();
+                if port > 0 {
+                    break;
+                }
+                // await for 0.5 RTT
+                if tm.elapsed() > rtt / 2 {
+                    break;
+                }
+                hbb_common::sleep(0.001).await;
+            }
         }
-        // await for 0.5 RTT
-        if tm.elapsed() > rtt / 2 {
-            break;
-        }
-        hbb_common::sleep(0.001).await;
-    }
-}
         // Stop UDP NAT test task if still running
         stop_udp_tx.map(|tx| tx.send(()));
         let mut msg_out = RendezvousMessage::new();
@@ -499,6 +489,7 @@ if !key.is_empty() && !token.is_empty() {
             udp_port: udp_nat_port as _,
             force_relay: interface.is_force_relay(),
             socket_addr_v6: ipv6.1.unwrap_or_default(),
+            switch_code,
             ..Default::default()
         });
         for i in 1..=3 {
@@ -746,6 +737,7 @@ if !key.is_empty() && !token.is_empty() {
         let mut direct = !conn.is_err();
         if interface.is_force_relay() || conn.is_err() {
             if !relay_server.is_empty() {
+                let switch_code = interface.get_switch_code();
                 conn = Self::request_relay(
                     peer_id,
                     relay_server.to_owned(),
@@ -754,6 +746,7 @@ if !key.is_empty() && !token.is_empty() {
                     key,
                     token,
                     conn_type,
+                    &switch_code,
                 )
                 .await;
                 if let Err(e) = conn {
@@ -874,6 +867,7 @@ if !key.is_empty() && !token.is_empty() {
         key: &str,
         token: &str,
         conn_type: ConnType,
+        switch_code: &str,
     ) -> ResultType<Stream> {
         let mut succeed = false;
         let mut uuid = "".to_owned();
@@ -885,8 +879,7 @@ if !key.is_empty() && !token.is_empty() {
                 .await
                 .with_context(|| "Failed to connect to rendezvous server")?;
 
-            if !key.is_empty() && !token.is_empty() {
-                // mainly for the security of token
+            if !key.is_empty() && (!token.is_empty() || !switch_code.is_empty()) {
                 secure_tcp(&mut socket, key).await?;
             }
 
@@ -907,6 +900,7 @@ if !key.is_empty() && !token.is_empty() {
                 uuid: uuid.clone(),
                 relay_server: relay_server.clone(),
                 secure,
+                switch_code: switch_code.to_owned(),
                 ..Default::default()
             });
             socket.send(&msg_out).await?;
@@ -1431,6 +1425,10 @@ impl AudioHandler {
 
     /// Handle audio format and create an audio decoder.
     pub fn handle_format(&mut self, f: AudioFormat) {
+        if !is_supported_audio_channel_count(f.channels) {
+            log::error!("Unsupported audio channel count: {}", f.channels);
+            return;
+        }
         match AudioDecoder::new(f.sample_rate, if f.channels > 1 { Stereo } else { Mono }) {
             Ok(d) => {
                 let buffer = vec![0.; f.sample_rate as usize * f.channels as usize];
@@ -1567,6 +1565,23 @@ impl AudioHandler {
         stream.play()?;
         self.audio_stream = Some(Box::new(stream));
         Ok(())
+    }
+}
+
+fn is_supported_audio_channel_count(channels: u32) -> bool {
+    (1..=2).contains(&channels)
+}
+
+#[cfg(test)]
+mod audio_format_tests {
+    use super::is_supported_audio_channel_count;
+
+    #[test]
+    fn only_mono_and_stereo_are_supported() {
+        assert!(is_supported_audio_channel_count(1));
+        assert!(is_supported_audio_channel_count(2));
+        assert!(!is_supported_audio_channel_count(0));
+        assert!(!is_supported_audio_channel_count(u32::MAX));
     }
 }
 
@@ -2680,9 +2695,6 @@ impl LoginConfigHandler {
         os_password: String,
         password: Vec<u8>,
     ) -> Message {
-        #[cfg(any(target_os = "android", target_os = "ios"))]
-        let my_id = Config::get_id_or(crate::DEVICE_ID.lock().unwrap().clone());
-        #[cfg(not(any(target_os = "android", target_os = "ios")))]
         let my_id = Config::get_id();
         let (my_id, pure_id) = if let Some((id, _, _)) = self.other_server.as_ref() {
             let server = Config::get_rendezvous_server();
@@ -3463,9 +3475,55 @@ pub fn handle_login_error(
     }
 }
 
+// "Switch sides" requires the incoming-only client to connect back to its
+// controlling peer; verify the local pending uuid before opening the connection.
 #[cfg(feature = "flutter")]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-async fn consume_local_switch_sides_uuid(id: &str, uuid: &Uuid) -> bool {
+async fn is_switch_sides_back(conn_type: ConnType, interface: &impl Interface) -> bool {
+    if conn_type != ConnType::DEFAULT_CONN {
+        return false;
+    }
+    let (id, uuid) = {
+        let lch = interface.get_lch();
+        let lc = lch.read().unwrap();
+        let Some(uuid) = lc.switch_uuid.as_deref() else {
+            return false;
+        };
+        let Ok(uuid) = Uuid::parse_str(uuid) else {
+            return false;
+        };
+        (lc.id.clone(), uuid)
+    };
+    if !request_local_switch_sides_uuid(
+        &id,
+        &uuid,
+        crate::ipc::SwitchSidesUuidAction::Check,
+    )
+    .await
+    {
+        return false;
+    }
+    let lch = interface.get_lch();
+    let lc = lch.read().unwrap();
+    let current_uuid = lc
+        .switch_uuid
+        .as_deref()
+        .and_then(|value| Uuid::parse_str(value).ok());
+    lc.id == id && current_uuid.as_ref() == Some(&uuid)
+}
+
+#[cfg(not(all(feature = "flutter", not(any(target_os = "android", target_os = "ios")))))]
+async fn is_switch_sides_back(_conn_type: ConnType, _interface: &impl Interface) -> bool {
+    false
+}
+
+#[cfg(feature = "flutter")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+async fn request_local_switch_sides_uuid(
+    id: &str,
+    uuid: &Uuid,
+    action: crate::ipc::SwitchSidesUuidAction,
+) -> bool {
     let Ok(mut conn) = crate::ipc::connect(1000, "").await else {
         return false;
     };
@@ -3474,6 +3532,7 @@ async fn consume_local_switch_sides_uuid(id: &str, uuid: &Uuid) -> bool {
         .send(&crate::ipc::Data::SwitchSidesUuid(
             uuid.clone(),
             id.to_owned(),
+            action,
             None,
         ))
         .await
@@ -3485,9 +3544,10 @@ async fn consume_local_switch_sides_uuid(id: &str, uuid: &Uuid) -> bool {
         Ok(Some(crate::ipc::Data::SwitchSidesUuid(
             returned_uuid,
             returned_id,
+            returned_action,
             Some(true),
         ))) => {
-            returned_uuid == uuid && returned_id == id
+            returned_uuid == uuid && returned_id == id && returned_action == action
         }
         _ => false,
     }
@@ -3508,7 +3568,7 @@ pub async fn handle_hash(
     hash: Hash,
     interface: &impl Interface,
     peer: &mut Stream,
-) {
+) -> bool {
     lc.write().unwrap().hash = hash.clone();
     // Take care of password application order
 
@@ -3520,15 +3580,34 @@ pub async fn handle_hash(
         if let Some(uuid) = uuid {
             if let Ok(uuid) = uuid::Uuid::from_str(&uuid) {
                 let id = lc.read().unwrap().id.clone();
-                if !consume_local_switch_sides_uuid(&id, &uuid).await {
+                if !request_local_switch_sides_uuid(
+                    &id,
+                    &uuid,
+                    crate::ipc::SwitchSidesUuidAction::Consume,
+                )
+                .await
+                {
                     log::warn!("Ignored untrusted switch_uuid");
                 } else {
                     lc.write().unwrap().allow_switch_back_once();
                     send_switch_login_request(lc.clone(), peer, uuid).await;
                     lc.write().unwrap().password_source = Default::default();
-                    return;
+                    return true;
                 }
             }
+        }
+        // Incoming-only may connect out solely for a verified switch-back;
+        // never fall through to password login, including on repeated hashes.
+        if config::is_incoming_only() {
+            interface.msgbox("error", "Connection Error", "Incoming only mode", "");
+            let mut misc = Misc::new();
+            misc.set_close_reason(
+                "Connection not allowed in incoming-only mode".to_owned(),
+            );
+            let mut msg = Message::new();
+            msg.set_misc(misc);
+            allow_err!(peer.send(&msg).await);
+            return false;
         }
     }
     // last password
@@ -3592,7 +3671,7 @@ pub async fn handle_hash(
             interface.msgbox("terminal-admin-login", "", "", "");
         }
         lc.write().unwrap().hash = hash;
-        return;
+        return true;
     }
 
     let password = if password.is_empty() {
@@ -3618,6 +3697,7 @@ pub async fn handle_hash(
 
     send_login(lc.clone(), os_username, os_password, password, peer).await;
     lc.write().unwrap().hash = hash;
+    true
 }
 
 #[inline]
@@ -3745,7 +3825,7 @@ pub trait Interface: Send + Clone + 'static + Sized {
     fn on_error(&self, err: &str) {
         self.msgbox("error", "Error", err, "");
     }
-    async fn handle_hash(&self, pass: &str, hash: Hash, peer: &mut Stream);
+    async fn handle_hash(&self, pass: &str, hash: Hash, peer: &mut Stream) -> bool;
     async fn handle_login_from_ui(
         &self,
         os_username: String,
@@ -3764,6 +3844,16 @@ pub trait Interface: Send + Clone + 'static + Sized {
 
     fn is_force_relay(&self) -> bool {
         self.get_lch().read().unwrap().force_relay
+    }
+
+    fn get_switch_code(&self) -> String {
+        match self.get_lch().read().unwrap().switch_uuid.clone() {
+            Some(u) if !u.is_empty() => {
+                use hbb_common::sodiumoxide::crypto::hash::sha256;
+                crate::encode64(sha256::hash(u.as_bytes()).0)
+            }
+            _ => String::new(),
+        }
     }
 
     fn swap_modifier_mouse(&self, _msg: &mut hbb_common::protos::message::MouseEvent) {}
@@ -4029,7 +4119,23 @@ pub fn check_if_retry(msgtype: &str, title: &str, text: &str, retry_for_relay: b
                 && !text.to_lowercase().contains("mismatch")
                 && !text.to_lowercase().contains("manually")
                 && !text.to_lowercase().contains("restricted")
+                && !text.to_lowercase().contains("incoming only")
                 && !text.to_lowercase().contains("not allowed")))
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::check_if_retry;
+
+    #[test]
+    fn incoming_only_error_is_not_retryable() {
+        assert!(!check_if_retry(
+            "error",
+            "Connection Error",
+            "Incoming only mode",
+            false,
+        ));
+    }
 }
 
 pub async fn hc_connection(

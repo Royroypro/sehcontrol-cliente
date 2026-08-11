@@ -805,6 +805,26 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
 
 [[package]]
+name = "bindgen"
+version = "0.72.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "993776b509cfb49c750f11b8f07a46fa23e0a1386ffc01fb1e7d343efc387895"
+dependencies = [
+ "bitflags 2.9.1",
+ "cexpr",
+ "clang-sys",
+ "itertools 0.12.1",
+ "log",
+ "prettyplease",
+ "proc-macro2 1.0.93",
+ "quote 1.0.36",
+ "regex",
+ "rustc-hash 2.1.1",
+ "shlex",
+ "syn 2.0.98",
+]
+
+[[package]]
 name = "bit_field"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1499,6 +1519,8 @@ dependencies = [
  "compression-core",
  "flate2",
  "memchr",
+ "zstd 0.13.1",
+ "zstd-safe 7.1.0",
 ]
 
 [[package]]
@@ -3869,7 +3891,7 @@ dependencies = [
  "url",
  "users 0.11.0",
  "uuid",
- "webpki-roots 1.0.4",
+ "webpki-roots 1.0.9",
  "webrtc",
  "whoami",
  "winapi 0.3.9",
@@ -4072,7 +4094,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tower-service",
- "webpki-roots 1.0.4",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -7075,7 +7097,7 @@ dependencies = [
 [[package]]
 name = "rdev"
 version = "0.5.0-2"
-source = "git+https://github.com/rustdesk-org/rdev#871bf1c856d6a30af2f56ab8848396a025140855"
+source = "git+https://github.com/rustdesk-org/rdev#23e24dd6b35452a495dae0ae6d99395e9755ab0f"
 dependencies = [
  "cocoa 0.24.1",
  "core-foundation 0.9.4",
@@ -7254,7 +7276,7 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
- "webpki-roots 1.0.4",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
@@ -7355,18 +7377,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "runas"
-version = "1.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b96d6b6c505282b007a9b009f2aa38b2fd0359b81a0430ceacc60f69ade4c6a0"
-dependencies = [
- "libc",
- "security-framework-sys",
- "which",
- "windows-sys 0.48.0",
-]
-
-[[package]]
 name = "rust-ini"
 version = "0.18.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7409,6 +7419,131 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bfa0f585226d2e68097d4f95d113b15b83a82e819ab25717ec0590d9584ef366"
 dependencies = [
  "semver",
+]
+
+[[package]]
+name = "rustdesk"
+version = "1.4.9"
+dependencies = [
+ "android-wakelock",
+ "android_logger",
+ "arboard",
+ "async-process",
+ "async-trait",
+ "bytemuck",
+ "bytes",
+ "cc",
+ "cfg-if 1.0.0",
+ "chrono",
+ "cidr-utils",
+ "clipboard",
+ "clipboard-master",
+ "cocoa 0.24.1",
+ "core-foundation 0.9.4",
+ "core-graphics 0.22.3",
+ "cpal",
+ "crossbeam-queue",
+ "ctrlc",
+ "dasp",
+ "dbus",
+ "dbus-crossroads",
+ "default-net",
+ "dispatch",
+ "docopt",
+ "enigo",
+ "errno",
+ "evdev",
+ "flutter_rust_bridge",
+ "fon",
+ "fontdb",
+ "foreign-types 0.3.2",
+ "fruitbasket",
+ "gtk",
+ "hbb_common",
+ "hex",
+ "hound",
+ "image 0.24.9",
+ "impersonate_system",
+ "include_dir",
+ "jni",
+ "kcp-sys",
+ "keepawake",
+ "lazy_static",
+ "libpulse-binding",
+ "libpulse-simple-binding",
+ "libxdo-sys",
+ "mac_address",
+ "magnum-opus",
+ "nix 0.29.0",
+ "num_cpus",
+ "objc",
+ "objc_id",
+ "once_cell",
+ "openssl",
+ "os-version",
+ "pam",
+ "parity-tokio-ipc",
+ "percent-encoding",
+ "piet",
+ "piet-coregraphics",
+ "portable-pty",
+ "qrcode-generator",
+ "rdev",
+ "remote_printer",
+ "repng",
+ "reqwest",
+ "ringbuf",
+ "rubato",
+ "rust-pulsectl",
+ "samplerate",
+ "sciter-rs",
+ "scrap",
+ "serde 1.0.228",
+ "serde_derive",
+ "serde_json 1.0.118",
+ "serde_repr",
+ "sha2",
+ "shared_memory",
+ "shutdown_hooks",
+ "softbuffer",
+ "stunclient",
+ "sys-locale",
+ "system_shutdown",
+ "tao",
+ "tauri-winrt-notification",
+ "terminfo",
+ "termios 0.3.3",
+ "tiny-skia",
+ "totp-rs",
+ "tray-icon",
+ "ttf-parser",
+ "url",
+ "uuid",
+ "virtual_display",
+ "wallpaper",
+ "winapi 0.3.9",
+ "windows 0.61.1",
+ "windows-service",
+ "winit",
+ "winreg 0.11.0",
+ "winres",
+ "wol-rs",
+ "x11-clipboard 0.8.1",
+ "x11rb 0.12.0",
+ "zip",
+]
+
+[[package]]
+name = "rustdesk-portable-packer"
+version = "1.4.9"
+dependencies = [
+ "brotli",
+ "dirs 5.0.1",
+ "md5",
+ "native-windows-gui",
+ "winapi 0.3.9",
+ "windows 0.61.1",
+ "winres",
 ]
 
 [[package]]
@@ -7628,7 +7763,7 @@ name = "scrap"
 version = "0.5.0"
 dependencies = [
  "android_logger",
- "bindgen 0.65.1",
+ "bindgen 0.72.1",
  "block",
  "cfg-if 1.0.0",
  "dbus",
@@ -9068,7 +9203,7 @@ dependencies = [
  "tokio-native-tls",
  "tokio-rustls",
  "tungstenite",
- "webpki-roots 0.26.9",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -9391,7 +9526,7 @@ dependencies = [
  "sha1",
  "thiserror 2.0.17",
  "utf-8",
- "webpki-roots 0.26.9",
+ "webpki-roots 0.26.11",
 ]
 
 [[package]]
@@ -10079,18 +10214,18 @@ dependencies = [
 
 [[package]]
 name = "webpki-roots"
-version = "0.26.9"
+version = "0.26.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "29aad86cec885cafd03e8305fd727c418e970a521322c91688414d5b8efba16b"
+checksum = "521bc38abb08001b01866da9f51eb7c5d647a19260e00054a8c7fd5f9e57f7a9"
 dependencies = [
- "rustls-pki-types",
+ "webpki-roots 1.0.9",
 ]
 
 [[package]]
 name = "webpki-roots"
-version = "1.0.4"
+version = "1.0.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2878ef029c47c6e8cf779119f20fcf52bde7ad42a731b2a304bc221df17571e"
+checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
 dependencies = [
  "rustls-pki-types",
 ]

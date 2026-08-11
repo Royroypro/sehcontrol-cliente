@@ -1,4 +1,8 @@
 #include <dlfcn.h>
+#include <limits.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
 #include "my_application.h"
 
 #define RUSTDESK_LIB_PATH "sehcontrol.so"
@@ -7,8 +11,36 @@ bool gIsConnectionManager = false;
 
 void print_help_install_pkg(const char* so);
 
+// The bundle keeps the core library at lib/sehcontrol.so next to the
+// executable. Resolve that path explicitly instead of relying on the
+// runner's RPATH, which repackaged installs may strip.
+// https://github.com/rustdesk/rustdesk/discussions/14407
+static void* dlopen_bundled_lib() {
+  char exe_path[PATH_MAX];
+  ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
+  if (len <= 0 || len >= (ssize_t)(sizeof(exe_path) - 1)) return nullptr;
+  exe_path[len] = '\0';
+  char* last_slash = strrchr(exe_path, '/');
+  if (last_slash == nullptr) return nullptr;
+  *last_slash = '\0';
+  char lib_path[PATH_MAX + sizeof("/lib/" RUSTDESK_LIB_PATH)];
+  snprintf(lib_path, sizeof(lib_path), "%s/lib/%s", exe_path, RUSTDESK_LIB_PATH);
+  if (access(lib_path, F_OK) != 0) return nullptr;
+  void* sehcontrol = dlopen(lib_path, RTLD_LAZY);
+  if (!sehcontrol) {
+    char* error = dlerror();
+    if (error != nullptr) {
+      fprintf(stderr, "Failed to load \"%s\": %s\n", lib_path, error);
+    }
+  }
+  return sehcontrol;
+}
+
 bool flutter_rustdesk_core_main() {
-   void* sehcontrol = dlopen(RUSTDESK_LIB_PATH, RTLD_LAZY);
+   void* sehcontrol = dlopen_bundled_lib();
+   if (!sehcontrol) {
+      sehcontrol = dlopen(RUSTDESK_LIB_PATH, RTLD_LAZY);
+   }
    if (!sehcontrol) {
       fprintf(stderr,"Failed to load \"sehcontrol.so\"\n");
       char* error;

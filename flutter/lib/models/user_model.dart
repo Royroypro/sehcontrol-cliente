@@ -71,7 +71,6 @@ class UserModel {
   final RxString avatar = ''.obs;
   final RxBool isAdmin = false.obs;
   final RxString networkError = ''.obs;
-
   // Membership/license gating (Sehcontrol membership panel integration).
   // Cosmetic only: the real enforcement lives server-side in hbbs.
   final RxBool membershipBlocked = false.obs;
@@ -101,6 +100,9 @@ class UserModel {
   RealtimeChannelController? _realtimeController;
   ScreenCamPreviewLifecycleDispatcher? _previewLifecycle;
 
+  // True when networkError carries a server-reported error rather than a
+  // connectivity failure; netWorkErrorWidget hides the network tip then.
+  final RxBool networkErrorFromServer = false.obs;
   bool get isLogin => userName.isNotEmpty;
   String get displayNameOrUserName =>
       displayName.value.trim().isEmpty ? userName.value : displayName.value;
@@ -131,6 +133,7 @@ class UserModel {
   void refreshCurrentUser() async {
     if (bind.isDisableAccount()) return;
     networkError.value = '';
+    networkErrorFromServer.value = false;
     final token = bind.mainGetLocalOption(key: 'access_token');
     if (token == '') {
       await updateOtherModels();
@@ -166,6 +169,10 @@ class UserModel {
       final data = json.decode(decode_http_response(response));
       final error = data['error'];
       if (error != null) {
+        // The only failure known to come from the server itself, so the
+        // check-your-network tip does not apply. Flag before the message is
+        // set in the catch below so rebuilds read a consistent pair.
+        networkErrorFromServer.value = true;
         throw error;
       }
 
@@ -182,6 +189,13 @@ class UserModel {
       // transport failures.
       if (bind.mainGetLocalOption(key: 'access_token').isNotEmpty) {
         startMembershipPolling();
+      }
+      // Surface failures in the address book / group tabs, which offer a
+      // retry. Anything not flagged above -- transport errors, non-JSON or
+      // unexpected-schema bodies (e.g. a filter's block page) -- keeps the
+      // check-your-network tip.
+      if (networkError.value.isEmpty) {
+        networkError.value = e.toString();
       }
     } finally {
       refreshingUser = false;
@@ -984,29 +998,33 @@ class UserModel {
     return result.applied;
   }
 
+  /// Throws on network failures, non-success responses, and invalid response
+  /// data. Returns an empty list when no API server is configured or a
+  /// successful response contains no third-party login options.
   static Future<List<dynamic>> queryOidcLoginOptions() async {
-    try {
-      final url = await bind.mainGetApiServer();
-      if (url.trim().isEmpty) return [];
-      final resp = await http.get(Uri.parse('$url/api/login-options'));
-      final List<String> ops = [];
-      for (final item in jsonDecode(resp.body)) {
-        ops.add(item as String);
-      }
-      for (final item in ops) {
-        if (item.startsWith('common-oidc/')) {
-          return jsonDecode(item.substring('common-oidc/'.length));
-        }
-      }
-      return ops
-          .where((item) => item.startsWith('oidc/'))
-          .map((item) => {'name': item.substring('oidc/'.length)})
-          .toList();
-    } catch (e) {
-      debugPrint(
-          "queryOidcLoginOptions: jsonDecode resp body failed: ${e.toString()}");
-      return [];
+    final url = await bind.mainGetApiServer();
+    if (url.trim().isEmpty) return [];
+    final resp = await http.get(Uri.parse('$url/api/login-options'));
+    const successStatusCodeStart = 200;
+    const successStatusCodeEnd = 300;
+    if (resp.statusCode < successStatusCodeStart ||
+        resp.statusCode >= successStatusCodeEnd) {
+      throw RequestException(
+          resp.statusCode, resp.reasonPhrase ?? 'Request failed');
     }
+    final List<String> ops = [];
+    for (final item in jsonDecode(resp.body)) {
+      ops.add(item as String);
+    }
+    for (final item in ops) {
+      if (item.startsWith('common-oidc/')) {
+        return jsonDecode(item.substring('common-oidc/'.length));
+      }
+    }
+    return ops
+        .where((item) => item.startsWith('oidc/'))
+        .map((item) => {'name': item.substring('oidc/'.length)})
+        .toList();
   }
 }
 

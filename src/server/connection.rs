@@ -73,8 +73,16 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use crate::virtual_display_manager;
 pub type Sender = mpsc::UnboundedSender<(Instant, Arc<Message>)>;
 
+const FAILURE_IDX_ID_WHITELIST: usize = 2;
+// How long a rejection counts, so also how long a blocked address stays blocked. Longer
+// throttles enumeration harder; shorter limits collateral on whitelisted neighbours.
+const ID_WHITELIST_FAILURE_DECAY_MINUTES: i32 = 10;
+
 lazy_static::lazy_static! {
-    static ref LOGIN_FAILURES: [Arc::<Mutex<HashMap<String, (i32, i32, i32)>>>; 2] = Default::default();
+    // [0] password, [1] 2FA, [2] ID whitelist.
+    // Bucket 2 is separate so its rejections do not touch the password / 2FA budgets. It is
+    // decayed in `check_id_whitelist` and cleared on auth, never on a bare id match.
+    static ref LOGIN_FAILURES: [Arc::<Mutex<HashMap<String, (i32, i32, i32)>>>; 3] = Default::default();
     static ref SESSIONS: Arc::<Mutex<HashMap<SessionKey, Session>>> = Default::default();
     static ref ALIVE_CONNS: Arc::<Mutex<Vec<i32>>> = Default::default();
     pub static ref AUTHED_CONNS: Arc::<Mutex<Vec<AuthedConn>>> = Default::default();
@@ -85,9 +93,13 @@ lazy_static::lazy_static! {
 
 #[cfg(feature = "flutter")]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
+const SWITCH_SIDES_UUID_TTL: Duration = Duration::from_secs(10);
+
+#[cfg(feature = "flutter")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 lazy_static::lazy_static! {
     static ref SWITCH_SIDES_UUID: Arc::<Mutex<HashMap<String, (Instant, uuid::Uuid)>>> = Default::default();
-    static ref PENDING_SWITCH_SIDES_UUID: Arc::<Mutex<HashMap<String, (Instant, uuid::Uuid)>>> = Default::default();
+    static ref PENDING_SWITCH_SIDES_UUID: Arc::<Mutex<HashMap<String, (Instant, uuid::Uuid, bool)>>> = Default::default();
 }
 
 #[cfg(target_os = "windows")]
@@ -317,6 +329,7 @@ pub struct Connection {
     tx_to_cm: mpsc::UnboundedSender<ipc::Data>,
     authorized: bool,
     require_2fa: Option<totp_rs::TOTP>,
+    awaiting_2fa: bool,
     keyboard: bool,
     clipboard: bool,
     audio: bool,
@@ -354,6 +367,9 @@ pub struct Connection {
     server_audit_file: String,
     controlled_context: Option<ControlledContext>,
     lr: LoginRequest,
+    // Authentication retries may update credentials, but not the requested session scope.
+    // A digest, so no peer-controlled strings are retained.
+    login_scope: Option<[u8; 32]>,
     peer_argb: u32,
     session_last_recv_time: Option<Arc<Mutex<Instant>>>,
     chat_unanswered: bool,
@@ -503,7 +519,10 @@ impl Connection {
                 tx_video: Some(tx_video),
             },
             require_2fa: crate::auth_2fa::get_2fa(None),
-            display_idx: *display_service::PRIMARY_DISPLAY_IDX,
+            awaiting_2fa: false,
+            // Defer display enumeration until login succeeds. Monitor login replaces this
+            // with the primary index returned with the refreshed display snapshot.
+            display_idx: 0,
             stream,
             server,
             hash,
@@ -548,6 +567,7 @@ impl Connection {
             server_audit_file: "".to_owned(),
             controlled_context,
             lr: Default::default(),
+            login_scope: None,
             peer_argb: 0u32,
             session_last_recv_time: None,
             chat_unanswered: false,
@@ -1373,6 +1393,64 @@ impl Connection {
         true
     }
 
+    async fn check_id_whitelist(&mut self) -> bool {
+        let id_whitelist: Vec<String> = Config::get_option(keys::OPTION_ID_WHITELIST)
+            .split(',')
+            .map(|x| x.trim().to_owned())
+            .filter(|x| !x.is_empty())
+            .collect();
+        if id_whitelist.is_empty() {
+            return true;
+        }
+        // Limit before matching, or a match returning early would never touch the counter and
+        // leave enumeration unthrottled. Not cleared here: `my_id` is self-reported, so that
+        // would let anyone holding one allowed id reset the budget between probes.
+        self.decay_id_whitelist_failures();
+        let (failure, res) = self.check_failure(FAILURE_IDX_ID_WHITELIST).await;
+        if !res {
+            return false;
+        }
+        if id_whitelist_allows(&id_whitelist, &self.lr.my_id) {
+            return true;
+        }
+        self.update_failure(failure, false, FAILURE_IDX_ID_WHITELIST);
+        self.send_login_error("Your ID is blocked by the peer")
+            .await;
+        self.post_alarm_audit(
+            AlarmAuditType::IdWhitelist,
+            json!({ "id": self.lr.my_id.clone(), "ip": self.ip.clone(), "name": self.lr.my_name.clone() }),
+        );
+        false
+    }
+
+    // What `check_failure` consults: the source address, plus shared IPv6 prefixes.
+    fn failure_keys(&self) -> Vec<String> {
+        let mut keys = vec![self.ip.clone()];
+        if let Some((p64, p56, p48)) = self.get_ipv6_prefixes() {
+            keys.extend([p64, p56, p48]);
+        }
+        keys
+    }
+
+    // Only this connection's own keys, so it stays O(1) instead of scanning the map.
+    fn decay_id_whitelist_failures(&self) {
+        decay_stale_failures(
+            &mut LOGIN_FAILURES[FAILURE_IDX_ID_WHITELIST].lock().unwrap(),
+            &self.failure_keys(),
+            (get_time() / 60_000) as i32,
+            ID_WHITELIST_FAILURE_DECAY_MINUTES,
+        );
+    }
+
+    // Not `update_failure(.., true, ..)`: it no-ops when the peer's own address has no entry,
+    // normal on IPv6, leaving the shared prefixes that are what actually block it.
+    fn clear_id_whitelist_failures(&self) {
+        clear_failures(
+            &mut LOGIN_FAILURES[FAILURE_IDX_ID_WHITELIST].lock().unwrap(),
+            &self.failure_keys(),
+        );
+    }
+
     async fn on_open(&mut self, addr: SocketAddr) -> bool {
         log::debug!("#{} Connection opened from {}.", self.inner.id, addr);
         if !self.check_whitelist(&addr).await {
@@ -1436,6 +1514,8 @@ impl Connection {
         v["uuid"] = json!(crate::encode64(hbb_common::get_uuid()));
         v["conn_id"] = json!(self.inner.id);
         v["session_id"] = json!(self.lr.session_id);
+        // Unique per record; the api server dedups retried posts by it.
+        v["nonce"] = json!(uuid::Uuid::new_v4().to_string());
         allow_err!(self.tx_post_seq.send((url, v)));
     }
 
@@ -1485,6 +1565,7 @@ impl Connection {
             "path":path,
             "is_file":is_file,
             "info":json!(info).to_string(),
+            "nonce": uuid::Uuid::new_v4().to_string(),
         });
         tokio::spawn(async move {
             allow_err!(Self::post_audit_async(url, v).await);
@@ -1506,7 +1587,8 @@ impl Connection {
         v["typ"] = json!(typ as i8);
         v["info"] = serde_json::Value::String(info.to_string());
         v["conn_id"] = json!(self.inner.id());
-        if typ == AlarmAuditType::IpWhitelist {
+        v["nonce"] = json!(uuid::Uuid::new_v4().to_string());
+        if typ == AlarmAuditType::IpWhitelist || typ == AlarmAuditType::IdWhitelist {
             if let Some(audit_ref) = self.conn_audit_ref() {
                 v["conn_audit_ref"] = json!(audit_ref);
             }
@@ -1533,9 +1615,103 @@ impl Connection {
         );
     }
 
-    #[inline]
     async fn post_audit_async(url: String, v: Value) -> ResultType<String> {
-        crate::post_request(url, v.to_string(), "").await
+        // Audit records are compliance evidence; retry transport errors and
+        // 5xx (e.g. a reverse proxy answering while the api server restarts)
+        // so transient failures don't silently drop them. A 4xx is a
+        // deterministic rejection and fails immediately.
+        //
+        // The delays, not the attempt count, are what cover the case this exists
+        // for: a proxy answering 502 during a restart fails fast, so without them
+        // every attempt lands within a few seconds and none outlives the restart.
+        //
+        // The window is bounded on the other side: the api server only remembers a
+        // record's nonce for five minutes, so a retry arriving after that expired
+        // would be stored a second time. Counting attempts cannot bound it - one
+        // attempt is already up to 84s (post_request_ retries the TLS handshake up
+        // to four times at 12s each, then the TCP-proxy fallback adds 36s), and a
+        // suspend between attempts stretches the wall clock without limit. So stop
+        // by elapsed time instead, early enough that the last attempt still lands
+        // inside the server's window.
+        const RETRY_DEADLINE: Duration = Duration::from_secs(120);
+        // One delay per retry, so the attempt count follows from the table and the
+        // two cannot drift apart.
+        const RETRY_BACKOFF_SECS: [u64; 2] = [10, 30];
+        const ATTEMPTS: usize = RETRY_BACKOFF_SECS.len() + 1;
+        let body = v.to_string();
+        let started = Instant::now();
+        let mut attempt = 0usize;
+        loop {
+            attempt += 1;
+            let (retryable, err) =
+                match crate::post_request_with_status(url.clone(), body.clone(), "").await {
+                    Ok((status, text)) => {
+                        if (200..300).contains(&status) {
+                            // Success is an empty body. hbbs reports handler
+                            // failures (e.g. a db write error) as 200 with an
+                            // {"error": ...} body - retryable: the server
+                            // releases the record's nonce when its write fails,
+                            // so trying again is what stores the record. Any
+                            // other nonempty body did not come from the audit
+                            // handler (a proxy interposing a 2xx maintenance
+                            // page, a malformed error) and must not be mistaken
+                            // for storage, so it is retried rather than dropped.
+                            if text.trim().is_empty() {
+                                return Ok(text);
+                            }
+                            let server_err = serde_json::from_str::<Value>(&text)
+                                .ok()
+                                .and_then(|v| v.get("error")?.as_str().map(|s| s.to_owned()))
+                                .filter(|e| !e.is_empty());
+                            let (label, detail) = match &server_err {
+                                Some(e) => ("server error", e.as_str()),
+                                None => ("unexpected response body", text.as_str()),
+                            };
+                            let brief: String = detail.chars().take(128).collect();
+                            (true, format!("{}: {}", label, brief))
+                        } else {
+                            let brief: String = text.chars().take(128).collect();
+                            // 408 and 429 are the transient 4xx: the request timed
+                            // out upstream, or a proxy is shedding load. Every other
+                            // 4xx is a deterministic rejection and retrying it would
+                            // only delay the log line.
+                            let transient = status >= 500 || status == 408 || status == 429;
+                            (transient, format!("status {}: {}", status, brief))
+                        }
+                    }
+                    Err(e) => (true, e.to_string()),
+                };
+            let elapsed = started.elapsed();
+            if !retryable || attempt >= ATTEMPTS || elapsed >= RETRY_DEADLINE {
+                log::error!(
+                    "Audit post dropped (attempt {}/{}, {:?} elapsed): {}",
+                    attempt,
+                    ATTEMPTS,
+                    elapsed,
+                    err
+                );
+                bail!("{}", err);
+            }
+            log::warn!(
+                "Audit post failed (attempt {}/{}): {}",
+                attempt,
+                ATTEMPTS,
+                err
+            );
+            // In range by construction: the guard above returns at ATTEMPTS.
+            time::sleep(Duration::from_secs(RETRY_BACKOFF_SECS[attempt - 1])).await;
+            // Re-checked after the delay so no attempt starts past the deadline;
+            // the check above alone would let one begin up to a backoff later.
+            if started.elapsed() >= RETRY_DEADLINE {
+                log::error!(
+                    "Audit post dropped (attempt {}/{}, deadline passed during backoff): {}",
+                    attempt,
+                    ATTEMPTS,
+                    err
+                );
+                bail!("{}", err);
+            }
+        }
     }
 
     fn set_conn_audit_primary_auth(&mut self, method: ConnAuditPrimaryAuth) {
@@ -1644,10 +1820,12 @@ impl Connection {
                     });
                 }
             });
+            self.awaiting_2fa = true;
             self.send_login_error(crate::client::REQUIRE_2FA).await;
             // Keep the connection alive so the client can continue with 2FA.
             return true;
         }
+        self.awaiting_2fa = false;
         if let Some(keep_alive) = self.prepare_terminal_login_for_authorization().await {
             return keep_alive;
         }
@@ -1655,6 +1833,9 @@ impl Connection {
             return false;
         }
         self.authorized = true;
+        // Releases the budget `check_id_whitelist` charges against this address: only a peer
+        // that got this far proved more than a self-reported id.
+        self.clear_id_whitelist_failures();
         let (conn_type, auth_conn_type) = if self.file_transfer.is_some() {
             (1, AuthConnType::FileTransfer)
         } else if self.port_forward_socket.is_some() {
@@ -1891,13 +2072,15 @@ impl Connection {
                 Err(err) => {
                     res.set_error(format!("{}", err));
                 }
-                Ok(displays) => {
+                Ok((displays, primary_display_idx)) => {
                     // For compatibility with old versions, we need to send the displays to the peer.
                     // But the displays may be updated later, before creating the video capturer.
                     #[cfg(target_os = "macos")]
                     {
                         self.retina.set_displays(&displays);
                     }
+                    // A separate primary lookup here could race with display hot-plug.
+                    self.display_idx = primary_display_idx;
                     pi.displays = displays;
                     pi.current_display = self.display_idx as _;
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -2006,8 +2189,8 @@ impl Connection {
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 let _h = try_start_record_cursor_pos();
                 self.auto_disconnect_timer = Self::get_auto_disconenct_timer();
-                s.try_add_primay_video_service();
-                s.add_connection(self.inner.clone(), &noperms);
+                s.try_add_monitor_service(self.display_idx);
+                s.add_monitor_connection(self.inner.clone(), &noperms, self.display_idx);
             }
         }
     }
@@ -2446,6 +2629,90 @@ impl Connection {
         self.terminal_persistent = false;
     }
 
+    // Approval and whitelist decisions must stay bound to the same controller identity and
+    // session scope across authentication retries.
+    fn login_scope_digest(lr: &LoginRequest) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        // Length-prefixed so adjacent fields cannot alias.
+        let mut push = |bytes: &[u8]| {
+            hasher.update((bytes.len() as u64).to_le_bytes());
+            hasher.update(bytes);
+        };
+        push(lr.my_id.as_bytes());
+        // Payloads are destructured exhaustively: a new field fails to compile until it is
+        // either latched here or deliberately ignored.
+        match lr.union.as_ref() {
+            Some(login_request::Union::FileTransfer(ft)) => {
+                let FileTransfer {
+                    dir,
+                    show_hidden,
+                    special_fields: _,
+                } = ft;
+                push(b"file_transfer");
+                push(dir.as_bytes());
+                push(&[*show_hidden as u8]);
+            }
+            Some(login_request::Union::ViewCamera(vc)) => {
+                let ViewCamera { special_fields: _ } = vc;
+                push(b"view_camera");
+            }
+            Some(login_request::Union::Terminal(t)) => {
+                let Terminal {
+                    service_id,
+                    special_fields: _,
+                } = t;
+                push(b"terminal");
+                push(service_id.as_bytes());
+            }
+            Some(login_request::Union::PortForward(pf)) => {
+                let PortForward {
+                    host,
+                    port,
+                    special_fields: _,
+                } = pf;
+                push(b"port_forward");
+                push(host.as_bytes());
+                push(&port.to_le_bytes());
+            }
+            // Variants this build does not know execute as remote, so they latch as remote.
+            None | Some(_) => push(b"remote"),
+        }
+        hasher.finalize().into()
+    }
+
+    // Logging only; security decisions compare digests.
+    fn login_scope_kind(lr: &LoginRequest) -> &'static str {
+        match lr.union.as_ref() {
+            Some(login_request::Union::FileTransfer(_)) => "file_transfer",
+            Some(login_request::Union::ViewCamera(_)) => "view_camera",
+            Some(login_request::Union::Terminal(_)) => "terminal",
+            Some(login_request::Union::PortForward(_)) => "port_forward",
+            _ => "remote",
+        }
+    }
+
+    async fn check_login_scope(&mut self, lr: &LoginRequest) -> bool {
+        let requested = Self::login_scope_digest(lr);
+        match self.login_scope {
+            Some(initial) if initial != requested => {
+                // self.lr still holds the first accepted request, whose scope is the latched one.
+                log::warn!(
+                    "Rejected login scope change: conn_id={}, initial={}, requested={}",
+                    self.inner.id(),
+                    Self::login_scope_kind(&self.lr),
+                    Self::login_scope_kind(lr),
+                );
+                self.send_login_error("Connection not allowed").await;
+                false
+            }
+            Some(_) => true,
+            None => {
+                self.login_scope = Some(requested);
+                true
+            }
+        }
+    }
+
     async fn handle_login_request_without_validation(&mut self, lr: &LoginRequest) {
         self.lr = lr.clone();
         self.peer_argb = crate::str2color(&format!("{}{}", &lr.my_id, &lr.my_platform), 0xff);
@@ -2523,11 +2790,18 @@ impl Connection {
         }
         // After handling CloseReason messages, proceed to process other message types
         if let Some(message::Union::LoginRequest(lr)) = msg.union {
+            if !self.check_login_scope(&lr).await {
+                return false;
+            }
+            self.awaiting_2fa = false;
             self.handle_login_request_without_validation(&lr).await;
             if self.authorized {
                 return true;
             }
             self.reset_session_scope_for_login();
+            if !self.check_id_whitelist().await {
+                return false;
+            }
             match lr.union {
                 Some(login_request::Union::FileTransfer(ft)) => {
                     if !Self::permission(
@@ -2752,6 +3026,11 @@ impl Connection {
                 }
             }
         } else if let Some(message::Union::Auth2fa(tfa)) = msg.union {
+            // A 2FA response may arrive after click authorization has completed.
+            // Ignore it unless this connection is still waiting for the response.
+            if !self.awaiting_2fa {
+                return true;
+            }
             let (failure, res) = self.check_failure(1).await;
             if !res {
                 return true;
@@ -2807,15 +3086,28 @@ impl Connection {
             #[cfg(feature = "flutter")]
             #[cfg(not(any(target_os = "android", target_os = "ios")))]
             if let Some(lr) = _s.lr.clone().take() {
-                self.handle_login_request_without_validation(&lr).await;
                 SWITCH_SIDES_UUID
                     .lock()
                     .unwrap()
-                    .retain(|_, v| v.0.elapsed() < Duration::from_secs(10));
+                    .retain(|_, v| v.0.elapsed() < SWITCH_SIDES_UUID_TTL);
                 let uuid_old = SWITCH_SIDES_UUID.lock().unwrap().remove(&lr.my_id);
                 if let Ok(uuid) = uuid::Uuid::from_slice(_s.uuid.to_vec().as_ref()) {
                     if let Some((_instant, uuid_old)) = uuid_old {
                         if uuid == uuid_old {
+                            if lr.union.is_some() {
+                                log::warn!(
+                                    "Rejected switch sides response for non-remote-desktop session; closing connection"
+                                );
+                                self.send_login_error("Connection not allowed").await;
+                                return false;
+                            }
+                            self.reset_session_scope_for_login();
+                            self.handle_login_request_without_validation(&lr).await;
+                            // Switching sides authorizes without a password, so it must not bypass
+                            // the whitelist, which can be a locked policy pushed by the server.
+                            if !self.check_id_whitelist().await {
+                                return false;
+                            }
                             self.from_switch = true;
                             self.set_conn_audit_primary_auth(ConnAuditPrimaryAuth::SwitchSides);
                             if !self.send_logon_response_and_keep_alive().await {
@@ -3537,17 +3829,18 @@ impl Connection {
                     #[cfg(not(any(target_os = "android", target_os = "ios")))]
                     Some(misc::Union::SwitchSidesRequest(s)) => {
                         if let Ok(uuid) = uuid::Uuid::from_slice(&s.uuid.to_vec()[..]) {
-                            crate::server::insert_pending_switch_sides_uuid(
+                            if crate::server::insert_pending_switch_sides_uuid(
                                 self.lr.my_id.clone(),
                                 uuid.clone(),
-                            );
-                            crate::run_me(vec![
-                                "--connect",
-                                &self.lr.my_id,
-                                "--switch_uuid",
-                                uuid.to_string().as_ref(),
-                            ])
-                            .ok();
+                            ) {
+                                crate::run_me(vec![
+                                    "--connect",
+                                    &self.lr.my_id,
+                                    "--switch_uuid",
+                                    uuid.to_string().as_ref(),
+                                ])
+                                .ok();
+                            }
                             self.on_close("switch sides", false).await;
                             return false;
                         }
@@ -4142,7 +4435,9 @@ impl Connection {
         let display_idx = s.display as usize;
         if self.display_idx != display_idx {
             if let Some(server) = self.server.upgrade() {
-                self.switch_display_to(display_idx, server.clone());
+                if !self.switch_display_to(display_idx, server.clone()) {
+                    return;
+                }
 
                 #[cfg(not(any(target_os = "android", target_os = "ios")))]
                 if !self.view_camera && s.width != 0 && s.height != 0 {
@@ -4169,6 +4464,13 @@ impl Connection {
         }
     }
 
+    fn video_source_count(video_source: VideoSource) -> usize {
+        match video_source {
+            VideoSource::Monitor => display_service::get_sync_displays().len(),
+            VideoSource::Camera => camera::Cameras::get_sync_cameras().len(),
+        }
+    }
+
     fn video_source(&self) -> VideoSource {
         if self.view_camera {
             VideoSource::Camera
@@ -4177,18 +4479,28 @@ impl Connection {
         }
     }
 
-    fn switch_display_to(&mut self, display_idx: usize, server: Arc<RwLock<Server>>) {
+    fn switch_display_to(&mut self, display_idx: usize, server: Arc<RwLock<Server>>) -> bool {
+        let source_count = Self::video_source_count(self.video_source());
+        if display_idx >= source_count {
+            // Do not remap an explicit switch: its resolution belongs to the requested source.
+            log::warn!(
+                "Ignore switch to invalid {:?} index {}, available source count: {}",
+                self.video_source(),
+                display_idx,
+                source_count
+            );
+            return false;
+        }
+
         let new_service_name = video_service::get_service_name(self.video_source(), display_idx);
         let old_service_name =
             video_service::get_service_name(self.video_source(), self.display_idx);
         let mut lock = server.write().unwrap();
-        if display_idx != *display_service::PRIMARY_DISPLAY_IDX {
-            if !lock.contains(&new_service_name) {
-                lock.add_service(Box::new(video_service::new(
-                    self.video_source(),
-                    display_idx,
-                )));
-            }
+        if !lock.contains(&new_service_name) {
+            lock.add_service(Box::new(video_service::new(
+                self.video_source(),
+                display_idx,
+            )));
         }
         // For versions greater than 1.2.4, a `CaptureDisplays` message will be sent immediately.
         // Unnecessary capturers will be removed then.
@@ -4197,6 +4509,7 @@ impl Connection {
         }
         lock.subscribe(&new_service_name, self.inner.clone(), true);
         self.display_idx = display_idx;
+        true
     }
 
     #[cfg(windows)]
@@ -4223,26 +4536,61 @@ impl Connection {
 
     async fn capture_displays(&mut self, add: &[usize], sub: &[usize], set: &[usize]) {
         let video_source = self.video_source();
-        if let Some(sever) = self.server.upgrade() {
-            let mut lock = sever.write().unwrap();
-            for display in add.iter() {
+        let source_count = Self::video_source_count(video_source);
+        // Only add/set can create services; sub only narrows existing subscriptions.
+        let valid_add = add
+            .iter()
+            .copied()
+            .filter(|display| *display < source_count)
+            .collect::<Vec<_>>();
+        let valid_sub = sub
+            .iter()
+            .copied()
+            .filter(|display| *display < source_count)
+            .collect::<Vec<_>>();
+        let valid_set = set
+            .iter()
+            .copied()
+            .filter(|display| *display < source_count)
+            .collect::<Vec<_>>();
+        let invalid_count =
+            add.len() + sub.len() + set.len() - valid_add.len() - valid_sub.len() - valid_set.len();
+        if invalid_count != 0 {
+            log::warn!(
+                "Ignore {} invalid {:?} indices, available source count: {}",
+                invalid_count,
+                video_source,
+                source_count
+            );
+        }
+        // Passing an invalid sub request as an empty exclude list would unsubscribe all services.
+        if (!add.is_empty() && valid_add.is_empty())
+            || (add.is_empty() && !sub.is_empty() && valid_sub.is_empty())
+            || (add.is_empty() && sub.is_empty() && !set.is_empty() && valid_set.is_empty())
+        {
+            return;
+        }
+
+        if let Some(server) = self.server.upgrade() {
+            let mut lock = server.write().unwrap();
+            for display in valid_add.iter() {
                 let service_name = video_service::get_service_name(video_source, *display);
                 if !lock.contains(&service_name) {
                     lock.add_service(Box::new(video_service::new(video_source, *display)));
                 }
             }
-            for display in set.iter() {
+            for display in valid_set.iter() {
                 let service_name = video_service::get_service_name(video_source, *display);
                 if !lock.contains(&service_name) {
                     lock.add_service(Box::new(video_service::new(video_source, *display)));
                 }
             }
             if !add.is_empty() {
-                lock.capture_displays(self.inner.clone(), video_source, add, true, false);
+                lock.capture_displays(self.inner.clone(), video_source, &valid_add, true, false);
             } else if !sub.is_empty() {
-                lock.capture_displays(self.inner.clone(), video_source, sub, false, true);
+                lock.capture_displays(self.inner.clone(), video_source, &valid_sub, false, true);
             } else {
-                lock.capture_displays(self.inner.clone(), video_source, set, true, true);
+                lock.capture_displays(self.inner.clone(), video_source, &valid_set, true, true);
             }
             self.multi_ui_session = lock.get_subbed_displays_count(self.inner.id()) > 1;
             if self.follow_remote_window {
@@ -5656,6 +6004,7 @@ impl Connection {
             Some(misc::Union::ChangeDisplayResolution(_)) => "misc.change_display_resolution",
             Some(misc::Union::MessageQuery(_)) => "misc.message_query",
             Some(misc::Union::FollowCurrentDisplay(_)) => "misc.follow_current_display",
+            Some(misc::Union::SwitchSidesRequest(_)) => "misc.switch_sides_request",
             Some(_) => "misc.other",
             None => "misc.empty",
         }
@@ -5795,23 +6144,40 @@ pub fn insert_switch_sides_uuid(id: String, uuid: uuid::Uuid) {
 
 #[cfg(feature = "flutter")]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn insert_pending_switch_sides_uuid(id: String, uuid: uuid::Uuid) {
+pub fn insert_pending_switch_sides_uuid(id: String, uuid: uuid::Uuid) -> bool {
     let mut uuids = PENDING_SWITCH_SIDES_UUID.lock().unwrap();
-    uuids.retain(|_, (instant, _)| instant.elapsed() < Duration::from_secs(10));
-    uuids.insert(id, (tokio::time::Instant::now(), uuid));
+    uuids.retain(|_, (instant, _, _)| instant.elapsed() < SWITCH_SIDES_UUID_TTL);
+    if uuids.get(&id).map(|(_, stored_uuid, _)| stored_uuid) == Some(&uuid) {
+        return false;
+    }
+    uuids.insert(id, (tokio::time::Instant::now(), uuid, false));
+    true
 }
 
 #[cfg(feature = "flutter")]
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
-pub fn remove_pending_switch_sides_uuid(id: &str, uuid: &uuid::Uuid) -> bool {
+pub fn has_pending_switch_sides_uuid(id: &str, uuid: &uuid::Uuid) -> bool {
     let mut uuids = PENDING_SWITCH_SIDES_UUID.lock().unwrap();
-    uuids.retain(|_, (instant, _)| instant.elapsed() < Duration::from_secs(10));
-    if uuids.get(id).map(|(_, stored_uuid)| stored_uuid == uuid) == Some(true) {
-        uuids.remove(id);
-        true
-    } else {
-        false
+    uuids.retain(|_, (instant, _, _)| instant.elapsed() < SWITCH_SIDES_UUID_TTL);
+    uuids
+        .get(id)
+        .map(|(_, stored_uuid, claimed)| stored_uuid == uuid && !*claimed)
+        == Some(true)
+}
+
+#[cfg(feature = "flutter")]
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
+pub fn claim_pending_switch_sides_uuid(id: &str, uuid: &uuid::Uuid) -> bool {
+    let mut uuids = PENDING_SWITCH_SIDES_UUID.lock().unwrap();
+    uuids.retain(|_, (instant, _, _)| instant.elapsed() < SWITCH_SIDES_UUID_TTL);
+    // Keep claimed entries until expiry so replaying a request cannot launch another connection.
+    if let Some((_, stored_uuid, claimed)) = uuids.get_mut(id) {
+        if stored_uuid == uuid && !*claimed {
+            *claimed = true;
+            return true;
+        }
     }
+    false
 }
 
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
@@ -6057,6 +6423,7 @@ pub enum AlarmAuditType {
     TerminalOsLoginBackoff = 7,
     TerminalOsLoginConcurrency = 8,
     SessionScopeViolation = 9,
+    IdWhitelist = 10,
 }
 
 pub enum FileAuditType {
@@ -6674,10 +7041,292 @@ mod raii {
     }
 }
 
+// An empty whitelist allows everyone.
+//
+// A peer connecting across servers reports `<its id>@<its own server>` (see
+// `create_login_msg`), so the bare id is matched as well. That suffix is self-asserted and
+// unsigned, so matching only the full form would reject the honest cross-server peer while
+// an attacker just reports the bare id: it can produce false rejects but no true ones.
+fn id_whitelist_allows(id_whitelist: &[String], my_id: &str) -> bool {
+    if id_whitelist.is_empty() {
+        return true;
+    }
+    let bare_id = my_id.split('@').next().unwrap_or(my_id);
+    id_whitelist
+        .iter()
+        .any(|x| wildcard_match(x, my_id) || wildcard_match(x, bare_id))
+}
+
+// Drop `keys` whose last failure (`.0`, in minutes) is at least `window` old. A backwards
+// clock gives a negative age and keeps the entry, so it never widens access.
+fn decay_stale_failures(
+    failures: &mut HashMap<String, (i32, i32, i32)>,
+    keys: &[String],
+    now: i32,
+    window: i32,
+) {
+    for key in keys {
+        if failures
+            .get(key)
+            .is_some_and(|v| now.saturating_sub(v.0) >= window)
+        {
+            failures.remove(key);
+        }
+    }
+}
+
+// Unconditionally forget `keys`, unlike `update_failure`'s remove path which requires the
+// per-address entry to exist.
+fn clear_failures(failures: &mut HashMap<String, (i32, i32, i32)>, keys: &[String]) {
+    for key in keys {
+        failures.remove(key);
+    }
+}
+
+// Simple glob matching for the ID whitelist: '*' matches any sequence of characters
+// (including the empty one), '?' matches exactly one character. Case-insensitive.
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.trim().to_lowercase().chars().collect();
+    let t: Vec<char> = text.trim().to_lowercase().chars().collect();
+    let (mut pi, mut ti) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == '*' {
+            star = Some((pi + 1, ti));
+            pi += 1;
+        } else if pi < p.len() && (p[pi] == '?' || p[pi] == t[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if let Some((sp, st)) = star {
+            pi = sp;
+            ti = st + 1;
+            star = Some((sp, st + 1));
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
 #[cfg(test)]
 mod test {
     #[allow(unused)]
     use super::*;
+
+    #[cfg(feature = "flutter")]
+    #[cfg(not(any(target_os = "android", target_os = "ios")))]
+    #[test]
+    fn test_pending_switch_sides_uuid_is_claimed_once() {
+        let id = uuid::Uuid::new_v4().to_string();
+        let uuid = uuid::Uuid::new_v4();
+        let other_uuid = uuid::Uuid::new_v4();
+        assert!(insert_pending_switch_sides_uuid(id.clone(), uuid.clone()));
+
+        assert!(!insert_pending_switch_sides_uuid(id.clone(), uuid.clone()));
+        assert!(has_pending_switch_sides_uuid(&id, &uuid));
+        assert!(!has_pending_switch_sides_uuid(&id, &other_uuid));
+        assert!(!claim_pending_switch_sides_uuid("other-peer", &uuid));
+        assert!(!claim_pending_switch_sides_uuid(&id, &other_uuid));
+        assert!(claim_pending_switch_sides_uuid(&id, &uuid));
+        assert!(!has_pending_switch_sides_uuid(&id, &uuid));
+        assert!(!claim_pending_switch_sides_uuid(&id, &uuid));
+        assert!(!insert_pending_switch_sides_uuid(id, uuid));
+    }
+
+    #[test]
+    fn login_scope_latches_session_scope_across_login_retries() {
+        let port_forward = |host: &str| {
+            let mut lr = LoginRequest::new();
+            lr.my_id = "peer".to_owned();
+            lr.set_port_forward(PortForward {
+                host: host.to_owned(),
+                port: 3389,
+                ..Default::default()
+            });
+            lr
+        };
+        let first = port_forward("localhost");
+        let scope = |lr: &LoginRequest| Connection::login_scope_digest(lr);
+
+        // A retry may carry new credentials, profile data, options, and unknown fields.
+        let mut retry = port_forward("localhost");
+        retry.password = "secret".into();
+        retry.hwid = "hwid".into();
+        retry.os_login = Some(OSLogin {
+            username: "admin".to_owned(),
+            ..Default::default()
+        })
+        .into();
+        retry.my_name = "New Display Name".to_owned();
+        retry.avatar = "data:image/png;base64,AAAA".to_owned();
+        retry
+            .special_fields
+            .mut_unknown_fields()
+            .add_varint(9999, 1);
+        assert_eq!(scope(&first), scope(&retry));
+
+        // It may not change the controller identity, move the target, or switch type.
+        let mut rotated_id = first.clone();
+        rotated_id.my_id = "rotated-id".to_owned();
+        assert_ne!(scope(&first), scope(&rotated_id));
+        assert_ne!(scope(&first), scope(&port_forward("10.0.0.5")));
+        let mut moved_port = port_forward("localhost");
+        moved_port.mut_port_forward().port = 22;
+        assert_ne!(scope(&first), scope(&moved_port));
+        let terminal = |service_id: &str| {
+            let mut lr = LoginRequest::new();
+            lr.my_id = "peer".to_owned();
+            lr.set_terminal(Terminal {
+                service_id: service_id.to_owned(),
+                ..Default::default()
+            });
+            lr
+        };
+        assert_ne!(scope(&first), scope(&terminal("")));
+        assert_ne!(scope(&terminal("a")), scope(&terminal("b")));
+    }
+
+    #[test]
+    fn test_wildcard_match() {
+        // Exact match.
+        assert!(wildcard_match("123456789", "123456789"));
+        assert!(!wildcard_match("123456789", "123456780"));
+        assert!(!wildcard_match("12345678", "123456789"));
+        assert!(!wildcard_match("123456789", "12345678"));
+        // Case-insensitive.
+        assert!(wildcard_match("MyCustomId", "mycustomid"));
+        // '*' matches any sequence.
+        assert!(wildcard_match("*", "123456789"));
+        assert!(wildcard_match("*", ""));
+        assert!(wildcard_match("*", "*abc"));
+        assert!(wildcard_match("123*", "123456789"));
+        assert!(wildcard_match("123*", "123"));
+        assert!(wildcard_match("12*", "12*9"));
+        assert!(!wildcard_match("123*", "124456789"));
+        assert!(wildcard_match("*789", "123456789"));
+        assert!(wildcard_match("1*9", "123456789"));
+        assert!(wildcard_match("1*4*9", "123456789"));
+        assert!(!wildcard_match("1*4*9", "123456780"));
+        assert!(wildcard_match("*456*", "123456789"));
+        // '?' matches exactly one character.
+        assert!(wildcard_match("12345678?", "123456789"));
+        assert!(!wildcard_match("123456789?", "123456789"));
+        assert!(wildcard_match("???456???", "123456789"));
+        assert!(wildcard_match("1?3*7?9", "123456789"));
+        // Whitespace around entries is ignored.
+        assert!(wildcard_match(" 123456789 ", "123456789"));
+    }
+
+    #[test]
+    fn test_decay_stale_failures() {
+        let entry = |minute: i32| (minute, 1, 40);
+        let keys = ["ip".to_string(), "p64".to_string(), "absent".to_string()];
+        let mut m: HashMap<String, (i32, i32, i32)> = HashMap::new();
+        m.insert("ip".to_string(), entry(100));
+        m.insert("p64".to_string(), entry(160));
+        m.insert("untouched".to_string(), entry(100));
+
+        // Exactly at the window: forgotten. Still inside it: kept.
+        decay_stale_failures(&mut m, &keys, 160, 60);
+        assert!(!m.contains_key("ip"));
+        assert!(m.contains_key("p64"));
+        // Keys that were not passed in are never visited, absent ones are a no-op.
+        assert!(m.contains_key("untouched"));
+
+        // One minute short of the window keeps the entry.
+        decay_stale_failures(&mut m, &keys, 219, 60);
+        assert!(m.contains_key("p64"));
+        decay_stale_failures(&mut m, &keys, 220, 60);
+        assert!(!m.contains_key("p64"));
+
+        // A clock that jumped backwards must not drop anything.
+        m.insert("ip".to_string(), entry(500));
+        decay_stale_failures(&mut m, &keys, 0, 60);
+        assert!(m.contains_key("ip"));
+    }
+
+    #[test]
+    fn test_clear_failures_drops_shared_prefixes() {
+        // On IPv6 a whitelisted peer usually has no entry of its own, while the shared
+        // prefixes that block it do. Clearing must not depend on the per-address entry.
+        let mut m: HashMap<String, (i32, i32, i32)> = HashMap::new();
+        m.insert("p64".to_string(), (100, 1, 55));
+        m.insert("p56".to_string(), (100, 1, 75));
+        m.insert("p48".to_string(), (100, 1, 95));
+        m.insert("someone-else".to_string(), (100, 1, 95));
+        let keys = ["ip", "p64", "p56", "p48"].map(|k| k.to_string());
+
+        clear_failures(&mut m, &keys);
+
+        for key in ["p64", "p56", "p48"] {
+            assert!(!m.contains_key(key), "{key} should have been cleared");
+        }
+        // Keys belonging to other peers are left alone.
+        assert!(m.contains_key("someone-else"));
+    }
+
+    #[test]
+    fn test_id_whitelist_allows() {
+        let list = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+
+        // An empty whitelist allows everyone.
+        assert!(id_whitelist_allows(&[], "123456789"));
+
+        // Same server: the peer reports a bare id.
+        assert!(id_whitelist_allows(&list(&["123456789"]), "123456789"));
+        assert!(!id_whitelist_allows(&list(&["123456789"]), "987654321"));
+
+        // Cross server: the peer appends its own server, which must not reject it.
+        assert!(id_whitelist_allows(
+            &list(&["123456789"]),
+            "123456789@example.com:21116"
+        ));
+        // Cross server from web, whose server is a WebSocket URI.
+        assert!(id_whitelist_allows(
+            &list(&["123456789"]),
+            "123456789@wss://example.com:21118/ws/id"
+        ));
+        // A different id is still rejected, suffix or not.
+        assert!(!id_whitelist_allows(
+            &list(&["123456789"]),
+            "987654321@example.com:21116"
+        ));
+
+        // An entry pinned to one server keeps matching that exact form.
+        assert!(id_whitelist_allows(
+            &list(&["123456789@example.com:21116"]),
+            "123456789@example.com:21116"
+        ));
+        assert!(!id_whitelist_allows(
+            &list(&["123456789@example.com:21116"]),
+            "123456789@other.com:21116"
+        ));
+        // ... and no longer matches the bare id, which is the point of pinning.
+        assert!(!id_whitelist_allows(
+            &list(&["123456789@example.com:21116"]),
+            "123456789"
+        ));
+
+        // Wildcards keep working on both forms.
+        assert!(id_whitelist_allows(&list(&["abc*"]), "abcdef"));
+        assert!(id_whitelist_allows(
+            &list(&["abc*"]),
+            "abcdef@example.com:21116"
+        ));
+        assert!(id_whitelist_allows(
+            &list(&["*"]),
+            "123456789@example.com:21116"
+        ));
+
+        // Any entry of the list is enough.
+        assert!(id_whitelist_allows(
+            &list(&["111111111", "123456789", "222222222"]),
+            "123456789@example.com:21116"
+        ));
+    }
 
     #[cfg(target_os = "macos")]
     #[test]
@@ -6773,6 +7422,10 @@ mod test {
                         misc_msg(|m| m.set_capture_displays(CaptureDisplays::new())),
                         Some("misc.capture_displays"),
                     ),
+                    (
+                        misc_msg(|m| m.set_switch_sides_request(SwitchSidesRequest::new())),
+                        Some("misc.switch_sides_request"),
+                    ),
                     (msg(|m| m.set_clipboard(Clipboard::new())), None),
                     (
                         msg(|m| m.set_multi_clipboards(MultiClipboards::new())),
@@ -6816,6 +7469,10 @@ mod test {
                     (
                         misc_msg(|m| m.set_toggle_privacy_mode(TogglePrivacyMode::new())),
                         Some("misc.toggle_privacy_mode"),
+                    ),
+                    (
+                        misc_msg(|m| m.set_switch_sides_request(SwitchSidesRequest::new())),
+                        Some("misc.switch_sides_request"),
                     ),
                     (misc_msg(|m| m.set_chat_message(ChatMessage::new())), None),
                     (msg(|m| m.set_clipboard(Clipboard::new())), None),
@@ -6902,6 +7559,10 @@ mod test {
                         msg(|m| m.set_terminal_action(TerminalAction::new())),
                         Some("terminal_action"),
                     ),
+                    (
+                        misc_msg(|m| m.set_switch_sides_request(SwitchSidesRequest::new())),
+                        Some("misc.switch_sides_request"),
+                    ),
                 ],
             ),
             (
@@ -6912,6 +7573,10 @@ mod test {
                         None,
                     ),
                     (msg(|m| m.set_terminal_action(TerminalAction::new())), None),
+                    (
+                        misc_msg(|m| m.set_switch_sides_request(SwitchSidesRequest::new())),
+                        None,
+                    ),
                 ],
             ),
             (
@@ -6930,6 +7595,10 @@ mod test {
                     (
                         msg(|m| m.set_screenshot_request(ScreenshotRequest::new())),
                         Some("screenshot_request"),
+                    ),
+                    (
+                        misc_msg(|m| m.set_switch_sides_request(SwitchSidesRequest::new())),
+                        Some("misc.switch_sides_request"),
                     ),
                     (misc_msg(|m| m.set_refresh_video(true)), None),
                     (misc_msg(|m| m.set_refresh_video_display(0)), None),

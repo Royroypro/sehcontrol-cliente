@@ -1,4 +1,4 @@
-use super::create_http_client_async_with_url;
+use super::create_http_client_async_with_url_strict;
 use hbb_common::{
     bail,
     lazy_static::lazy_static,
@@ -261,7 +261,7 @@ async fn do_download(
     auto_del_dur: Option<Duration>,
     mut rx_cancel: UnboundedReceiver<()>,
 ) -> ResultType<bool> {
-    let client = create_http_client_async_with_url(&url).await;
+    let client = create_http_client_async_with_url_strict(&url).await?;
     // Copias para la verificacion final: `url` se consume al lanzar el GET y
     // `path` al abrir el destino.
     let url_for_verification = url.clone();

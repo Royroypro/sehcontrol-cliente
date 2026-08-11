@@ -410,7 +410,7 @@ impl<T: InvokeUiSession> Remote<T> {
                             || !self.is_connected
                             || !(server_file_transfer_enabled && file_transfer_enabled));
                     log::debug!(
-                        "Process clipboard message from system, stop: {}, is_stopping_allowed: {}, view_only: {}, server_file_transfer_enabled: {}, file_transfer_enabled: {}",
+                        "Process clipboard message from system, view_only: {}, stop: {}, is_stopping_allowed: {}, server_file_transfer_enabled: {}, file_transfer_enabled: {}",
                         view_only, stop, is_stopping_allowed, server_file_transfer_enabled, file_transfer_enabled
                     );
                     if stop {
@@ -1353,9 +1353,13 @@ impl<T: InvokeUiSession> Remote<T> {
                     }
                 }
                 Some(message::Union::Hash(hash)) => {
-                    self.handler
+                    if !self
+                        .handler
                         .handle_hash(&self.handler.password.clone(), hash, peer)
-                        .await;
+                        .await
+                    {
+                        return false;
+                    }
                 }
                 Some(message::Union::LoginResponse(lr)) => match lr.union {
                     Some(login_response::Union::Error(err)) => {

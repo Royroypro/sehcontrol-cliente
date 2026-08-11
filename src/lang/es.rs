@@ -333,7 +333,6 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Relay Connection", "Conexión Relay"),
         ("Secure Connection", "Conexión segura"),
         ("Insecure Connection", "Conexión insegura"),
-        ("Continue", ""),
         ("Scale original", "Escala original"),
         ("Scale adaptive", "Escala adaptativa"),
         ("General", "General"),
@@ -799,6 +798,17 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Learn more", "Más información"),
         ("secure_connection_tip", "Todas las conexiones están protegidas con cifrado de extremo a extremo AES-256."),
         ("All", "Todos"),
-        ("My Devices", "Mis equipos")
+        ("My Devices", "Mis equipos"),
+        ("ID whitelisting", "IDs admitidos"),
+        ("Use ID whitelisting", "Usar lista de IDs admitidos"),
+        ("id_whitelist_tip", "Solo los IDs autorizados pueden conectarse a este escritorio"),
+        ("id_whitelist_wildcard_tip", "Se admiten comodines: '*' coincide con cualquier número de caracteres, '?' con exactamente un carácter"),
+        ("Invalid ID", "ID incorrecto"),
+        ("Your ID is blocked by the peer", "Tu ID está bloqueado por el dispositivo remoto"),
+        ("Your ip is blocked by the peer", "Tu IP está bloqueada por el dispositivo remoto"),
+        ("id_whitelist_caveat_tip", "El ID lo comunica el cliente que se conecta. Esta lista blanca reduce la exposición y no sustituye a la contraseña ni al 2FA"),
+        ("whitelist_cidr_tip", "Se admite la notación CIDR, por ejemplo 192.168.1.0/24"),
+        ("Continue", ""),
+        ("Browser didn't open? Use the url below to sign in.", ""),
     ].iter().cloned().collect();
 }
