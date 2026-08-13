@@ -834,6 +834,7 @@ class Client {
   bool recording = false;
   bool blockInput = false;
   bool privacyMode = false;
+  bool viewOnly = false;
   bool disconnected = false;
   bool fromSwitch = false;
   bool inVoiceCall = false;
@@ -863,6 +864,7 @@ class Client {
     recording = json['recording'];
     blockInput = json['block_input'];
     privacyMode = json['privacy_mode'] ?? privacyMode;
+    viewOnly = json['view_only'] ?? false;
     disconnected = json['disconnected'];
     fromSwitch = json['from_switch'];
     inVoiceCall = json['in_voice_call'];
@@ -888,6 +890,7 @@ class Client {
     data['recording'] = recording;
     data['block_input'] = blockInput;
     data['privacy_mode'] = privacyMode;
+    data['view_only'] = viewOnly;
     data['disconnected'] = disconnected;
     data['from_switch'] = fromSwitch;
     data['in_voice_call'] = inVoiceCall;

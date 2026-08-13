@@ -95,7 +95,7 @@ class _ConnectionPageState extends State<ConnectionPage> {
           child: PeerTabPage(),
         )
       ],
-    ).marginOnly(top: 2, left: 10, right: 10);
+    ).marginOnly(top: 10, left: 16, right: 16);
   }
 
   /// Callback for the connect button.
@@ -149,20 +149,24 @@ class _ConnectionPageState extends State<ConnectionPage> {
   /// UI for the remote ID TextField.
   /// Search for a peer and connect to it if the id exists.
   Widget _buildRemoteIDTextField() {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
+    final borderColor =
+        isDark ? const Color(0xFF1D2B38) : const Color(0xFFE2E8F0);
     final w = SizedBox(
-      height: 84,
+      height: 132,
       child: Padding(
-        padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 2),
+        padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 2),
         child: Ink(
           decoration: BoxDecoration(
-            color: Theme.of(context).cardColor,
-            borderRadius: BorderRadius.all(Radius.circular(13)),
+            color: isDark ? const Color(0xFF0C1925) : Colors.white,
+            borderRadius: const BorderRadius.all(Radius.circular(18)),
+            border: Border.all(color: borderColor),
           ),
           child: Row(
             children: <Widget>[
               Expanded(
                 child: Container(
-                  padding: const EdgeInsets.only(left: 16, right: 16),
+                  padding: const EdgeInsets.only(left: 20, right: 8),
                   child: RawAutocomplete<Peer>(
                     optionsBuilder: (TextEditingValue textEditingValue) {
                       if (textEditingValue.text == '') {
@@ -223,7 +227,7 @@ class _ConnectionPageState extends State<ConnectionPage> {
                       return AutoSizeTextField(
                         controller: fieldTextEditingController,
                         focusNode: fieldFocusNode,
-                        minFontSize: 18,
+                        minFontSize: 20,
                         autocorrect: false,
                         enableSuggestions: false,
                         keyboardType: TextInputType.visiblePassword,
@@ -234,8 +238,8 @@ class _ConnectionPageState extends State<ConnectionPage> {
                         style: const TextStyle(
                           fontFamily: 'WorkSans',
                           fontWeight: FontWeight.bold,
-                          fontSize: 30,
-                          color: MyTheme.idColor,
+                          fontSize: 36,
+                          color: Color(0xFF087CF0),
                         ),
                         decoration: InputDecoration(
                           labelText: translate('Remote ID'),
@@ -244,13 +248,13 @@ class _ConnectionPageState extends State<ConnectionPage> {
                           helperStyle: const TextStyle(
                             fontWeight: FontWeight.bold,
                             fontSize: 16,
-                            color: MyTheme.darkGray,
+                            color: Color(0xFF8390A2),
                           ),
                           labelStyle: const TextStyle(
                             fontWeight: FontWeight.w600,
                             fontSize: 16,
                             letterSpacing: 0.2,
-                            color: MyTheme.darkGray,
+                            color: Color(0xFF8390A2),
                           ),
                         ),
                         inputFormatters: [IDTextInputFormatter()],
@@ -336,12 +340,30 @@ class _ConnectionPageState extends State<ConnectionPage> {
                         icon: Icon(Icons.clear, color: MyTheme.darkGray)),
                   )),
               SizedBox(
-                width: 60,
-                height: 60,
-                child: IconButton(
-                  icon: const Icon(Icons.arrow_forward,
-                      color: MyTheme.darkGray, size: 45),
-                  onPressed: onConnect,
+                width: 76,
+                height: 76,
+                child: Padding(
+                  padding: const EdgeInsets.only(right: 12),
+                  child: Material(
+                    color: Colors.transparent,
+                    borderRadius: BorderRadius.circular(18),
+                    child: Ink(
+                      decoration: BoxDecoration(
+                        gradient: const LinearGradient(
+                          begin: Alignment.topLeft,
+                          end: Alignment.bottomRight,
+                          colors: [Color(0xFF087CF0), Color(0xFF24C946)],
+                        ),
+                        borderRadius: BorderRadius.circular(18),
+                      ),
+                      child: InkWell(
+                        borderRadius: BorderRadius.circular(18),
+                        onTap: onConnect,
+                        child: const Icon(Icons.arrow_forward_rounded,
+                            color: Colors.white, size: 38),
+                      ),
+                    ),
+                  ),
                 ),
               ),
             ],

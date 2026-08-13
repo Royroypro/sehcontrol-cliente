@@ -570,6 +570,7 @@ pub enum Data {
         recording: bool,
         block_input: bool,
         privacy_mode: bool,
+        view_only: bool,
         from_switch: bool,
     },
     ChatMessage {

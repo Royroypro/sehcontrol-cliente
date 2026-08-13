@@ -580,15 +580,16 @@ class MyTheme {
   );
 
   static ThemeMode getThemeModePreference() {
-    return themeModeFromString(bind.mainGetLocalOption(key: kCommConfKeyTheme));
+    final saved = bind.mainGetLocalOption(key: kCommConfKeyTheme);
+    if (saved.isEmpty && isCustomClient) return ThemeMode.dark;
+    return themeModeFromString(saved);
   }
 
   static Future<void> changeDarkMode(ThemeMode mode) async {
     Get.changeThemeMode(mode);
     if (desktopType == DesktopType.main || isAndroid || isIOS || isWeb) {
       if (mode == ThemeMode.system) {
-        await bind.mainSetLocalOption(
-            key: kCommConfKeyTheme, value: defaultOptionTheme);
+        await bind.mainSetLocalOption(key: kCommConfKeyTheme, value: 'system');
       } else {
         await bind.mainSetLocalOption(
             key: kCommConfKeyTheme, value: mode.toShortString());
@@ -2537,6 +2538,7 @@ connectMainDesktop(String id,
     required bool isTerminal,
     required bool isTcpTunneling,
     required bool isRDP,
+    bool isViewOnly = false,
     bool? forceRelay,
     String? password,
     String? connToken,
@@ -2569,7 +2571,8 @@ connectMainDesktop(String id,
     await rustDeskWinManager.newRemoteDesktop(id,
         password: password,
         isSharedPassword: isSharedPassword,
-        forceRelay: forceRelay);
+        forceRelay: forceRelay,
+        isViewOnly: isViewOnly);
   }
 }
 
@@ -2584,6 +2587,7 @@ connect(BuildContext context, String id,
     bool isTerminal = false,
     bool isTcpTunneling = false,
     bool isRDP = false,
+    bool isViewOnly = false,
     bool forceRelay = false,
     String? password,
     String? connToken,
@@ -2621,6 +2625,7 @@ connect(BuildContext context, String id,
         isTerminal: isTerminal,
         isTcpTunneling: isTcpTunneling,
         isRDP: isRDP,
+        isViewOnly: isViewOnly,
         password: password,
         isSharedPassword: isSharedPassword,
         forceRelay: forceRelay,
@@ -2633,6 +2638,7 @@ connect(BuildContext context, String id,
         'isTerminal': isTerminal,
         'isTcpTunneling': isTcpTunneling,
         'isRDP': isRDP,
+        'isViewOnly': isViewOnly,
         'password': password,
         'isSharedPassword': isSharedPassword,
         'forceRelay': forceRelay,
@@ -4042,11 +4048,13 @@ Widget buildMembershipPlanCard() {
     final maxDevices = gFFI.userModel.membershipMaxDevices.value;
     final expiringSoon = !blocked && daysLeft != null && daysLeft <= 7;
 
+    final isDark = Get.context == null ||
+        Theme.of(Get.context!).brightness == Brightness.dark;
     final Color accentColor = blocked
         ? Colors.redAccent
         : expiringSoon
             ? Colors.orangeAccent
-            : const Color(0xFFFFC24B); // gold
+            : const Color(0xFF24C946);
     final String statusLabel = blocked
         ? translate('Account restricted')
         : expiringSoon
@@ -4070,17 +4078,16 @@ Widget buildMembershipPlanCard() {
         : '-';
 
     return Container(
-      margin: const EdgeInsets.symmetric(vertical: 8),
-      padding: const EdgeInsets.all(14),
+      margin: const EdgeInsets.symmetric(vertical: 10),
+      padding: const EdgeInsets.all(20),
       decoration: BoxDecoration(
-        color: const Color(0xFF15161C),
-        borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: accentColor.withOpacity(0.55), width: 1.2),
+        color: isDark ? const Color(0xFF0A1722) : Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: accentColor.withOpacity(0.85), width: 1.2),
         boxShadow: [
           BoxShadow(
             color: accentColor.withOpacity(0.18),
-            blurRadius: 16,
-            spreadRadius: 1,
+            blurRadius: 20,
           ),
         ],
       ),
@@ -4089,8 +4096,19 @@ Widget buildMembershipPlanCard() {
         children: [
           Row(
             children: [
-              Icon(Icons.shield_rounded, color: accentColor, size: 30),
-              const SizedBox(width: 10),
+              Container(
+                width: 44,
+                height: 44,
+                decoration: BoxDecoration(
+                  gradient: LinearGradient(
+                    colors: [accentColor.withOpacity(0.95), accentColor],
+                  ),
+                  borderRadius: BorderRadius.circular(13),
+                ),
+                child: const Icon(Icons.check_rounded,
+                    color: Colors.white, size: 28),
+              ),
+              const SizedBox(width: 14),
               Expanded(
                 child: Row(
                   children: [
@@ -4098,28 +4116,34 @@ Widget buildMembershipPlanCard() {
                       child: Text(
                         planName,
                         overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          color: Colors.white,
-                          fontSize: 17,
+                        style: TextStyle(
+                          color:
+                              isDark ? Colors.white : const Color(0xFF172033),
+                          fontSize: 21,
                           fontWeight: FontWeight.bold,
                         ),
                       ),
                     ),
                     const SizedBox(width: 8),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 8, vertical: 3),
-                      decoration: BoxDecoration(
-                        color: accentColor.withOpacity(0.15),
-                        borderRadius: BorderRadius.circular(20),
-                        border: Border.all(color: accentColor.withOpacity(0.6)),
-                      ),
-                      child: Text(
-                        statusLabel,
-                        style: TextStyle(
-                          color: accentColor,
-                          fontSize: 11,
-                          fontWeight: FontWeight.w600,
+                    Flexible(
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                            horizontal: 8, vertical: 3),
+                        decoration: BoxDecoration(
+                          color: accentColor.withOpacity(0.15),
+                          borderRadius: BorderRadius.circular(20),
+                          border:
+                              Border.all(color: accentColor.withOpacity(0.6)),
+                        ),
+                        child: Text(
+                          statusLabel,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            color: accentColor,
+                            fontSize: 12,
+                            fontWeight: FontWeight.w600,
+                          ),
                         ),
                       ),
                     ),
@@ -4128,36 +4152,43 @@ Widget buildMembershipPlanCard() {
               ),
             ],
           ),
-          const SizedBox(height: 6),
+          const SizedBox(height: 14),
           Row(
             children: [
-              Icon(Icons.verified_user_rounded,
-                  color: Colors.white54, size: 14),
-              const SizedBox(width: 6),
+              Icon(Icons.check_circle_outline_rounded,
+                  color: accentColor, size: 18),
+              const SizedBox(width: 9),
               Expanded(
                 child: Text(
                   tagline,
                   overflow: TextOverflow.ellipsis,
-                  style: const TextStyle(color: Colors.white54, fontSize: 12.5),
+                  style: TextStyle(
+                    color: isDark ? Colors.white60 : const Color(0xFF667085),
+                    fontSize: 14,
+                  ),
                 ),
               ),
             ],
           ),
-          const SizedBox(height: 12),
-          Divider(color: Colors.white.withOpacity(0.08), height: 1),
-          const SizedBox(height: 10),
+          const SizedBox(height: 18),
+          Divider(
+              color: isDark ? Colors.white12 : const Color(0xFFE5EAF0),
+              height: 1),
+          const SizedBox(height: 14),
           Row(
             children: [
               Expanded(
-                child: _membershipStat(translate('Expires'), expiresLabel),
+                child:
+                    _membershipStat(translate('Expires'), expiresLabel, isDark),
               ),
               Container(
                 width: 1,
                 height: 30,
-                color: Colors.white.withOpacity(0.08),
+                color: isDark ? Colors.white12 : const Color(0xFFE5EAF0),
               ),
               Expanded(
-                child: _membershipStat(translate('Devices'), devicesLabel),
+                child:
+                    _membershipStat(translate('Devices'), devicesLabel, isDark),
               ),
             ],
           ),
@@ -4167,17 +4198,19 @@ Widget buildMembershipPlanCard() {
   });
 }
 
-Widget _membershipStat(String label, String value) {
+Widget _membershipStat(String label, String value, bool isDark) {
   return Column(
     crossAxisAlignment: CrossAxisAlignment.start,
     children: [
       Text(label,
-          style: const TextStyle(color: Colors.white38, fontSize: 11.5)),
+          style: TextStyle(
+              color: isDark ? Colors.white38 : const Color(0xFF7A8596),
+              fontSize: 12.5)),
       const SizedBox(height: 2),
       Text(value,
-          style: const TextStyle(
-              color: Colors.white,
-              fontSize: 14.5,
+          style: TextStyle(
+              color: isDark ? Colors.white : const Color(0xFF172033),
+              fontSize: 16,
               fontWeight: FontWeight.w600)),
     ],
   );

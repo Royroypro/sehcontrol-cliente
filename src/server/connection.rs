@@ -2275,6 +2275,20 @@ impl Connection {
     }
 
     fn try_start_cm(&mut self, peer_id: String, name: String, authorized: bool) {
+        let view_only = self.disable_keyboard && self.disable_clipboard && {
+            #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+            {
+                !self.enable_file_transfer
+            }
+                #[cfg(not(any(
+                    target_os = "windows",
+                    target_os = "linux",
+                    target_os = "macos"
+                )))]
+                {
+                    true
+                }
+        };
         self.send_to_cm(ipc::Data::Login {
             id: self.inner.id(),
             is_file_transfer: self.file_transfer.is_some(),
@@ -2294,6 +2308,7 @@ impl Connection {
             recording: self.recording,
             block_input: self.block_input,
             privacy_mode: self.privacy_mode,
+            view_only,
             from_switch: self.from_switch,
         });
     }

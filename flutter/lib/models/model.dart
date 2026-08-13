@@ -3777,6 +3777,7 @@ class FFI {
     int? tabWindowId,
     int? display,
     List<int>? displays,
+    bool isViewOnly = false,
   }) {
     closed = false;
     if (isMobile) mobileReset();
@@ -3809,20 +3810,34 @@ class FFI {
     // Else this session is a new one.
     if (isNewPeer) {
       // ignore: unused_local_variable
-      final addRes = bind.sessionAddSync(
-        sessionId: sessionId,
-        id: id,
-        isFileTransfer: isFileTransfer,
-        isViewCamera: isViewCamera,
-        isPortForward: isPortForward,
-        isRdp: isRdp,
-        isTerminal: isTerminal,
-        switchUuid: switchUuid ?? '',
-        forceRelay: forceRelay ?? false,
-        password: password ?? '',
-        isSharedPassword: isSharedPassword ?? false,
-        connToken: connToken,
-      );
+      final savedViewOnly = isViewOnly
+          ? bind.mainGetPeerOptionSync(id: id, key: kOptionToggleViewOnly)
+          : null;
+      if (isViewOnly) {
+        bind.mainSetPeerOptionSync(
+            id: id, key: kOptionToggleViewOnly, value: 'Y');
+      }
+      try {
+        bind.sessionAddSync(
+          sessionId: sessionId,
+          id: id,
+          isFileTransfer: isFileTransfer,
+          isViewCamera: isViewCamera,
+          isPortForward: isPortForward,
+          isRdp: isRdp,
+          isTerminal: isTerminal,
+          switchUuid: switchUuid ?? '',
+          forceRelay: forceRelay ?? false,
+          password: password ?? '',
+          isSharedPassword: isSharedPassword ?? false,
+          connToken: connToken,
+        );
+      } finally {
+        if (savedViewOnly != null) {
+          bind.mainSetPeerOptionSync(
+              id: id, key: kOptionToggleViewOnly, value: savedViewOnly);
+        }
+      }
     } else if (display != null) {
       if (displays == null) {
         debugPrint(

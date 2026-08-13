@@ -230,6 +230,7 @@ class RustDeskMultiWindowManager {
     bool? isRDP,
     bool? isSharedPassword,
     String? connToken,
+    bool? isViewOnly,
   }) async {
     var params = {
       "type": type.index,
@@ -248,6 +249,9 @@ class RustDeskMultiWindowManager {
     }
     if (connToken != null) {
       params['connToken'] = connToken;
+    }
+    if (isViewOnly != null) {
+      params['isViewOnly'] = isViewOnly;
     }
     final msg = jsonEncode(params);
 
@@ -273,6 +277,7 @@ class RustDeskMultiWindowManager {
     bool? isSharedPassword,
     String? switchUuid,
     bool? forceRelay,
+    bool isViewOnly = false,
   }) async {
     return await newSession(
       WindowType.RemoteDesktop,
@@ -283,6 +288,7 @@ class RustDeskMultiWindowManager {
       forceRelay: forceRelay,
       switchUuid: switchUuid,
       isSharedPassword: isSharedPassword,
+      isViewOnly: isViewOnly,
     );
   }
 
@@ -472,7 +478,8 @@ class RustDeskMultiWindowManager {
     }
     for (int i = 0; i < windows.length; i++) {
       final wId = windows[i];
-      final shouldSavePos = type != WindowType.Terminal || i == windows.length - 1;
+      final shouldSavePos =
+          type != WindowType.Terminal || i == windows.length - 1;
       if (shouldSavePos) {
         debugPrint("closing multi window, type: ${type.toString()} id: $wId");
         try {

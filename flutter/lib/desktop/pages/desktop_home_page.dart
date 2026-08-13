@@ -15,10 +15,10 @@ import 'package:flutter_hbb/desktop/widgets/update_progress.dart';
 import 'package:flutter_hbb/models/peer_tab_model.dart';
 import 'package:flutter_hbb/models/platform_model.dart';
 import 'package:flutter_hbb/models/server_model.dart';
-import 'package:flutter_hbb/models/state_model.dart';
 import 'package:flutter_hbb/plugin/ui_manager.dart';
 import 'package:flutter_hbb/utils/multi_window_manager.dart';
 import 'package:flutter_hbb/utils/platform_channel.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 import 'package:get/get.dart';
 import 'package:provider/provider.dart';
 import 'package:url_launcher/url_launcher.dart';
@@ -34,6 +34,8 @@ class DesktopHomePage extends StatefulWidget {
 }
 
 const borderColor = Color(0xFF2F65BA);
+const _sehBlue = Color(0xFF176B87);
+const _sehMint = Color(0xFF64CCC5);
 
 class _DesktopHomePageState extends State<DesktopHomePage>
     with AutomaticKeepAliveClientMixin, WidgetsBindingObserver {
@@ -64,34 +66,56 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     // assertions that would otherwise explain a silent rendering failure.
     try {
       final isIncomingOnly = bind.isIncomingOnly();
-      return _buildBlock(
-          child: Stack(
-        children: [
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.stretch,
-            children: [
-              // Fixed height: the header's content (icons/buttons with no
-              // explicit intrinsic size) left this unbounded, which silently
-              // produced a blank window in release builds instead of the
-              // debug-only "unbounded height" assertion that would flag it.
-              if (!isIncomingOnly)
-                SizedBox(height: 60, child: _buildHeader(context)),
-              Expanded(
-                child: Row(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    buildLeftPane(context),
-                    if (!isIncomingOnly) const VerticalDivider(width: 1),
-                    if (!isIncomingOnly)
-                      Expanded(child: buildRightPane(context)),
-                  ],
+      final baseTheme = Theme.of(context);
+      final isDark = baseTheme.brightness == Brightness.dark;
+      final compact = MediaQuery.of(context).size.height < 820;
+      final sehTheme = baseTheme.copyWith(
+        scaffoldBackgroundColor:
+            isDark ? const Color(0xFF07111F) : const Color(0xFFF4F7FB),
+        colorScheme: baseTheme.colorScheme.copyWith(
+          primary: const Color(0xFF2774FF),
+          secondary: _sehMint,
+          surface: isDark ? const Color(0xFF0A1626) : const Color(0xFFFFFFFF),
+          surfaceContainerHighest:
+              isDark ? const Color(0xFF111E31) : const Color(0xFFEAF0F7),
+        ),
+        dividerColor:
+            isDark ? const Color(0xFF24364D) : const Color(0xFFD7E0EC),
+      );
+      return Theme(
+        data: sehTheme,
+        child: Builder(
+          builder: (context) => _buildBlock(
+            child: Stack(
+              children: [
+                Container(
+                  color: Theme.of(context).scaffoldBackgroundColor,
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      if (!isIncomingOnly)
+                        SizedBox(
+                            height: compact ? 78 : 96,
+                            child: _buildHeader(context)),
+                      Expanded(
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            buildLeftPane(context),
+                            if (!isIncomingOnly)
+                              Expanded(child: buildRightPane(context)),
+                          ],
+                        ),
+                      ),
+                    ],
+                  ),
                 ),
-              ),
-            ],
+                buildMembershipLockOverlay(),
+              ],
+            ),
           ),
-          buildMembershipLockOverlay(),
-        ],
-      ));
+        ),
+      );
     } catch (e, st) {
       debugPrint('DesktopHomePage build failed: $e\n$st');
       return Container(
@@ -110,58 +134,103 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   /// rather than opening a separate page, since that's the closest existing
   /// concept to a dedicated devices view.
   Widget _buildHeader(BuildContext context) {
+    final compact = MediaQuery.of(context).size.height < 820;
+    final logoSize = compact ? 48.0 : 58.0;
     return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 10),
+      padding:
+          EdgeInsets.symmetric(horizontal: 28, vertical: compact ? 10 : 14),
       decoration: BoxDecoration(
+        color: Theme.of(context).colorScheme.surface,
         border: Border(
-          bottom: BorderSide(color: Theme.of(context).dividerColor),
+          bottom: BorderSide(
+              color: Theme.of(context).dividerColor.withOpacity(0.45)),
         ),
       ),
       child: Row(
         children: [
-          SizedBox(width: 28, height: 28, child: loadLogo()),
-          const SizedBox(width: 10),
-          Text(
-            bind.mainGetAppNameSync().toUpperCase(),
-            style: const TextStyle(
-                fontSize: 16, fontWeight: FontWeight.bold, letterSpacing: 0.5),
+          SizedBox(
+            width: logoSize,
+            height: logoSize,
+            child: ClipOval(
+              child: SvgPicture.asset(
+                'assets/icon.svg',
+                fit: BoxFit.cover,
+              ),
+            ),
           ),
-          const SizedBox(width: 28),
-          _HeaderNavButton(
-            icon: Icons.desktop_windows_outlined,
-            title: translate('Control Remote Desktop'),
-            subtitle: translate('desk_tip'),
-            onTap: () {},
-          ),
-          const SizedBox(width: 8),
-          _HeaderNavButton(
-            icon: Icons.devices_other_outlined,
-            title: translate('My Devices'),
-            // Jumps to the Address Book tab (Cabinas/Clientes) rather than
-            // the RustDesk "Grupo" tab: the latter needs /api/users,
-            // /api/peers and /api/device-group/accessible, which the
-            // Sehcontrol server doesn't implement (404s), while the address
-            // book already works against the existing /api/ab/* endpoints.
-            onTap: () {
-              gFFI.abModel.selectedTags.clear();
-              gFFI.peerTabModel.setCurrentTab(PeerTabIndex.ab.index);
-            },
+          const SizedBox(width: 14),
+          Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Row(
+                children: [
+                  Text('SEH',
+                      style: TextStyle(
+                          color: Theme.of(context).colorScheme.onSurface,
+                          fontSize: 28,
+                          fontWeight: FontWeight.w800,
+                          letterSpacing: 0.5)),
+                  const Text('CONTROL',
+                      style: TextStyle(
+                          color: Color(0xFF1670DB),
+                          fontSize: 28,
+                          fontWeight: FontWeight.w800,
+                          letterSpacing: 0.5)),
+                ],
+              ),
+              Text(translate('Control Remote Desktop'),
+                  style: TextStyle(
+                      color: Theme.of(context)
+                          .textTheme
+                          .bodySmall
+                          ?.color
+                          ?.withOpacity(0.55),
+                      fontSize: 14,
+                      fontWeight: FontWeight.w500)),
+            ],
           ),
           const Spacer(),
-          IconButton(
+          Container(
+            height: 40,
+            padding: const EdgeInsets.symmetric(horizontal: 14),
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(10),
+              border: Border.all(color: Theme.of(context).dividerColor),
+            ),
+            child: Row(
+              children: [
+                const Icon(Icons.verified_user_outlined,
+                    color: Color(0xFF35D69B), size: 19),
+                const SizedBox(width: 8),
+                Text('${translate('Secure Connection')} (AES-256)',
+                    style: const TextStyle(fontSize: 12)),
+                const SizedBox(width: 8),
+                const Icon(Icons.keyboard_arrow_down, size: 18),
+              ],
+            ),
+          ),
+          const SizedBox(width: 12),
+          _headerIconButton(
+            context,
             tooltip: translate('Help'),
-            icon: const Icon(Icons.help_outline),
+            icon: Icons.help_outline,
             onPressed: () => launchUrl(Uri.parse(kSehcontrolHelpUrl)),
           ),
-          IconButton(
+          const SizedBox(width: 6),
+          _headerIconButton(
+            context,
             tooltip: translate('Notifications'),
-            icon: unreadTopRightBuilder(gFFI.userModel.unreadNotificationCount,
-                icon: const Icon(Icons.notifications_outlined)),
+            child: unreadTopRightBuilder(gFFI.userModel.unreadNotificationCount,
+                icon: const Icon(Icons.notifications_outlined, size: 20)),
             onPressed: () => _showNotificationsDialog(context),
           ),
-          IconButton(
+          const SizedBox(width: 6),
+          _headerIconButton(
+            context,
             tooltip: translate('Settings'),
-            icon: const Icon(Icons.settings_outlined),
+            icon: Icons.settings_outlined,
             onPressed: () {
               if (DesktopSettingPage.tabKeys.isNotEmpty) {
                 DesktopSettingPage.switch2page(DesktopSettingPage.tabKeys[0]);
@@ -169,6 +238,31 @@ class _DesktopHomePageState extends State<DesktopHomePage>
             },
           ),
         ],
+      ),
+    );
+  }
+
+  Widget _headerIconButton(
+    BuildContext context, {
+    required String tooltip,
+    IconData? icon,
+    Widget? child,
+    required VoidCallback onPressed,
+  }) {
+    return Tooltip(
+      message: tooltip,
+      child: Material(
+        color: Theme.of(context).colorScheme.surfaceContainerHighest,
+        borderRadius: BorderRadius.circular(12),
+        child: InkWell(
+          borderRadius: BorderRadius.circular(12),
+          onTap: onPressed,
+          child: SizedBox(
+            width: 40,
+            height: 40,
+            child: Center(child: child ?? Icon(icon, size: 20)),
+          ),
+        ),
       ),
     );
   }
@@ -254,43 +348,22 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   Widget buildLeftPane(BuildContext context) {
     final isIncomingOnly = bind.isIncomingOnly();
     final isOutgoingOnly = bind.isOutgoingOnly();
+    final compact = MediaQuery.of(context).size.height < 760;
     final children = <Widget>[
+      if (!isIncomingOnly) _buildSidebarNavigation(context, compact: compact),
       if (!isOutgoingOnly) buildPresetPasswordWarning(),
       if (bind.isCustomClient())
         Align(
           alignment: Alignment.center,
           child: loadPowered(context),
         ),
-      Align(
-        alignment: Alignment.center,
-        child: loadLogo(),
-      ),
-      buildTip(context),
+      if (!isIncomingOnly) _buildAccessIntro(context, compact: compact),
       if (!isOutgoingOnly) _sidebarCard(context, child: buildIDBoard(context)),
       if (!isOutgoingOnly)
         _sidebarCard(context, child: buildPasswordBoard(context)),
-      if (!isOutgoingOnly) _buildIncomingAccessToggle(context),
-      if (!isOutgoingOnly) _buildStatusCard(context),
-      FutureBuilder<Widget>(
-        future: Future.value(
-            Obx(() => buildHelpCards(stateGlobal.updateUrl.value))),
-        builder: (_, data) {
-          if (data.hasData) {
-            if (isIncomingOnly) {
-              if (isInHomePage()) {
-                Future.delayed(Duration(milliseconds: 300), () {
-                  _updateWindowSize();
-                });
-              }
-            }
-            return data.data!;
-          } else {
-            return const Offstage();
-          }
-        },
-      ),
+      if (!isOutgoingOnly && isIncomingOnly)
+        _buildIncomingAccessToggle(context),
       buildPluginEntry(),
-      if (!isOutgoingOnly) _buildProCard(context),
     ];
     if (isIncomingOnly) {
       children.addAll([
@@ -310,20 +383,32 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     return ChangeNotifierProvider.value(
       value: gFFI.serverModel,
       child: Container(
-        width: isIncomingOnly ? 280.0 : 200.0,
-        color: Theme.of(context).colorScheme.background,
+        width: isIncomingOnly ? 300.0 : 324.0,
+        decoration: BoxDecoration(
+          color: Theme.of(context).colorScheme.surface,
+          border: Border(
+            right: BorderSide(
+                color: Theme.of(context).dividerColor.withOpacity(0.45)),
+          ),
+        ),
         child: Stack(
           children: [
             Column(
               children: [
-                SingleChildScrollView(
-                  controller: _leftPaneScrollController,
-                  child: Column(
-                    key: _childKey,
-                    children: children,
+                Expanded(
+                  child: Scrollbar(
+                    controller: _leftPaneScrollController,
+                    thumbVisibility: true,
+                    child: SingleChildScrollView(
+                      controller: _leftPaneScrollController,
+                      child: Column(
+                        key: _childKey,
+                        children: children,
+                      ),
+                    ),
                   ),
                 ),
-                Expanded(child: Container())
+                if (!isOutgoingOnly) _buildProCard(context),
               ],
             ),
             if (isOutgoingOnly)
@@ -360,21 +445,156 @@ class _DesktopHomePageState extends State<DesktopHomePage>
   }
 
   buildRightPane(BuildContext context) {
+    final isDark = Theme.of(context).brightness == Brightness.dark;
     return Container(
-      color: Theme.of(context).scaffoldBackgroundColor,
+      decoration: BoxDecoration(
+        color: Theme.of(context).scaffoldBackgroundColor,
+        gradient: LinearGradient(
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
+          colors: isDark
+              ? [
+                  const Color(0xFF10264A).withOpacity(0.32),
+                  const Color(0xFF07111F),
+                  const Color(0xFF071A22),
+                ]
+              : const [
+                  Color(0xFFEAF2FF),
+                  Color(0xFFF7F9FC),
+                  Color(0xFFEEF8F7),
+                ],
+        ),
+      ),
       child: ConnectionPage(),
+    );
+  }
+
+  Widget _buildSidebarNavigation(BuildContext context,
+      {required bool compact}) {
+    Widget item(IconData icon, String label, VoidCallback onTap,
+        {bool selected = false}) {
+      final unselectedColor = Theme.of(context).colorScheme.onSurface;
+      return Padding(
+        padding:
+            EdgeInsets.symmetric(horizontal: 14, vertical: compact ? 1 : 3),
+        child: Material(
+          color: selected ? const Color(0xFF10A83A) : Colors.transparent,
+          borderRadius: BorderRadius.circular(10),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(10),
+            onTap: onTap,
+            child: Padding(
+              padding: EdgeInsets.symmetric(
+                  horizontal: 13, vertical: compact ? 8 : 12),
+              child: Row(
+                children: [
+                  Icon(icon,
+                      size: 20,
+                      color: selected
+                          ? Colors.white
+                          : unselectedColor.withOpacity(0.72)),
+                  const SizedBox(width: 13),
+                  Text(label,
+                      style: TextStyle(
+                          color: selected ? Colors.white : unselectedColor,
+                          fontWeight:
+                              selected ? FontWeight.w700 : FontWeight.w500)),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    void showDevices() {
+      gFFI.abModel.selectedTags.clear();
+      gFFI.peerTabModel.setCurrentTab(PeerTabIndex.ab.index);
+    }
+
+    return Padding(
+      padding: EdgeInsets.only(top: compact ? 10 : 24, bottom: compact ? 4 : 8),
+      child: Column(
+        children: [
+          item(Icons.home_outlined, translate('Home'), () {}, selected: true),
+          item(Icons.desktop_windows_outlined, translate('My Devices'),
+              showDevices),
+          item(Icons.history_rounded, translate('Recent sessions'), () {
+            gFFI.peerTabModel.setCurrentTab(PeerTabIndex.recent.index);
+          }),
+          item(Icons.star_border_rounded, translate('Favorites'), () {
+            gFFI.peerTabModel.setCurrentTab(PeerTabIndex.fav.index);
+          }),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAccessIntro(BuildContext context, {required bool compact}) {
+    return Padding(
+      padding: EdgeInsets.fromLTRB(24, compact ? 4 : 10, 24, compact ? 3 : 8),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          const Divider(height: 1),
+          SizedBox(height: compact ? 9 : 20),
+          Text('ACCESO RÁPIDO',
+              style: Theme.of(context).textTheme.labelMedium?.copyWith(
+                  color: Theme.of(context)
+                      .colorScheme
+                      .onSurface
+                      .withOpacity(0.7))),
+          SizedBox(height: compact ? 7 : 16),
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Container(
+                width: 24,
+                height: 24,
+                alignment: Alignment.center,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF10A83A),
+                  borderRadius: BorderRadius.circular(5),
+                ),
+                child: const Text('ID',
+                    style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 10,
+                        fontWeight: FontWeight.w800)),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Text(translate('desk_tip'),
+                    style: Theme.of(context)
+                        .textTheme
+                        .bodySmall
+                        ?.copyWith(height: compact ? 1.2 : 1.45),
+                    maxLines: compact ? 2 : null,
+                    overflow:
+                        compact ? TextOverflow.ellipsis : TextOverflow.visible),
+              ),
+            ],
+          ),
+        ],
+      ),
     );
   }
 
   /// Wraps an existing sidebar block (ID board, password board, ...) in a
   /// rounded card background without touching its internal layout/logic.
   Widget _sidebarCard(BuildContext context, {required Widget child}) {
+    final compact = MediaQuery.of(context).size.height < 760;
     return Container(
-      margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
-      padding: const EdgeInsets.symmetric(vertical: 4),
+      margin: EdgeInsets.symmetric(horizontal: 14, vertical: compact ? 3 : 6),
+      padding: EdgeInsets.symmetric(vertical: compact ? 1 : 5),
       decoration: BoxDecoration(
-        color: Theme.of(context).colorScheme.surfaceContainerHighest,
-        borderRadius: BorderRadius.circular(12),
+        color: Theme.of(context)
+            .colorScheme
+            .surfaceContainerHighest
+            .withOpacity(0.72),
+        borderRadius: BorderRadius.circular(16),
+        border:
+            Border.all(color: Theme.of(context).dividerColor.withOpacity(0.38)),
       ),
       child: child,
     );
@@ -415,49 +635,6 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                   value: !svcStopped.value,
                   onChanged: (v) async => await start_service(v),
                 ),
-              ],
-            )),
-      ),
-    );
-  }
-
-  /// Read-only status summary: real service state (same source as
-  /// [OnlineStatusWidget]) plus encryption, which is always AES-256 in
-  /// RustDesk. Trimmed to just these two per user feedback that the earlier
-  /// 3-row version (which also showed a coarse Relay/Direct approximation)
-  /// was more detail than useful here.
-  Widget _buildStatusCard(BuildContext context) {
-    Widget row(String label, Widget value) => Padding(
-          padding: const EdgeInsets.symmetric(vertical: 3),
-          child: Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Text(label, style: Theme.of(context).textTheme.bodySmall),
-              value,
-            ],
-          ),
-        );
-    return _sidebarCard(
-      context,
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-        child: Obx(() => Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                row(
-                    translate('Service'),
-                    Text(
-                      stateGlobal.svcStatus.value == SvcStatus.ready
-                          ? translate('Ready')
-                          : svcStopped.value
-                              ? translate('Stopped')
-                              : translate('connecting_status'),
-                      style: const TextStyle(fontWeight: FontWeight.w600),
-                    )),
-                row(
-                    translate('Encryption'),
-                    const Text('AES-256',
-                        style: TextStyle(fontWeight: FontWeight.w600))),
               ],
             )),
       ),
@@ -566,19 +743,24 @@ class _DesktopHomePageState extends State<DesktopHomePage>
 
   buildIDBoard(BuildContext context) {
     final model = gFFI.serverModel;
+    final compact = MediaQuery.of(context).size.height < 760;
     return Container(
-      margin: const EdgeInsets.only(left: 20, right: 11),
+      margin: EdgeInsets.fromLTRB(14, compact ? 5 : 10, 10, compact ? 5 : 10),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.baseline,
         textBaseline: TextBaseline.alphabetic,
         children: [
           Container(
-            width: 2,
-            decoration: const BoxDecoration(color: MyTheme.accent),
-          ).marginOnly(top: 5),
+            width: 38,
+            height: 38,
+            decoration: BoxDecoration(
+                color: _sehBlue.withOpacity(0.12),
+                borderRadius: BorderRadius.circular(12)),
+            child: const Icon(Icons.fingerprint, color: _sehBlue, size: 20),
+          ),
           Expanded(
             child: Padding(
-              padding: const EdgeInsets.only(left: 7),
+              padding: const EdgeInsets.only(left: 10),
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -593,7 +775,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                             ?.color
                             ?.withOpacity(0.5)),
                     maxLines: 1,
-                  ).marginOnly(top: 5),
+                  ),
                   Flexible(
                     child: GestureDetector(
                       onDoubleTap: () {
@@ -606,10 +788,14 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                         readOnly: true,
                         decoration: InputDecoration(
                           border: InputBorder.none,
-                          contentPadding: EdgeInsets.only(top: 10, bottom: 10),
+                          contentPadding: EdgeInsets.only(
+                              top: compact ? 4 : 10, bottom: compact ? 4 : 10),
                         ),
                         style: TextStyle(
-                          fontSize: 22,
+                          fontSize: 21,
+                          fontWeight: FontWeight.w700,
+                          letterSpacing: 0.6,
+                          color: const Color(0xFF10A83A),
                         ),
                       ).workaroundFreezeLinuxMint(),
                     ),
@@ -639,20 +825,25 @@ class _DesktopHomePageState extends State<DesktopHomePage>
     final textColor = Theme.of(context).textTheme.titleLarge?.color;
     final showOneTime = model.approveMode != 'click' &&
         model.verificationMethod != kUsePermanentPassword;
+    final compact = MediaQuery.of(context).size.height < 760;
     return Container(
-      margin: EdgeInsets.only(left: 20.0, right: 16, top: 13, bottom: 13),
+      margin: EdgeInsets.fromLTRB(14, compact ? 5 : 10, 10, compact ? 5 : 10),
       child: Row(
         crossAxisAlignment: CrossAxisAlignment.baseline,
         textBaseline: TextBaseline.alphabetic,
         children: [
           Container(
-            width: 2,
-            height: 52,
-            decoration: BoxDecoration(color: MyTheme.accent),
+            width: 38,
+            height: 38,
+            decoration: BoxDecoration(
+                color: _sehMint.withOpacity(0.15),
+                borderRadius: BorderRadius.circular(12)),
+            child:
+                const Icon(Icons.password_rounded, color: _sehBlue, size: 20),
           ),
           Expanded(
             child: Padding(
-              padding: const EdgeInsets.only(left: 7),
+              padding: const EdgeInsets.only(left: 10),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
@@ -678,8 +869,9 @@ class _DesktopHomePageState extends State<DesktopHomePage>
                             readOnly: true,
                             decoration: InputDecoration(
                               border: InputBorder.none,
-                              contentPadding:
-                                  EdgeInsets.only(top: 14, bottom: 10),
+                              contentPadding: EdgeInsets.only(
+                                  top: compact ? 6 : 14,
+                                  bottom: compact ? 5 : 10),
                             ),
                             style: TextStyle(fontSize: 15),
                           ).workaroundFreezeLinuxMint(),
@@ -1143,6 +1335,7 @@ class _DesktopHomePageState extends State<DesktopHomePage>
           isTerminal: call.arguments['isTerminal'],
           isTcpTunneling: call.arguments['isTcpTunneling'],
           isRDP: call.arguments['isRDP'],
+          isViewOnly: call.arguments['isViewOnly'] ?? false,
           password: call.arguments['password'],
           forceRelay: call.arguments['forceRelay'],
           connToken: call.arguments['connToken'],
@@ -1479,58 +1672,4 @@ void setPasswordDialog({VoidCallback? notEmptyCallback}) async {
       onCancel: close,
     );
   });
-}
-
-/// One of the tab-like nav buttons in the home page header (e.g.
-/// "Control Remoto" / "Mis Equipos"): an icon, a title, and an optional
-/// subtitle underneath.
-class _HeaderNavButton extends StatelessWidget {
-  final IconData icon;
-  final String title;
-  final String? subtitle;
-  final VoidCallback onTap;
-
-  const _HeaderNavButton({
-    required this.icon,
-    required this.title,
-    this.subtitle,
-    required this.onTap,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Material(
-      color: Colors.transparent,
-      child: InkWell(
-        borderRadius: BorderRadius.circular(8),
-        onTap: onTap,
-        child: Padding(
-          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-          child: Row(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              Icon(icon, size: 20, color: MyTheme.accent),
-              const SizedBox(width: 8),
-              Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Text(
-                    title,
-                    style: const TextStyle(
-                        fontSize: 13, fontWeight: FontWeight.w600),
-                  ),
-                  if (subtitle != null)
-                    Text(
-                      subtitle!,
-                      style: Theme.of(context).textTheme.bodySmall,
-                    ),
-                ],
-              ),
-            ],
-          ),
-        ),
-      ),
-    );
-  }
 }

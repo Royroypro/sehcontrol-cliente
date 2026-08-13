@@ -83,10 +83,20 @@ class _PeerCardState extends State<_PeerCard>
   Widget _buildPortrait() {
     final peer = super.widget.peer;
     return Card(
-        margin: EdgeInsets.symmetric(horizontal: 2),
+        elevation: 0,
+        margin: const EdgeInsets.symmetric(horizontal: 2, vertical: 6),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(16),
+          side: BorderSide(
+            color: Theme.of(context).brightness == Brightness.dark
+                ? const Color(0xFF1B2A37)
+                : const Color(0xFFE0E6ED),
+          ),
+        ),
         child: gestureDetector(
           child: Container(
-              padding: EdgeInsets.only(left: 12, top: 8, bottom: 8),
+              padding: const EdgeInsets.only(
+                  left: 14, right: 4, top: 12, bottom: 12),
               child: _buildPeerTile(context, peer, null)),
         ));
   }
@@ -154,11 +164,11 @@ class _PeerCardState extends State<_PeerCard>
                     ),
             ),
             alignment: Alignment.center,
-            width: isPortrait ? 50 : 42,
-            height: isPortrait ? 50 : null,
+            width: isPortrait ? 58 : 42,
+            height: isPortrait ? 58 : null,
             child: Stack(
               children: [
-                getPlatformImage(peer.platform, size: isPortrait ? 38 : 30)
+                getPlatformImage(peer.platform, size: isPortrait ? 44 : 30)
                     .paddingAll(6),
                 if (_shouldBuildPasswordIcon(peer))
                   Positioned(
@@ -171,7 +181,7 @@ class _PeerCardState extends State<_PeerCard>
         Expanded(
           child: Container(
             decoration: BoxDecoration(
-              color: Theme.of(context).colorScheme.background,
+              color: Theme.of(context).colorScheme.surface,
               borderRadius: BorderRadius.only(
                 topRight: Radius.circular(_tileRadius),
                 bottomRight: Radius.circular(_tileRadius),
@@ -188,7 +198,11 @@ class _PeerCardState extends State<_PeerCard>
                             child: Text(
                           peer.alias.isEmpty ? formatID(peer.id) : peer.alias,
                           overflow: TextOverflow.ellipsis,
-                          style: Theme.of(context).textTheme.titleSmall,
+                          style:
+                              Theme.of(context).textTheme.titleMedium?.copyWith(
+                                    fontWeight: FontWeight.w600,
+                                    letterSpacing: 0.2,
+                                  ),
                         )),
                       ]).marginOnly(top: isPortrait ? 0 : 2),
                       Row(
@@ -201,7 +215,16 @@ class _PeerCardState extends State<_PeerCard>
                                 alignment: Alignment.centerLeft,
                                 child: Text(
                                   name,
-                                  style: isPortrait ? null : greyStyle,
+                                  style: isPortrait
+                                      ? TextStyle(
+                                          color: Theme.of(context)
+                                              .textTheme
+                                              .bodyMedium
+                                              ?.color
+                                              ?.withOpacity(0.65),
+                                          fontSize: 13,
+                                        )
+                                      : greyStyle,
                                   textAlign: TextAlign.start,
                                   overflow: TextOverflow.ellipsis,
                                 ),
@@ -359,7 +382,7 @@ class _PeerCardState extends State<_PeerCard>
                   ),
                 ),
                 Container(
-                  color: Theme.of(context).colorScheme.background,
+                  color: Theme.of(context).colorScheme.surface,
                   child: Row(
                     mainAxisAlignment: MainAxisAlignment.spaceBetween,
                     children: [
@@ -547,6 +570,7 @@ abstract class BasePeerCard extends StatelessWidget {
     bool isRDP = false,
     bool isTerminal = false,
     bool isTerminalRunAsAdmin = false,
+    bool isViewOnly = false,
   }) {
     return MenuEntryButton<String>(
       childBuilder: (TextStyle? style) => Text(
@@ -566,6 +590,7 @@ abstract class BasePeerCard extends StatelessWidget {
           isTcpTunneling: isTcpTunneling,
           isRDP: isRDP,
           isTerminal: isTerminal || isTerminalRunAsAdmin,
+          isViewOnly: isViewOnly,
         );
       },
       padding: menuPadding,
@@ -580,6 +605,15 @@ abstract class BasePeerCard extends StatelessWidget {
       (peer.alias.isEmpty
           ? translate('Connect')
           : '${translate('Connect')} ${peer.id}'),
+    );
+  }
+
+  @protected
+  MenuEntryBase<String> _viewOnlyAction(BuildContext context) {
+    return _connectCommonAction(
+      context,
+      '${translate('Connect')} ${translate('Read-only').toLowerCase()}',
+      isViewOnly: true,
     );
   }
 
@@ -968,6 +1002,7 @@ class RecentPeerCard extends BasePeerCard {
       BuildContext context) async {
     final List<MenuEntryBase<String>> menuItems = [
       _connectAction(context),
+      if (isDesktop) _viewOnlyAction(context),
       _transferFileAction(context),
       _viewCameraAction(context),
       _terminalAction(context),
@@ -1033,6 +1068,7 @@ class FavoritePeerCard extends BasePeerCard {
       BuildContext context) async {
     final List<MenuEntryBase<String>> menuItems = [
       _connectAction(context),
+      if (isDesktop) _viewOnlyAction(context),
       _transferFileAction(context),
       _viewCameraAction(context),
       _terminalAction(context),
@@ -1093,6 +1129,7 @@ class DiscoveredPeerCard extends BasePeerCard {
       BuildContext context) async {
     final List<MenuEntryBase<String>> menuItems = [
       _connectAction(context),
+      if (isDesktop) _viewOnlyAction(context),
       _transferFileAction(context),
       _viewCameraAction(context),
       _terminalAction(context),
@@ -1152,6 +1189,7 @@ class AddressBookPeerCard extends BasePeerCard {
       BuildContext context) async {
     final List<MenuEntryBase<String>> menuItems = [
       _connectAction(context),
+      if (isDesktop) _viewOnlyAction(context),
       _transferFileAction(context),
       _viewCameraAction(context),
       _terminalAction(context),
@@ -1309,6 +1347,7 @@ class MyGroupPeerCard extends BasePeerCard {
       BuildContext context) async {
     final List<MenuEntryBase<String>> menuItems = [
       _connectAction(context),
+      if (isDesktop) _viewOnlyAction(context),
       _transferFileAction(context),
       _viewCameraAction(context),
       _terminalAction(context),
@@ -1484,11 +1523,11 @@ Widget build_more(BuildContext context, {bool invert = false}) {
           radius: 14,
           backgroundColor: hover.value
               ? (invert
-                  ? Theme.of(context).colorScheme.background
+                  ? Theme.of(context).colorScheme.surface
                   : Theme.of(context).scaffoldBackgroundColor)
               : (invert
                   ? Theme.of(context).scaffoldBackgroundColor
-                  : Theme.of(context).colorScheme.background),
+                  : Theme.of(context).colorScheme.surface),
           child: Icon(Icons.more_vert,
               size: 18,
               color: hover.value
@@ -1543,7 +1582,8 @@ void connectInPeerTab(BuildContext context, Peer peer, PeerTabIndex tab,
     bool isViewCamera = false,
     bool isTcpTunneling = false,
     bool isRDP = false,
-    bool isTerminal = false}) async {
+    bool isTerminal = false,
+    bool isViewOnly = false}) async {
   var password = '';
   bool isSharedPassword = false;
   if (tab == PeerTabIndex.ab) {
@@ -1577,5 +1617,6 @@ void connectInPeerTab(BuildContext context, Peer peer, PeerTabIndex tab,
       isTerminal: isTerminal,
       isViewCamera: isViewCamera,
       isTcpTunneling: isTcpTunneling,
-      isRDP: isRDP);
+      isRDP: isRDP,
+      isViewOnly: isViewOnly);
 }

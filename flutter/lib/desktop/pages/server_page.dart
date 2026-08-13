@@ -82,9 +82,28 @@ class _DesktopServerPageState extends State<DesktopServerPage>
       ],
       child: Consumer<ServerModel>(
         builder: (context, serverModel, child) {
+          final baseTheme = Theme.of(context);
+          final isDark = baseTheme.brightness == Brightness.dark;
+          final sehTheme = baseTheme.copyWith(
+            scaffoldBackgroundColor:
+                isDark ? const Color(0xFF07111F) : const Color(0xFFF4F7FB),
+            colorScheme: baseTheme.colorScheme.copyWith(
+              primary: const Color(0xFF0877F9),
+              secondary: const Color(0xFF10A83A),
+              surface:
+                  isDark ? const Color(0xFF0B1828) : const Color(0xFFFFFFFF),
+              surfaceContainerHighest:
+                  isDark ? const Color(0xFF122238) : const Color(0xFFEDF3F9),
+            ),
+            dividerColor:
+                isDark ? const Color(0xFF20344B) : const Color(0xFFDCE5EF),
+          );
           final body = Scaffold(
-            backgroundColor: Theme.of(context).colorScheme.background,
-            body: ConnectionManager(),
+            backgroundColor: sehTheme.scaffoldBackgroundColor,
+            body: Theme(
+              data: sehTheme,
+              child: ConnectionManager(),
+            ),
           );
           return isLinux
               ? buildVirtualWindowFrame(context, body)
@@ -193,7 +212,7 @@ class ConnectionManagerState extends State<ConnectionManager>
               showClose: true,
               onWindowCloseButton: handleWindowCloseButton,
               controller: serverModel.tabController,
-              selectedBorderColor: MyTheme.accent,
+              selectedBorderColor: const Color(0xFF10A83A),
               maxLabelWidth: 100,
               tail: null, //buildScrollJumper(),
               tabBuilder: (key, icon, label, themeConf) {
@@ -295,7 +314,7 @@ class ConnectionManagerState extends State<ConnectionManager>
                 windowManager.startDragging();
               },
               child: Container(
-                color: Theme.of(context).colorScheme.background,
+                color: Theme.of(context).colorScheme.surface,
               ),
             ),
           ),
@@ -353,7 +372,33 @@ Widget buildConnectionCard(Client client) {
       key: ValueKey(client.id),
       children: [
         _CmHeader(client: client),
-        client.type_() == ClientType.file ||
+        if (client.viewOnly)
+          Container(
+            margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+            padding: const EdgeInsets.all(14),
+            decoration: BoxDecoration(
+              color: Theme.of(context).colorScheme.primary.withOpacity(0.10),
+              borderRadius: BorderRadius.circular(14),
+              border: Border.all(
+                color: Theme.of(context).colorScheme.primary.withOpacity(0.35),
+              ),
+            ),
+            child: Row(
+              children: [
+                Icon(Icons.visibility_outlined,
+                    color: Theme.of(context).colorScheme.primary),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: Text(
+                    '${translate('Read-only')}: la pantalla está siendo visualizada sin control remoto.',
+                    style: const TextStyle(fontSize: 12.5),
+                  ),
+                ),
+              ],
+            ),
+          ),
+        client.viewOnly ||
+                client.type_() == ClientType.file ||
                 client.type_() == ClientType.portForward ||
                 client.type_() == ClientType.terminal ||
                 client.disconnected
@@ -366,7 +411,7 @@ Widget buildConnectionCard(Client client) {
           ),
         )
       ],
-    ).paddingSymmetric(vertical: 4.0, horizontal: 8.0),
+    ).paddingSymmetric(vertical: 6.0, horizontal: 8.0),
   );
 }
 
@@ -442,17 +487,24 @@ class _CmHeaderState extends State<_CmHeader>
     super.build(context);
     return Container(
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(10.0),
+        borderRadius: BorderRadius.circular(16.0),
         gradient: LinearGradient(
-          begin: Alignment.topRight,
-          end: Alignment.bottomLeft,
+          begin: Alignment.topLeft,
+          end: Alignment.bottomRight,
           colors: [
-            Color(0xff00bfe1),
-            Color(0xff0071ff),
+            Theme.of(context).colorScheme.primary,
+            const Color(0xFF0B9E7A),
           ],
         ),
+        boxShadow: [
+          BoxShadow(
+            color: Theme.of(context).colorScheme.primary.withOpacity(0.18),
+            blurRadius: 16,
+            offset: const Offset(0, 6),
+          ),
+        ],
       ),
-      margin: EdgeInsets.symmetric(horizontal: 5.0, vertical: 10.0),
+      margin: const EdgeInsets.fromLTRB(8, 12, 8, 8),
       padding: EdgeInsets.only(
         top: 10.0,
         bottom: 10.0,
@@ -570,8 +622,8 @@ class _CmHeaderState extends State<_CmHeader>
   Widget _buildClientAvatar() {
     return buildAvatarWidget(
           avatar: client.avatar,
-          size: 70,
-          borderRadius: 15,
+          size: 64,
+          borderRadius: 32,
           fallback: _buildInitialAvatar(),
         ) ??
         _buildInitialAvatar();
@@ -579,19 +631,20 @@ class _CmHeaderState extends State<_CmHeader>
 
   Widget _buildInitialAvatar() {
     return Container(
-      width: 70,
-      height: 70,
+      width: 64,
+      height: 64,
       alignment: Alignment.center,
       decoration: BoxDecoration(
         color: str2color(client.name),
-        borderRadius: BorderRadius.circular(15.0),
+        shape: BoxShape.circle,
+        border: Border.all(color: Colors.white.withOpacity(0.55), width: 2),
       ),
       child: Text(
         client.name.isNotEmpty ? client.name[0] : '?',
         style: TextStyle(
           fontWeight: FontWeight.bold,
           color: Colors.white,
-          fontSize: 55,
+          fontSize: 46,
         ),
       ),
     );
@@ -615,32 +668,41 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
     return Tooltip(
       message: "$tooltipText: ${enabled ? "ON" : "OFF"}",
       waitDuration: Duration.zero,
-      child: Container(
-        decoration: BoxDecoration(
-          color: enabled
-              ? (canModify ? MyTheme.accent : MyTheme.accent.withOpacity(0.6))
-              : Colors.grey[700],
-          borderRadius: BorderRadius.circular(10.0),
-        ),
-        padding: EdgeInsets.all(8.0),
-        child: InkWell(
-          onTap: canModify
-              ? () =>
-                  checkClickTime(widget.client.id, () => onTap?.call(!enabled))
-              : null,
-          child: Column(
-            mainAxisAlignment: MainAxisAlignment.spaceAround,
-            children: [
-              Expanded(
-                child: Icon(
-                  iconData,
-                  color: Colors.white,
-                ),
+      child: Material(
+          color: Colors.transparent,
+          child: Container(
+            decoration: BoxDecoration(
+              color: enabled
+                  ? const Color(0xFF0877F9)
+                  : Theme.of(context).colorScheme.surfaceContainerHighest,
+              borderRadius: BorderRadius.circular(12.0),
+              border: Border.all(
+                color: enabled
+                    ? const Color(0xFF1590FF)
+                    : Theme.of(context).dividerColor,
               ),
-            ],
-          ),
-        ),
-      ),
+            ),
+            padding: EdgeInsets.all(8.0),
+            child: InkWell(
+              onTap: canModify
+                  ? () => checkClickTime(
+                      widget.client.id, () => onTap?.call(!enabled))
+                  : null,
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.spaceAround,
+                children: [
+                  Expanded(
+                    child: Icon(
+                      iconData,
+                      color: enabled
+                          ? Colors.white
+                          : Theme.of(context).colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          )),
     );
   }
 
@@ -654,26 +716,19 @@ class _PrivilegeBoardState extends State<_PrivilegeBoard> {
     return Container(
       width: double.infinity,
       height: 160.0,
-      margin: EdgeInsets.all(5.0),
-      padding: EdgeInsets.all(5.0),
+      margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+      padding: const EdgeInsets.fromLTRB(8, 10, 8, 8),
       decoration: BoxDecoration(
-        borderRadius: BorderRadius.circular(10.0),
-        color: Theme.of(context).colorScheme.background,
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.2),
-            spreadRadius: 1,
-            blurRadius: 1,
-            offset: Offset(0, 1.5),
-          ),
-        ],
+        borderRadius: BorderRadius.circular(16.0),
+        color: Theme.of(context).colorScheme.surface,
+        border: Border.all(color: Theme.of(context).dividerColor),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.center,
         children: [
           Text(
             translate("Permissions"),
-            style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+            style: const TextStyle(fontSize: 15, fontWeight: FontWeight.w700),
             textAlign: TextAlign.center,
           ).marginOnly(left: 4.0, bottom: 8.0),
           Expanded(
@@ -914,8 +969,9 @@ class _CmControlPanel extends StatelessWidget {
                                 value: d,
                                 groupValue: currentDevice,
                                 onChanged: (v) {
-                                  if (v != null)
+                                  if (v != null) {
                                     AudioInput.setDevice(v, true, true);
+                                  }
                                 },
                                 child: Container(
                                   child: Text(
@@ -1023,7 +1079,7 @@ class _CmControlPanel extends StatelessWidget {
           children: [
             Expanded(
               child: buildButton(context,
-                  color: Colors.redAccent,
+                  color: const Color(0xFFE94355),
                   onClick: handleDisconnect,
                   text: 'Disconnect',
                   icon: Icon(
@@ -1141,9 +1197,9 @@ class _CmControlPanel extends StatelessWidget {
         ),
       );
     }
-    final borderRadius = BorderRadius.circular(10.0);
+    final borderRadius = BorderRadius.circular(12.0);
     final btn = Container(
-      height: 28,
+      height: 36,
       decoration: BoxDecoration(
           color: color, borderRadius: borderRadius, border: border),
       child: InkWell(

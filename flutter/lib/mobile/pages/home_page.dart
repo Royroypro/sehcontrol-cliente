@@ -73,11 +73,43 @@ class HomePageState extends State<HomePage> {
           return false;
         },
         child: Scaffold(
-          // backgroundColor: MyTheme.grayBg,
+          backgroundColor: Theme.of(context).brightness == Brightness.dark
+              ? const Color(0xFF06131F)
+              : const Color(0xFFF7F9FC),
           appBar: AppBar(
-            centerTitle: true,
+            toolbarHeight: 76,
+            centerTitle: false,
+            elevation: 0,
+            scrolledUnderElevation: 0,
+            backgroundColor: Theme.of(context).brightness == Brightness.dark
+                ? const Color(0xFF06111C)
+                : Colors.white,
+            surfaceTintColor: Colors.transparent,
+            shape: Border(
+              bottom: BorderSide(
+                color: Theme.of(context).dividerColor.withOpacity(0.35),
+              ),
+            ),
             title: appTitle(),
-            actions: _pages.elementAt(_selectedIndex).appBarActions,
+            actions: [
+              IconButton(
+                tooltip: translate('Notifications'),
+                icon: const Icon(Icons.notifications_none_rounded),
+                onPressed: () {},
+              ),
+              ..._pages.elementAt(_selectedIndex).appBarActions,
+              if (_pages.elementAt(_selectedIndex).appBarActions.isEmpty)
+                IconButton(
+                  tooltip: translate('Settings'),
+                  icon: const Icon(Icons.more_vert_rounded),
+                  onPressed: () {
+                    setState(() {
+                      _selectedIndex = _pages.length - 1;
+                    });
+                  },
+                ),
+              const SizedBox(width: 8),
+            ],
           ),
           bottomNavigationBar: BottomNavigationBar(
             key: navigationBarKey,
@@ -87,8 +119,16 @@ class HomePageState extends State<HomePage> {
                 .toList(),
             currentIndex: _selectedIndex,
             type: BottomNavigationBarType.fixed,
-            selectedItemColor: MyTheme.accent, //
-            unselectedItemColor: MyTheme.darkGray,
+            selectedItemColor: const Color(0xFF087CF0),
+            unselectedItemColor: Theme.of(context).brightness == Brightness.dark
+                ? const Color(0xFF8A96A6)
+                : const Color(0xFF697587),
+            backgroundColor: Theme.of(context).brightness == Brightness.dark
+                ? const Color(0xFF071521)
+                : Colors.white,
+            elevation: 12,
+            selectedFontSize: 12,
+            unselectedFontSize: 12,
             onTap: (index) => setState(() {
               // close chat overlay when go chat page
               if (_selectedIndex != index) {
@@ -187,13 +227,33 @@ class HomePageState extends State<HomePage> {
     return Row(
       mainAxisSize: MainAxisSize.min,
       children: [
-        loadIcon(28),
-        const SizedBox(width: 8),
-        Text(
-          bind.mainGetAppNameSync().toUpperCase(),
-          style: const TextStyle(
-            fontWeight: FontWeight.bold,
-            letterSpacing: 0.5,
+        Container(
+          width: 48,
+          height: 48,
+          padding: const EdgeInsets.all(2),
+          decoration: BoxDecoration(
+            color: Colors.white,
+            shape: BoxShape.circle,
+            border: Border.all(color: const Color(0xFFCBD5E1)),
+          ),
+          child: ClipOval(child: loadIcon(44)),
+        ),
+        const SizedBox(width: 10),
+        RichText(
+          text: TextSpan(
+            style: TextStyle(
+              color: Theme.of(context).textTheme.titleLarge?.color,
+              fontSize: 20,
+              fontWeight: FontWeight.w800,
+              letterSpacing: 0.3,
+            ),
+            children: const [
+              TextSpan(text: 'SEH'),
+              TextSpan(
+                text: 'CONTROL',
+                style: TextStyle(color: Color(0xFF087CF0)),
+              ),
+            ],
           ),
         ),
       ],

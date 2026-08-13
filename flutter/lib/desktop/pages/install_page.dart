@@ -10,6 +10,7 @@ import 'package:get/get.dart';
 import 'package:path/path.dart';
 import 'package:url_launcher/url_launcher_string.dart';
 import 'package:window_manager/window_manager.dart';
+import 'package:flutter_svg/flutter_svg.dart';
 
 /// Los documentos legales viven en el servidor del proveedor, no en
 /// rustdesk.com: quien instala esto acepta las condiciones de Sehcontrol, y el
@@ -55,7 +56,7 @@ class _InstallPageState extends State<InstallPage> {
       enableResizeEdges: windowManagerEnableResizeEdges,
       child: Container(
         child: Scaffold(
-            backgroundColor: Theme.of(context).colorScheme.background,
+            backgroundColor: Theme.of(context).colorScheme.surface,
             body: DesktopTab(controller: tabController)),
       ),
     );
@@ -145,6 +146,8 @@ class _InstallPageBodyState extends State<_InstallPageBody>
           Obx(
             () => Checkbox(
               visualDensity: VisualDensity(horizontal: -4, vertical: -4),
+              activeColor: const Color(0xFF10A83A),
+              checkColor: Colors.white,
               value: option.value,
               onChanged: (v) =>
                   btnEnabled.value ? option.value = !option.value : null,
@@ -161,167 +164,258 @@ class _InstallPageBodyState extends State<_InstallPageBody>
   @override
   Widget build(BuildContext context) {
     final double em = 13;
-    final isDarkTheme = MyTheme.currentThemeMode() == ThemeMode.dark;
+    final isDarkTheme = Theme.of(context).brightness == Brightness.dark;
+    final appDisplayName = bind.mainGetAppNameSync();
+    final background =
+        isDarkTheme ? const Color(0xFF07111F) : const Color(0xFFF4F7FB);
+    final surface =
+        isDarkTheme ? const Color(0xFF0B1828) : const Color(0xFFFFFFFF);
+    final border =
+        isDarkTheme ? const Color(0xFF20344B) : const Color(0xFFDCE5EF);
     return Scaffold(
-        backgroundColor: null,
-        body: SingleChildScrollView(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              // Encabezado con el nombre del producto: el titulo suelto
-              // "Instalacion" no decia que se estaba instalando.
-              Row(
-                crossAxisAlignment: CrossAxisAlignment.center,
-                children: [
-                  Expanded(
-                    child: Column(
-                      crossAxisAlignment: CrossAxisAlignment.start,
+        backgroundColor: background,
+        body: Center(
+          child: SingleChildScrollView(
+            child: ConstrainedBox(
+              constraints: const BoxConstraints(maxWidth: 760),
+              child: Container(
+                margin: const EdgeInsets.all(28),
+                padding: const EdgeInsets.all(28),
+                decoration: BoxDecoration(
+                  color: surface,
+                  borderRadius: BorderRadius.circular(20),
+                  border: Border.all(color: border),
+                  boxShadow: isDarkTheme
+                      ? null
+                      : const [
+                          BoxShadow(
+                            color: Color(0x12000000),
+                            blurRadius: 24,
+                            offset: Offset(0, 8),
+                          )
+                        ],
+                ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Encabezado con el nombre del producto: el titulo suelto
+                    // "Instalacion" no decia que se estaba instalando.
+                    Row(
+                      crossAxisAlignment: CrossAxisAlignment.center,
                       children: [
-                        Text('${translate('Installation')} $appName',
-                            style:
-                                Theme.of(context).textTheme.headlineMedium),
-                        Text(
-                          '${translate('Version')} ${bind.mainGetVersion()}',
-                          style: TextStyle(
-                              fontSize: 13,
-                              color: Theme.of(context).hintColor),
-                        ).marginOnly(top: 4),
+                        Container(
+                          width: 58,
+                          height: 58,
+                          padding: const EdgeInsets.all(8),
+                          decoration: BoxDecoration(
+                            color: isDarkTheme
+                                ? const Color(0xFF10243A)
+                                : const Color(0xFFF1F7FF),
+                            shape: BoxShape.circle,
+                            border: Border.all(color: border),
+                          ),
+                          child: ClipOval(
+                            child: SvgPicture.asset(
+                              'assets/icon.svg',
+                              fit: BoxFit.cover,
+                            ),
+                          ),
+                        ),
+                        const SizedBox(width: 16),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                  '${translate('Installation')} $appDisplayName',
+                                  style: Theme.of(context)
+                                      .textTheme
+                                      .headlineSmall
+                                      ?.copyWith(fontWeight: FontWeight.w800)),
+                              Text(
+                                '${translate('Version')} ${bind.mainGetVersion()}',
+                                style: TextStyle(
+                                    fontSize: 13,
+                                    color: Theme.of(context).hintColor),
+                              ).marginOnly(top: 4),
+                            ],
+                          ),
+                        ),
                       ],
                     ),
-                  ),
-                ],
-              ),
-              Row(
-                children: [
-                  Text('${translate('Installation Path')}:')
-                      .marginOnly(right: 10),
-                  Expanded(
-                    child: TextField(
-                      controller: controller,
-                      readOnly: true,
-                      decoration: InputDecoration(
-                        contentPadding: EdgeInsets.all(0.75 * em),
-                      ),
-                    ).workaroundFreezeLinuxMint().marginOnly(right: 10),
-                  ),
-                  Obx(
-                    () => OutlinedButton.icon(
-                      icon: Icon(Icons.folder_outlined, size: 16),
-                      onPressed: btnEnabled.value ? selectInstallPath : null,
-                      style: buttonStyle,
-                      label: Text(translate('Change Path')),
-                    ),
-                  )
-                ],
-              ).marginSymmetric(vertical: 2 * em),
-              // Las casillas quedaban sueltas contra el fondo, a la misma
-              // altura visual que el resto; agrupadas se leen como lo que son:
-              // opciones de la instalacion.
-              Text(
-                translate('Options'),
-                style: TextStyle(
-                    fontSize: 12,
-                    fontWeight: FontWeight.w600,
-                    letterSpacing: 0.4,
-                    color: Theme.of(context).hintColor),
-              ).marginOnly(bottom: 8),
-              Option(startmenu, label: 'Create start menu shortcuts')
-                  .marginOnly(bottom: 4),
-              Option(desktopicon, label: 'Create desktop icon'),
-              //Option(printer, label: 'Install {$appName} Printer'),
-              Container(
-                  padding: EdgeInsets.all(14),
-                  decoration: BoxDecoration(
-                    color: isDarkTheme
-                        ? Color.fromARGB(135, 87, 87, 90)
-                        : Colors.grey[100],
-                    borderRadius: BorderRadius.circular(8),
-                    border: Border.all(
-                        color: isDarkTheme
-                            ? Colors.grey.withOpacity(0.4)
-                            : Colors.grey.shade300),
-                  ),
-                  child: Row(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Icon(Icons.info_outline_rounded, size: 26)
-                          .marginOnly(right: 14, top: 2),
-                      Expanded(
-                        child: Column(
+                    Row(
+                      children: [
+                        Container(
+                          width: 38,
+                          height: 38,
+                          decoration: BoxDecoration(
+                            color: const Color(0xFF0877F9).withOpacity(0.12),
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: const Icon(Icons.folder_open_rounded,
+                              color: Color(0xFF0877F9), size: 20),
+                        ).marginOnly(right: 12),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text('${translate('Installation Path')}:',
+                                  style: const TextStyle(
+                                      fontSize: 12,
+                                      fontWeight: FontWeight.w600)),
+                              const SizedBox(height: 6),
+                              TextField(
+                                controller: controller,
+                                readOnly: true,
+                                decoration: InputDecoration(
+                                  filled: true,
+                                  fillColor: Theme.of(context)
+                                      .colorScheme
+                                      .surfaceContainerHighest
+                                      .withOpacity(0.55),
+                                  contentPadding: EdgeInsets.all(0.75 * em),
+                                  border: OutlineInputBorder(
+                                    borderRadius: BorderRadius.circular(10),
+                                    borderSide: BorderSide(color: border),
+                                  ),
+                                ),
+                              ).workaroundFreezeLinuxMint(),
+                            ],
+                          ).marginOnly(right: 10),
+                        ),
+                        Obx(
+                          () => OutlinedButton.icon(
+                            icon: Icon(Icons.folder_outlined, size: 16),
+                            onPressed:
+                                btnEnabled.value ? selectInstallPath : null,
+                            style: buttonStyle,
+                            label: Text(translate('Change Path')),
+                          ),
+                        )
+                      ],
+                    ).marginSymmetric(vertical: 1.6 * em),
+                    // Las casillas quedaban sueltas contra el fondo, a la misma
+                    // altura visual que el resto; agrupadas se leen como lo que son:
+                    // opciones de la instalacion.
+                    Text(
+                      translate('Options'),
+                      style: TextStyle(
+                          fontSize: 12,
+                          fontWeight: FontWeight.w600,
+                          letterSpacing: 0.4,
+                          color: Theme.of(context).hintColor),
+                    ).marginOnly(bottom: 8),
+                    Option(startmenu, label: 'Create start menu shortcuts')
+                        .marginOnly(bottom: 4),
+                    Option(desktopicon, label: 'Create desktop icon'),
+                    //Option(printer, label: 'Install {$appName} Printer'),
+                    Container(
+                        padding: EdgeInsets.all(14),
+                        decoration: BoxDecoration(
+                          color: isDarkTheme
+                              ? const Color(0xFF0D2630)
+                              : const Color(0xFFF1FBF6),
+                          borderRadius: BorderRadius.circular(12),
+                          border: Border.all(color: const Color(0xFF10A83A)),
+                        ),
+                        child: Row(
                           crossAxisAlignment: CrossAxisAlignment.start,
                           children: [
-                            Text(translate('agreement_tip'))
-                                .marginOnly(bottom: 0.7 * em),
-                            // Los dos documentos juntos: el acuerdo remite a la
-                            // privacidad y quien va a instalar suele querer
-                            // leer esa antes que nada.
-                            Wrap(
-                              spacing: 18,
-                              runSpacing: 6,
-                              children: [
-                                _legalLink(
-                                    context, 'End-user license agreement',
-                                    '$_kSiteBase/eula'),
-                                _legalLink(context, 'Privacy Statement',
-                                    '$_kSiteBase/privacy.html'),
-                              ],
-                            ),
+                            const Icon(Icons.verified_user_outlined,
+                                    size: 26, color: Color(0xFF10A83A))
+                                .marginOnly(right: 14, top: 2),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  Text(translate('agreement_tip'))
+                                      .marginOnly(bottom: 0.7 * em),
+                                  // Los dos documentos juntos: el acuerdo remite a la
+                                  // privacidad y quien va a instalar suele querer
+                                  // leer esa antes que nada.
+                                  Wrap(
+                                    spacing: 18,
+                                    runSpacing: 6,
+                                    children: [
+                                      _legalLink(
+                                          context,
+                                          'End-user license agreement',
+                                          '$_kSiteBase/eula'),
+                                      _legalLink(context, 'Privacy Statement',
+                                          '$_kSiteBase/privacy.html'),
+                                    ],
+                                  ),
+                                ],
+                              ),
+                            )
                           ],
+                        )).marginSymmetric(vertical: 1.6 * em),
+                    Row(
+                      children: [
+                        Expanded(
+                          // NOT use Offstage to wrap LinearProgressIndicator
+                          child: Obx(() => showProgress.value
+                              ? LinearProgressIndicator().marginOnly(right: 10)
+                              : Offstage()),
                         ),
-                      )
-                    ],
-                  )).marginSymmetric(vertical: 1.6 * em),
-              Row(
-                children: [
-                  Expanded(
-                    // NOT use Offstage to wrap LinearProgressIndicator
-                    child: Obx(() => showProgress.value
-                        ? LinearProgressIndicator().marginOnly(right: 10)
-                        : Offstage()),
-                  ),
-                  // Orden: primero las salidas, y la accion recomendada al
-                  // final. Antes "Aceptar e instalar" quedaba en el medio,
-                  // entre dos botones que hacen otra cosa, y no se leia como
-                  // el camino principal.
-                  Obx(
-                    () => OutlinedButton.icon(
-                      icon: Icon(Icons.close_rounded, size: 16),
-                      label: Text(translate('Cancel')),
-                      onPressed:
-                          btnEnabled.value ? () => windowManager.close() : null,
-                      style: buttonStyle,
-                    ).marginOnly(right: 10),
-                  ),
-                  Offstage(
-                    offstage: bind.installShowRunWithoutInstall(),
-                    child: Obx(
-                      () => OutlinedButton.icon(
-                        icon: Icon(Icons.screen_share_outlined, size: 16),
-                        label: Text(translate('Run without install')),
-                        onPressed: btnEnabled.value
-                            ? () => bind.installRunWithoutInstall()
-                            : null,
-                        style: buttonStyle,
-                      ).marginOnly(right: 10),
-                    ),
-                  ),
-                  Obx(
-                    () => ElevatedButton.icon(
-                      icon: Icon(Icons.done_rounded, size: 18),
-                      label: Text(translate('Accept and Install')),
-                      onPressed: btnEnabled.value ? install : null,
-                      style: ElevatedButton.styleFrom(
-                        padding: EdgeInsets.symmetric(
-                            horizontal: 1.6 * em, vertical: 1.1 * em),
-                        textStyle: const TextStyle(
-                            fontSize: 14, fontWeight: FontWeight.w600),
-                      ),
-                    ),
-                  ),
-                ],
-              )
-            ],
-          ).paddingSymmetric(horizontal: 4 * em, vertical: 3 * em),
+                        // Orden: primero las salidas, y la accion recomendada al
+                        // final. Antes "Aceptar e instalar" quedaba en el medio,
+                        // entre dos botones que hacen otra cosa, y no se leia como
+                        // el camino principal.
+                        Obx(
+                          () => OutlinedButton.icon(
+                            icon: Icon(Icons.close_rounded, size: 16),
+                            label: Text(translate('Cancel')),
+                            onPressed: btnEnabled.value
+                                ? () => windowManager.close()
+                                : null,
+                            style: buttonStyle,
+                          ).marginOnly(right: 10),
+                        ),
+                        Offstage(
+                          offstage: bind.installShowRunWithoutInstall(),
+                          child: Obx(
+                            () => OutlinedButton.icon(
+                              icon: Icon(Icons.screen_share_outlined, size: 16),
+                              label: Text(translate('Run without install')),
+                              onPressed: btnEnabled.value
+                                  ? () => bind.installRunWithoutInstall()
+                                  : null,
+                              style: buttonStyle,
+                            ).marginOnly(right: 10),
+                          ),
+                        ),
+                        Obx(
+                          () => Container(
+                            decoration: BoxDecoration(
+                              gradient: const LinearGradient(
+                                colors: [Color(0xFF0877F9), Color(0xFF10B63B)],
+                              ),
+                              borderRadius: BorderRadius.circular(10),
+                            ),
+                            child: ElevatedButton.icon(
+                              icon: const Icon(Icons.done_rounded, size: 18),
+                              label: Text(translate('Accept and Install')),
+                              onPressed: btnEnabled.value ? install : null,
+                              style: ElevatedButton.styleFrom(
+                                backgroundColor: Colors.transparent,
+                                foregroundColor: Colors.white,
+                                shadowColor: Colors.transparent,
+                                padding: EdgeInsets.symmetric(
+                                    horizontal: 1.6 * em, vertical: 1.1 * em),
+                                textStyle: const TextStyle(
+                                    fontSize: 14, fontWeight: FontWeight.w700),
+                              ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    )
+                  ],
+                ),
+              ),
+            ),
+          ),
         ));
   }
 

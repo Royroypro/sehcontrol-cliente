@@ -26,7 +26,9 @@ import '../../common.dart';
 import '../../models/platform_model.dart';
 
 class PeerTabPage extends StatefulWidget {
-  const PeerTabPage({Key? key}) : super(key: key);
+  const PeerTabPage({Key? key, this.showSearchAction = true}) : super(key: key);
+
+  final bool showSearchAction;
   @override
   State<PeerTabPage> createState() => _PeerTabPageState();
 }
@@ -110,7 +112,7 @@ class _PeerTabPageState extends State<PeerTabPage>
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         Obx(() => SizedBox(
-              height: 32,
+              height: stateGlobal.isPortrait.isTrue ? 48 : 32,
               child: Container(
                 padding: stateGlobal.isPortrait.isTrue
                     ? EdgeInsets.symmetric(horizontal: 2)
@@ -159,8 +161,9 @@ class _PeerTabPageState extends State<PeerTabPage>
     if (t == PeerTabIndex.recent.index) {
       return gFFI.recentPeersModel.getPeersCount();
     }
-    if (t == PeerTabIndex.fav.index)
+    if (t == PeerTabIndex.fav.index) {
       return gFFI.favoritePeersModel.getPeersCount();
+    }
     if (t == PeerTabIndex.lan.index) return gFFI.lanPeersModel.getPeersCount();
     if (t == PeerTabIndex.ab.index) return gFFI.abModel.currentAbPeers.length;
     if (t == PeerTabIndex.group.index) return gFFI.groupModel.peers.length;
@@ -216,19 +219,23 @@ class _PeerTabPageState extends State<PeerTabPage>
       child: ChoiceChip(
         label: Text(
           '${_tabLabel(model, tab)} (${_tabCount(tab)})',
-          style: TextStyle(color: color, fontSize: 12),
+          style: TextStyle(
+              color: color, fontSize: 13, fontWeight: FontWeight.w500),
         ),
-        labelPadding: EdgeInsets.zero,
-        padding: EdgeInsets.zero,
+        labelPadding: const EdgeInsets.symmetric(horizontal: 5),
+        padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 8),
         selected: selected,
         showCheckmark: false,
         visualDensity: const VisualDensity(horizontal: -3, vertical: -4),
         materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-        side: BorderSide.none,
-        backgroundColor:
-            isDark ? const Color(0xFF303030) : const Color(0xFFF0F1F4),
+        side: BorderSide(
+          color: selected
+              ? const Color(0xFF087CF0)
+              : (isDark ? const Color(0xFF243340) : const Color(0xFFDDE3EA)),
+        ),
+        backgroundColor: isDark ? const Color(0xFF0B1824) : Colors.white,
         selectedColor:
-            isDark ? const Color(0xFF424242) : const Color(0xFFE3F2FD),
+            isDark ? const Color(0xFF102A42) : const Color(0xFFEAF4FF),
         onSelected: (_) async {
           if (tab == PeerTabIndex.ab.index) {
             gFFI.abModel.selectedTags.clear();
@@ -243,9 +250,8 @@ class _PeerTabPageState extends State<PeerTabPage>
 
   Widget _buildMobileReservedTagChip(BuildContext context, String tag) {
     return Obx(() {
-      final count = gFFI.abModel.currentAbPeers
-          .where((p) => p.tags.contains(tag))
-          .length;
+      final count =
+          gFFI.abModel.currentAbPeers.where((p) => p.tags.contains(tag)).length;
       final selected = gFFI.peerTabModel.currentTab == PeerTabIndex.ab.index &&
           gFFI.abModel.selectedTags.length == 1 &&
           gFFI.abModel.selectedTags.first == tag;
@@ -256,19 +262,23 @@ class _PeerTabPageState extends State<PeerTabPage>
       return Padding(
         padding: const EdgeInsets.symmetric(horizontal: 1),
         child: ChoiceChip(
-          label:
-              Text('$tag ($count)', style: TextStyle(color: color, fontSize: 12)),
-          labelPadding: EdgeInsets.zero,
-          padding: EdgeInsets.zero,
+          label: Text('$tag ($count)',
+              style: TextStyle(
+                  color: color, fontSize: 13, fontWeight: FontWeight.w500)),
+          labelPadding: const EdgeInsets.symmetric(horizontal: 5),
+          padding: const EdgeInsets.symmetric(horizontal: 2, vertical: 8),
           selected: selected,
           showCheckmark: false,
           visualDensity: const VisualDensity(horizontal: -3, vertical: -4),
           materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
-          side: BorderSide.none,
-          backgroundColor:
-              isDark ? const Color(0xFF303030) : const Color(0xFFF0F1F4),
+          side: BorderSide(
+            color: selected
+                ? const Color(0xFF087CF0)
+                : (isDark ? const Color(0xFF243340) : const Color(0xFFDDE3EA)),
+          ),
+          backgroundColor: isDark ? const Color(0xFF0B1824) : Colors.white,
           selectedColor:
-              isDark ? const Color(0xFF424242) : const Color(0xFFE3F2FD),
+              isDark ? const Color(0xFF102A42) : const Color(0xFFEAF4FF),
           onSelected: (_) async {
             gFFI.abModel.selectedTags
               ..clear()
@@ -326,7 +336,7 @@ class _PeerTabPageState extends State<PeerTabPage>
         children: model.visibleEnabledOrderedIndexs.map((t) {
           final hover = false.obs;
           final deco = BoxDecoration(
-              color: Theme.of(context).colorScheme.background,
+              color: Theme.of(context).colorScheme.surface,
               borderRadius: BorderRadius.circular(6));
           counter += 1;
           return ReorderableDragStartListener(
@@ -337,13 +347,14 @@ class _PeerTabPageState extends State<PeerTabPage>
                     (t != PeerTabIndex.ab.index ||
                         gFFI.abModel.selectedTags.isEmpty);
                 final color = selected
-                    ? MyTheme.tabbar(context).selectedTextColor
-                    : MyTheme.tabbar(context).unSelectedTextColor
-                  ?..withOpacity(0.5);
+                    ? Colors.white
+                    : MyTheme.tabbar(context)
+                        .unSelectedTextColor
+                        ?.withOpacity(0.8);
                 final decoBorder = BoxDecoration(
-                    border: Border(
-                  bottom: BorderSide(width: 2, color: color!),
-                ));
+                  color: const Color(0xFF10A83A),
+                  borderRadius: BorderRadius.circular(18),
+                );
                 return Tooltip(
                   preferBelow: false,
                   message: model.tabTooltip(t),
@@ -361,7 +372,7 @@ class _PeerTabPageState extends State<PeerTabPage>
                           Text('${_tabLabel(model, t)} (${_tabCount(t)})',
                               style: TextStyle(color: color, fontSize: 13)),
                         ],
-                      ).paddingSymmetric(horizontal: 4),
+                      ).paddingSymmetric(horizontal: 8, vertical: 5),
                     ).paddingSymmetric(horizontal: 4),
                     onTap: isOptionFixed(kOptionPeerTabIndex)
                         ? null
@@ -404,7 +415,9 @@ class _PeerTabPageState extends State<PeerTabPage>
     }
     return Expanded(
         child: child.marginSymmetric(
-            vertical: (isDesktop || isWebDesktop) ? 12.0 : 6.0));
+            vertical: (isDesktop || isWebDesktop)
+                ? (MediaQuery.of(context).size.height < 820 ? 4.0 : 12.0)
+                : 6.0));
   }
 
   Widget _createRefresh(
@@ -751,7 +764,7 @@ class _PeerTabPageState extends State<PeerTabPage>
   List<Widget> _landscapeRightActions(BuildContext context) {
     final model = Provider.of<PeerTabModel>(context);
     return [
-      const PeerSearchBar().marginOnly(right: 13),
+      if (widget.showSearchAction) const PeerSearchBar().marginOnly(right: 13),
       _createRefresh(
           index: PeerTabIndex.ab, loading: gFFI.abModel.currentAbLoading),
       _createRefresh(
@@ -856,7 +869,11 @@ class _PeerTabPageState extends State<PeerTabPage>
 }
 
 class PeerSearchBar extends StatefulWidget {
-  const PeerSearchBar({Key? key}) : super(key: key);
+  const PeerSearchBar({Key? key, this.expanded = false, this.width})
+      : super(key: key);
+
+  final bool expanded;
+  final double? width;
 
   @override
   State<StatefulWidget> createState() => _PeerSearchBarState();
@@ -867,8 +884,8 @@ class _PeerSearchBarState extends State<PeerSearchBar> {
 
   @override
   Widget build(BuildContext context) {
-    return drawer
-        ? _buildSearchBar()
+    return drawer || widget.expanded
+        ? _buildSearchBar(autofocus: !widget.expanded)
         : _hoverAction(
             context: context,
             toolTip: translate('Search'),
@@ -884,7 +901,7 @@ class _PeerSearchBarState extends State<PeerSearchBar> {
             ));
   }
 
-  Widget _buildSearchBar() {
+  Widget _buildSearchBar({required bool autofocus}) {
     RxBool focused = false.obs;
     FocusNode focusNode = FocusNode();
     focusNode.addListener(() {
@@ -894,10 +911,13 @@ class _PeerSearchBarState extends State<PeerSearchBar> {
           extentOffset: peerSearchTextController.value.text.length);
     });
     return Obx(() => Container(
-          width: stateGlobal.isPortrait.isTrue ? 120 : 140,
+          width: widget.width ?? (stateGlobal.isPortrait.isTrue ? 120 : 140),
           decoration: BoxDecoration(
-            color: Theme.of(context).colorScheme.background,
-            borderRadius: BorderRadius.circular(6),
+            color: Theme.of(context).colorScheme.surface,
+            borderRadius: BorderRadius.circular(10),
+            border: Border.all(
+              color: Theme.of(context).dividerColor.withOpacity(0.65),
+            ),
           ),
           child: Row(
             children: [
@@ -910,7 +930,7 @@ class _PeerSearchBarState extends State<PeerSearchBar> {
                     ).marginSymmetric(horizontal: 4),
                     Expanded(
                       child: TextField(
-                        autofocus: true,
+                        autofocus: autofocus,
                         controller: peerSearchTextController,
                         onChanged: (searchText) {
                           peerSearchText.value = searchText;
@@ -1165,7 +1185,7 @@ class RefreshWidgetState extends State<RefreshWidget> {
   @override
   Widget build(BuildContext context) {
     final deco = BoxDecoration(
-      color: Theme.of(context).colorScheme.background,
+      color: Theme.of(context).colorScheme.surface,
       borderRadius: BorderRadius.circular(6),
     );
     return AnimatedRotation(
@@ -1207,7 +1227,7 @@ Widget _hoverAction(
     EdgeInsetsGeometry padding = const EdgeInsets.all(4.0)}) {
   final hover = false.obs;
   final deco = BoxDecoration(
-    color: Theme.of(context).colorScheme.background,
+    color: Theme.of(context).colorScheme.surface,
     borderRadius: BorderRadius.circular(6),
   );
   return Tooltip(
