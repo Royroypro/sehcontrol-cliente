@@ -17,6 +17,32 @@ pub const NAME: &'static str = "display";
 #[cfg(windows)]
 const DUMMY_DISPLAY_SIDE_MAX_SIZE: usize = 1024;
 
+// Outcome of the last headless virtual-display attempt, so the connection can
+// tell the operator *why* a headless machine shows no screen instead of failing
+// silently (surfaced as a MessageBox in connection.rs).
+// 0 = ok / not headless, 1 = Windows too old, 2 = app not installed or driver
+// unsupported, 3 = driver install / plug-in failed.
+#[cfg(windows)]
+static HEADLESS_DISPLAY_STATUS: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(0);
+
+#[cfg(windows)]
+fn set_headless_display_status(status: u8) {
+    HEADLESS_DISPLAY_STATUS.store(status, Ordering::SeqCst);
+}
+
+// Consume the last headless-display issue as a client-side translation key, or
+// None when a display was present or a virtual one was plugged in normally.
+#[cfg(windows)]
+pub fn take_headless_display_issue_tip() -> Option<&'static str> {
+    match HEADLESS_DISPLAY_STATUS.swap(0, Ordering::SeqCst) {
+        1 => Some("idd_not_support_under_win10_2004_tip"),
+        2 => Some("headless_display_not_installed_tip"),
+        3 => Some("headless_display_plug_failed_tip"),
+        _ => None,
+    }
+}
+
 struct ChangedResolution {
     original: (i32, i32),
     changed: (i32, i32),
@@ -630,10 +656,22 @@ pub fn try_get_displays_add_amyuni_headless() -> ResultType<Vec<Display>> {
 #[cfg(windows)]
 pub fn try_get_displays_(add_amyuni_headless: bool) -> ResultType<Vec<Display>> {
     let mut displays = Display::all()?;
+    let is_headless = no_displays(&displays);
 
     // Do not add virtual display if the platform is not installed or the virtual display is not supported.
     if !crate::platform::is_installed() || !virtual_display_manager::is_virtual_display_supported()
     {
+        // Record why a headless machine can't get a virtual screen so the
+        // operator gets an actionable reason instead of a black "No displays".
+        if is_headless {
+            set_headless_display_status(
+                if !virtual_display_manager::is_virtual_display_supported() {
+                    1
+                } else {
+                    2
+                },
+            );
+        }
         return Ok(displays);
     }
 
@@ -662,13 +700,14 @@ pub fn try_get_displays_(add_amyuni_headless: bool) -> ResultType<Vec<Display>> 
     //     return Ok(displays);
     // }
 
-    let no_displays_v = no_displays(&displays);
-    if no_displays_v {
+    if is_headless {
         log::debug!("no displays, create virtual display");
         if let Err(e) = virtual_display_manager::plug_in_headless() {
             log::error!("plug in headless failed {}", e);
+            set_headless_display_status(3);
         } else {
             displays = Display::all()?;
+            set_headless_display_status(0);
         }
     }
     Ok(displays)

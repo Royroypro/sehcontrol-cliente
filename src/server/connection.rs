@@ -1744,6 +1744,21 @@ impl Connection {
         (format!("{}:{}", pf.host, pf.port), is_rdp)
     }
 
+    // Build the message shown to the operator when the tunnel target can't be
+    // reached. For RDP we send a translation key so the client can explain that
+    // Sehcontrol is only a bridge and Windows Remote Desktop must be enabled on
+    // the remote side (see client.rs handle_login_error -> msgbox).
+    fn port_forward_unreachable_msg(is_rdp: bool, addr: &str) -> String {
+        if is_rdp {
+            "rdp_unreachable_tip".to_owned()
+        } else {
+            format!(
+                "Failed to access remote {}. Please make sure it is reachable/open.",
+                addr
+            )
+        }
+    }
+
     async fn connect_port_forward_if_needed(&mut self) -> bool {
         if self.port_forward_socket.is_some() {
             return true;
@@ -1752,7 +1767,7 @@ impl Connection {
             return true;
         };
         let mut pf = pf.clone();
-        let (mut addr, is_rdp) = Self::normalize_port_forward_target(&mut pf);
+        let (addr, is_rdp) = Self::normalize_port_forward_target(&mut pf);
         self.port_forward_address = addr.clone();
         match timeout(3000, TcpStream::connect(&addr)).await {
             Ok(Ok(sock)) => {
@@ -1761,26 +1776,14 @@ impl Connection {
             }
             Ok(Err(e)) => {
                 log::warn!("Port forward connect failed for {}: {}", addr, e);
-                if is_rdp {
-                    addr = "RDP".to_owned();
-                }
-                self.send_login_error(format!(
-                    "Failed to access remote {}. Please make sure it is reachable/open.",
-                    addr
-                ))
-                .await;
+                self.send_login_error(Self::port_forward_unreachable_msg(is_rdp, &addr))
+                    .await;
                 false
             }
             Err(e) => {
                 log::warn!("Port forward connect timed out for {}: {}", addr, e);
-                if is_rdp {
-                    addr = "RDP".to_owned();
-                }
-                self.send_login_error(format!(
-                    "Failed to access remote {}. Please make sure it is reachable/open.",
-                    addr
-                ))
-                .await;
+                self.send_login_error(Self::port_forward_unreachable_msg(is_rdp, &addr))
+                    .await;
                 false
             }
         }
@@ -2028,6 +2031,9 @@ impl Connection {
         let mut sub_service = false;
         #[allow(unused_mut)]
         let mut wait_session_id_confirm = false;
+        // Headless virtual-display outcome to warn the operator about, if any.
+        #[cfg(windows)]
+        let mut headless_tip: Option<&'static str> = None;
         #[cfg(windows)]
         if !self.terminal {
             self.handle_windows_specific_session(&mut pi, &mut wait_session_id_confirm);
@@ -2098,6 +2104,13 @@ impl Connection {
                     res.set_peer_info(pi);
                     sub_service = true;
 
+                    // If the machine is headless and no (virtual) display could
+                    // be provided, tell the operator why instead of a black screen.
+                    #[cfg(windows)]
+                    {
+                        headless_tip = display_service::take_headless_display_issue_tip();
+                    }
+
                     #[cfg(target_os = "linux")]
                     {
                         // use rdp_input when uinput is not available in wayland. Ex: flatpak
@@ -2112,6 +2125,20 @@ impl Connection {
         let mut msg_out = Message::new();
         msg_out.set_login_response(res);
         self.send(msg_out).await;
+        // Warn the operator when a headless machine could not provide a screen
+        // (Windows too old, app not installed, or virtual-display driver failed).
+        #[cfg(windows)]
+        if let Some(tip) = headless_tip {
+            let mut msg_out = Message::new();
+            msg_out.set_message_box(MessageBox {
+                msgtype: "nook-nocancel-hasclose".to_owned(),
+                title: "Virtual display".to_owned(),
+                text: tip.to_owned(),
+                link: "".to_owned(),
+                ..Default::default()
+            });
+            self.send(msg_out).await;
+        }
         self.update_scoped_login_options().await;
         if let Some((dir, show_hidden)) = self.file_transfer.clone() {
             self.keyboard = false;
