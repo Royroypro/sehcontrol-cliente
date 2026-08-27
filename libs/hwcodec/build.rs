@@ -154,7 +154,15 @@ mod ffmpeg {
             )
         );
         {
-            let mut static_libs = vec!["avcodec", "avutil", "avformat", "swresample"];
+            let mut static_libs = vec!["avcodec", "avutil", "avformat"];
+            // El overlay-port de ffmpeg de este proyecto compila con
+            // --disable-swresample (res/vcpkg/ffmpeg/portfile.cmake), y el codigo
+            // de hwcodec no referencia ningun simbolo swr_*/SwrContext, asi que en
+            // Linux no existe libswresample.a y enlazarla rompe el build. En el
+            // resto de plataformas se mantiene por si su ffmpeg si la incluye.
+            if target_os != "linux" {
+                static_libs.push("swresample");
+            }
             // Intel Quick Sync (libmfx/QSV) is x86/x64-only; FFmpeg is built without
             // --enable-libmfx on arm64 (see res/vcpkg/ffmpeg/portfile.cmake), so don't link it there.
             if target_os == "windows" && (target_arch == "x64" || target_arch == "x86") {
