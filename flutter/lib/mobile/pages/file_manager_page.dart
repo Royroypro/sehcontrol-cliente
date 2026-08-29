@@ -8,6 +8,7 @@ import 'package:toggle_switch/toggle_switch.dart';
 
 import '../../common.dart';
 import '../../common/widgets/dialog.dart';
+import 'file_preview_sheet.dart';
 
 class FileManagerPage extends StatefulWidget {
   FileManagerPage(
@@ -524,11 +525,11 @@ class _FileManagerViewState extends State<FileManagerView> {
                                   child: Text(translate("Multi Select")),
                                   value: "multi_select",
                                 ),
-                                PopupMenuItem(
-                                  child: Text(translate("Properties")),
-                                  value: "properties",
-                                  enabled: false,
-                                ),
+                                if (entries[index].isFile)
+                                  PopupMenuItem(
+                                    child: Text(translate("Preview")),
+                                    value: "preview",
+                                  ),
                                 if (!entries[index].isDrive &&
                                     versionCmp(gFFI.ffiModel.pi.version,
                                             "1.3.0") >=
@@ -551,6 +552,13 @@ class _FileManagerViewState extends State<FileManagerView> {
                               } else if (v == "rename") {
                                 controller.renameAction(
                                     entries[index], isLocal);
+                              } else if (v == "preview") {
+                                showMobileFilePreview(
+                                  context,
+                                  entry: entries[index],
+                                  controller: controller,
+                                  isLocal: isLocal,
+                                );
                               }
                             }),
                 onTap: () {
@@ -566,7 +574,12 @@ class _FileManagerViewState extends State<FileManagerView> {
                   if (entries[index].isDirectory || entries[index].isDrive) {
                     controller.openDirectory(entries[index].path);
                   } else {
-                    // Perform file-related tasks.
+                    showMobileFilePreview(
+                      context,
+                      entry: entries[index],
+                      controller: controller,
+                      isLocal: isLocal,
+                    );
                   }
                 },
                 onLongPress: entries[index].isDrive

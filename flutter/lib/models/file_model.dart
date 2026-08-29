@@ -47,6 +47,13 @@ class JobID {
 typedef GetSessionID = SessionID Function();
 typedef GetDialogManager = OverlayDialogManager? Function();
 
+/// Identifies which single file is shown in the desktop preview panel.
+class PreviewTarget {
+  final bool isLocal;
+  final Entry entry;
+  const PreviewTarget(this.isLocal, this.entry);
+}
+
 class FileModel {
   final WeakReference<FFI> parent;
   // late final String sessionId;
@@ -60,6 +67,10 @@ class FileModel {
   late final GetDialogManager getDialogManager;
   SessionID get sessionId => getSessionID();
   late final FileDialogEventLoop evtLoop;
+
+  /// The file currently targeted for the preview panel (desktop), or null when
+  /// nothing single-file is selected.
+  final previewTarget = Rxn<PreviewTarget>();
 
   FileModel(this.parent) {
     getSessionID = () => parent.target!.sessionId;

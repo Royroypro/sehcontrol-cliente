@@ -230,6 +230,33 @@ def prepare_windows_privacy_components(output_dir):
         raise FileNotFoundError('Paquete de privacidad incompleto: ' + ', '.join(missing))
     print('Windows privacy components validated successfully.')
 
+def prepare_ffmpeg_tools(output_dir):
+    """Copy the bundled ffmpeg/ffprobe binaries beside the packaged app so the
+    file-transfer video preview works without a system ffmpeg install.
+
+    Drop ffmpeg.exe / ffprobe.exe into res/ffmpeg/windows-x64/ (they are not
+    committed to keep the repo small). Never raises: if the binaries are
+    absent the build still succeeds and the preview falls back to a system
+    ffmpeg on PATH, or to a plain video icon when none is available."""
+    destination = Path(output_dir)
+    if not destination.is_absolute():
+        destination = REPO_ROOT / destination
+    destination.mkdir(parents=True, exist_ok=True)
+
+    source_dir = REPO_ROOT / 'res' / 'ffmpeg' / 'windows-x64'
+    tools = ['ffmpeg.exe', 'ffprobe.exe']
+    copied = []
+    for tool in tools:
+        src = source_dir / tool
+        if src.is_file():
+            shutil.copy2(src, destination / tool)
+            copied.append(tool)
+        else:
+            print(f'WARNING: {src} not found; video preview will rely on a '
+                  f'system {tool} (PATH) if present.')
+    if copied:
+        print(f'Bundled ffmpeg tools: {", ".join(copied)} -> {destination}')
+
 def archive_binary(path):
     """Copies a built installer/binary into ./binarios (repo root) so it
     survives cleanup of the root-level output file between builds. Never
@@ -1150,6 +1177,7 @@ def build_flutter_windows(version, features, skip_portable_pack):
     shutil.copy2('target/release/deps/dylib_virtual_display.dll',
                  flutter_build_dir_2)
     prepare_windows_privacy_components(flutter_build_dir_2)
+    prepare_ffmpeg_tools(flutter_build_dir_2)
     if skip_portable_pack:
         return
     os.chdir('libs/portable')

@@ -14,6 +14,8 @@ import 'package:flutter_breadcrumb/flutter_breadcrumb.dart';
 import 'package:flutter_hbb/desktop/widgets/list_search_action_listener.dart';
 import 'package:flutter_hbb/desktop/widgets/menu_button.dart';
 import 'package:flutter_hbb/desktop/widgets/tabbar_widget.dart';
+import 'package:flutter_hbb/common/widgets/file_preview.dart';
+import 'package:flutter_hbb/desktop/pages/file_preview_panel.dart';
 import 'package:flutter_hbb/models/file_model.dart';
 import 'package:flutter_svg/flutter_svg.dart';
 import 'package:get/get.dart';
@@ -49,6 +51,34 @@ enum MouseFocusScope {
 
   /// Mouse is not in local field, remote neither.
   none
+}
+
+/// File browser layout for each side.
+enum FileViewMode {
+  /// Compact single-line rows (name + size).
+  list,
+
+  /// Detailed rows with name / modified / size columns.
+  details,
+
+  /// Grid of tiles with thumbnails.
+  tiles,
+}
+
+/// A dated section of entries for the "organize by date" grouping.
+class _DateGroup {
+  final String label;
+  final DateTime day;
+  final List<Entry> entries;
+  _DateGroup(this.label, this.day, this.entries);
+}
+
+/// Gesture callbacks shared between the list and grid renderers for one entry.
+class _EntryActions {
+  final VoidCallback onTap;
+  final VoidCallback onSecondaryTap;
+  final void Function(TapDownDetails) onSecondaryTapDown;
+  _EntryActions(this.onTap, this.onSecondaryTap, this.onSecondaryTapDown);
 }
 
 class FileManagerPage extends StatefulWidget {
@@ -164,23 +194,119 @@ class _FileManagerPageState extends State<FileManagerPage>
       OverlayEntry(builder: (_) {
         return willPopScope(Scaffold(
           backgroundColor: Theme.of(context).scaffoldBackgroundColor,
-          body: Row(
+          body: Column(
             children: [
-              if (!isWeb)
-                Flexible(
-                    flex: 3,
-                    child: dropArea(FileManagerView(
-                        model.localController, _ffi, _mouseFocusScope))),
-              Flexible(
-                  flex: 3,
-                  child: dropArea(FileManagerView(
-                      model.remoteController, _ffi, _mouseFocusScope))),
-              Flexible(flex: 2, child: statusList())
+              Expanded(
+                child: Row(
+                  children: [
+                    if (!isWeb)
+                      Flexible(
+                          flex: 3,
+                          child: dropArea(FileManagerView(
+                              model.localController, _ffi, _mouseFocusScope))),
+                    Flexible(
+                        flex: 3,
+                        child: dropArea(FileManagerView(
+                            model.remoteController, _ffi, _mouseFocusScope))),
+                    Flexible(flex: 2, child: _buildSidePanel())
+                  ],
+                ),
+              ),
+              _buildStatusBar(),
             ],
           ),
         ));
       })
     ]);
+  }
+
+  /// Right column: shows the preview panel when a single file is selected,
+  /// otherwise falls back to the transfer status list.
+  Widget _buildSidePanel() {
+    return Obx(() {
+      final target = model.previewTarget.value;
+      if (target != null) {
+        final controller =
+            target.isLocal ? model.localController : model.remoteController;
+        return FilePreviewPanel(
+          key: ValueKey('${target.isLocal}_${target.entry.path}'),
+          entry: target.entry,
+          isLocal: target.isLocal,
+          controller: controller,
+          onClose: () {
+            model.previewTarget.value = null;
+            model.localController.selectedItems.clear();
+            model.remoteController.selectedItems.clear();
+          },
+        );
+      }
+      return statusList();
+    });
+  }
+
+  /// Bottom status bar: secure-connection indicator, live transfer speeds and
+  /// active-transfer count.
+  Widget _buildStatusBar() {
+    final labelColor = Theme.of(context).tabBarTheme.labelColor;
+    return Container(
+      height: 34,
+      padding: const EdgeInsets.symmetric(horizontal: 16),
+      decoration: BoxDecoration(
+        color: Theme.of(context).cardColor,
+        border: Border(
+          top: BorderSide(color: Theme.of(context).dividerColor, width: 0.5),
+        ),
+      ),
+      child: Row(
+        children: [
+          Icon(Icons.lock_outline, size: 14, color: Colors.green),
+          const SizedBox(width: 6),
+          Text(
+            translate('Secure Connection'),
+            style: TextStyle(fontSize: 12, color: labelColor),
+          ),
+          const Spacer(),
+          Obx(() {
+            double up = 0, down = 0;
+            var active = 0;
+            for (final job in jobController.jobTable) {
+              if (job.type == JobType.transfer &&
+                  job.state == JobState.inProgress) {
+                active++;
+                if (job.isRemoteToLocal) {
+                  down += job.speed;
+                } else {
+                  up += job.speed;
+                }
+              }
+            }
+            String fmt(double s) => '${readableFileSize(s)}/s';
+            return Row(
+              children: [
+                Icon(Icons.arrow_upward, size: 14, color: MyTheme.darkGray),
+                const SizedBox(width: 2),
+                Text(fmt(up),
+                    style: TextStyle(fontSize: 12, color: labelColor)),
+                const SizedBox(width: 14),
+                Icon(Icons.arrow_downward, size: 14, color: MyTheme.darkGray),
+                const SizedBox(width: 2),
+                Text(fmt(down),
+                    style: TextStyle(fontSize: 12, color: labelColor)),
+                const SizedBox(width: 16),
+                Text(
+                  active > 0
+                      ? '$active ${translate('Active')}'
+                      : translate('Idle'),
+                  style: TextStyle(fontSize: 12, color: MyTheme.darkGray),
+                ),
+              ],
+            );
+          }),
+          const Spacer(),
+          if (!isWeb) _DiskUsageIndicator(controller: model.localController),
+        ],
+      ),
+    );
   }
 
   Widget dropArea(FileManagerView fileView) {
@@ -409,6 +535,27 @@ class _FileManagerViewState extends State<FileManagerView> {
   final _sizeColWidth = 0.0.obs;
   final _fileListScrollController = ScrollController();
   final _globalHeaderKey = GlobalKey();
+  final _viewMode = FileViewMode.details.obs;
+  final _groupByDate = false.obs;
+  final _typeFilter = FileFilter.all.obs;
+
+  /// Date-group labels the user has expanded via "See all".
+  final _expandedGroups = <String>{}.obs;
+
+  /// Currently selected date bucket in the sidebar (null = all dates).
+  final _selectedDateBucket = Rxn<DateTime>();
+
+  /// Whether the date sidebar shows every bucket or just the first few.
+  final _dateSidebarExpanded = false.obs;
+
+  /// Number of items shown per date group before the "See all" toggle.
+  static const int _groupPreviewCount = 12;
+
+  /// Number of date buckets shown in the sidebar before "See more".
+  static const int _sidebarBucketCount = 6;
+
+  /// Max size of a remote image auto-downloaded to render a grid thumbnail.
+  static const int _remoteThumbSizeLimit = 10 * 1024 * 1024;
 
   /// [_lastClickTime], [_lastClickEntry] help to handle double click
   var _lastClickTime =
@@ -428,7 +575,11 @@ class _FileManagerViewState extends State<FileManagerView> {
     super.initState();
     // register location listener
     _locationNode.addListener(onLocationFocusChanged);
-    controller.directory.listen((e) => breadCrumbScrollToEnd());
+    controller.directory.listen((e) {
+      breadCrumbScrollToEnd();
+      _selectedDateBucket.value = null;
+      _expandedGroups.clear();
+    });
   }
 
   @override
@@ -470,9 +621,47 @@ class _FileManagerViewState extends State<FileManagerView> {
               ],
             ),
           ),
+          _buildSelectionFooter(),
         ],
       ),
     );
+  }
+
+  Widget _buildSelectionFooter() {
+    return Obx(() {
+      final total = controller.directory.value.entries.length;
+      final selected = selectedItems.items;
+      final count = selected.length;
+      var size = 0;
+      for (final e in selected) {
+        if (e.isFile) size += e.size;
+      }
+      final label = count == 0
+          ? '$total ${translate('files')}'
+          : '$count ${translate('of')} $total ${translate('selected')}';
+      return Container(
+        padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+        margin: const EdgeInsets.only(top: 4),
+        decoration: BoxDecoration(
+          color: Theme.of(context).cardColor,
+          borderRadius: BorderRadius.circular(8),
+        ),
+        child: Row(
+          children: [
+            Icon(Icons.check_circle_outline,
+                size: 14, color: MyTheme.darkGray),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Text(label,
+                  style: TextStyle(fontSize: 12, color: MyTheme.darkGray)),
+            ),
+            if (count > 0)
+              Text(readableFileSize(size.toDouble()),
+                  style: TextStyle(fontSize: 12, color: MyTheme.darkGray)),
+          ],
+        ),
+      );
+    });
   }
 
   void _handleColumnPorportions() {
@@ -701,6 +890,8 @@ class _FileManagerViewState extends State<FileManagerView> {
                 color: Theme.of(context).cardColor,
                 hoverColor: Theme.of(context).hoverColor,
               ),
+              _buildViewModeToggle(),
+              _buildFilterButton(),
             ],
           ),
           Row(
@@ -1037,6 +1228,631 @@ class _FileManagerViewState extends State<FileManagerView> {
     );
   }
 
+  Widget _buildViewModeToggle() {
+    Widget btn(FileViewMode mode, IconData icon, String tip) {
+      return Obx(() {
+        final selected = _viewMode.value == mode;
+        return Tooltip(
+          message: translate(tip),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(6),
+            onTap: () => _viewMode.value = mode,
+            child: Container(
+              padding: const EdgeInsets.all(6),
+              decoration: BoxDecoration(
+                color: selected ? MyTheme.accent : Colors.transparent,
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Icon(
+                icon,
+                size: 18,
+                color: selected
+                    ? Colors.white
+                    : Theme.of(context).tabBarTheme.labelColor,
+              ),
+            ),
+          ),
+        );
+      });
+    }
+
+    return Container(
+      margin: const EdgeInsets.only(left: 6),
+      padding: const EdgeInsets.all(2),
+      decoration: BoxDecoration(
+        color: Theme.of(context).cardColor,
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          btn(FileViewMode.list, Icons.view_list_outlined, 'List'),
+          btn(FileViewMode.details, Icons.view_headline_outlined, 'Details'),
+          btn(FileViewMode.tiles, Icons.grid_view_outlined, 'Tiles'),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildFilterButton() {
+    return Obx(() {
+      final active = _typeFilter.value != FileFilter.all;
+      return PopupMenuButton<FileFilter>(
+        tooltip: translate('Filter'),
+        position: PopupMenuPosition.under,
+        onSelected: (f) => _typeFilter.value = f,
+        itemBuilder: (context) => FileFilter.values.map((f) {
+          final selected = _typeFilter.value == f;
+          return PopupMenuItem<FileFilter>(
+            value: f,
+            child: Row(
+              children: [
+                Icon(fileFilterIcon(f),
+                    size: 18,
+                    color: selected
+                        ? MyTheme.accent
+                        : Theme.of(context).tabBarTheme.labelColor),
+                const SizedBox(width: 10),
+                Text(fileFilterLabel(f),
+                    style: TextStyle(
+                        color: selected ? MyTheme.accent : null,
+                        fontWeight:
+                            selected ? FontWeight.w600 : FontWeight.normal)),
+              ],
+            ),
+          );
+        }).toList(),
+        child: Container(
+          margin: const EdgeInsets.only(left: 6),
+          padding: const EdgeInsets.all(8),
+          decoration: BoxDecoration(
+            color: active ? MyTheme.accent : Theme.of(context).cardColor,
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Icon(
+            Icons.filter_list,
+            size: 18,
+            color:
+                active ? Colors.white : Theme.of(context).tabBarTheme.labelColor,
+          ),
+        ),
+      );
+    });
+  }
+
+  Widget _buildGroupByDateToggle() {
+    return Obx(() {
+      final on = _groupByDate.value;
+      return InkWell(
+        borderRadius: BorderRadius.circular(6),
+        onTap: () {
+          _groupByDate.value = !on;
+          if (on) _selectedDateBucket.value = null;
+        },
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(Icons.calendar_month_outlined,
+                  size: 16,
+                  color: on
+                      ? MyTheme.accent
+                      : Theme.of(context).tabBarTheme.labelColor),
+              const SizedBox(width: 6),
+              Text(
+                translate('Organize by date'),
+                style: TextStyle(
+                  fontSize: 12,
+                  color: on
+                      ? MyTheme.accent
+                      : Theme.of(context).tabBarTheme.labelColor,
+                  fontWeight: on ? FontWeight.w600 : FontWeight.normal,
+                ),
+              ),
+              Icon(on ? Icons.expand_less : Icons.expand_more,
+                  size: 16, color: MyTheme.darkGray),
+            ],
+          ),
+        ),
+      );
+    });
+  }
+
+  /// Groups [entries] into dated sections: Today, Yesterday, then one section
+  /// per distinct older date (most recent first).
+  List<_DateGroup> _dateGroups(List<Entry> entries) {
+    final now = DateTime.now();
+    final today = DateTime(now.year, now.month, now.day);
+    final yesterday = today.subtract(const Duration(days: 1));
+    final map = <DateTime, List<Entry>>{};
+    for (final e in entries) {
+      final d = e.lastModified();
+      final key = DateTime(d.year, d.month, d.day);
+      (map[key] ??= []).add(e);
+    }
+    final keys = map.keys.toList()..sort((a, b) => b.compareTo(a));
+    return keys.map((k) {
+      String label;
+      if (k == today) {
+        label = translate('Today');
+      } else if (k == yesterday) {
+        label = translate('Yesterday');
+      } else {
+        label = _formatDateLabel(k);
+      }
+      return _DateGroup(label, k, map[k]!);
+    }).toList();
+  }
+
+  String _formatDateLabel(DateTime d) {
+    const weekdayKeys = [
+      'Monday',
+      'Tuesday',
+      'Wednesday',
+      'Thursday',
+      'Friday',
+      'Saturday',
+      'Sunday'
+    ];
+    final wd = translate(weekdayKeys[d.weekday - 1]);
+    String two(int n) => n.toString().padLeft(2, '0');
+    return '$wd ${two(d.day)}/${two(d.month)}/${d.year}';
+  }
+
+  Widget _buildDateSidebar(List<_DateGroup> groups, int total) {
+    final bucket = _selectedDateBucket.value;
+    final expanded = _dateSidebarExpanded.value;
+    final visible = expanded
+        ? groups
+        : groups.take(_sidebarBucketCount).toList(growable: false);
+    return Container(
+      width: 176,
+      padding: const EdgeInsets.symmetric(vertical: 6, horizontal: 4),
+      child: ListView(
+        children: [
+          _sidebarItem(translate('All dates'), total, bucket == null,
+              () => _selectedDateBucket.value = null),
+          for (final g in visible)
+            _sidebarItem(g.label, g.entries.length, bucket == g.day,
+                () => _selectedDateBucket.value = g.day),
+          if (groups.length > _sidebarBucketCount)
+            Padding(
+              padding: const EdgeInsets.only(top: 4),
+              child: TextButton.icon(
+                onPressed: () =>
+                    _dateSidebarExpanded.value = !_dateSidebarExpanded.value,
+                icon: Icon(expanded ? Icons.expand_less : Icons.expand_more,
+                    size: 18),
+                label: Text(
+                    expanded ? translate('See less') : translate('See more')),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _sidebarItem(
+      String label, int count, bool selected, VoidCallback onTap) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 2),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(8),
+        onTap: onTap,
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+          decoration: BoxDecoration(
+            color: selected
+                ? MyTheme.accent.withOpacity(0.15)
+                : Colors.transparent,
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Row(
+            children: [
+              Icon(
+                selected
+                    ? Icons.radio_button_checked
+                    : Icons.radio_button_unchecked,
+                size: 16,
+                color: selected ? MyTheme.accent : MyTheme.darkGray,
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontWeight:
+                            selected ? FontWeight.w600 : FontWeight.normal,
+                        color: selected ? MyTheme.accent : null,
+                      ),
+                    ),
+                    Text('$count ${translate('files')}',
+                        style:
+                            TextStyle(fontSize: 10, color: MyTheme.darkGray)),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildSeeAllButton(String label, int total, bool expanded) {
+    return Center(
+      child: TextButton.icon(
+        onPressed: () {
+          if (expanded) {
+            _expandedGroups.remove(label);
+          } else {
+            _expandedGroups.add(label);
+          }
+        },
+        icon: Icon(expanded ? Icons.expand_less : Icons.expand_more, size: 18),
+        label: Text(expanded
+            ? translate('See less')
+            : '${translate('See all')} ($total)'),
+      ),
+    );
+  }
+
+  Widget _groupHeader(String label, int count) {
+    return Padding(
+      padding: const EdgeInsets.fromLTRB(4, 12, 4, 6),
+      child: Row(
+        children: [
+          Text(label,
+              style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
+          const Spacer(),
+          Text('$count ${translate('files')}',
+              style: TextStyle(fontSize: 11, color: MyTheme.darkGray)),
+        ],
+      ),
+    );
+  }
+
+  /// Builds the shared tap / double-click / context-menu callbacks for [entry].
+  _EntryActions _entryActions(BuildContext context, Entry entry,
+      List<Entry> filteredEntries, Rx<Entry?> rightClickEntry) {
+    var secondaryPosition = RelativeRect.fromLTRB(0, 0, 0, 0);
+    onTap() {
+      final items = selectedItems;
+      if (_checkDoubleClick(entry)) {
+        controller.openDirectory(entry.path);
+        items.clear();
+        if (entry.isDirectory || entry.isDrive) {
+          _ffi.fileModel.previewTarget.value = null;
+        }
+        return;
+      }
+      _onSelectedChanged(items, filteredEntries, entry, isLocal);
+    }
+
+    onSecondaryTap() {
+      final items = [
+        if (!entry.isDrive &&
+            versionCmp(_ffi.ffiModel.pi.version, "1.3.0") >= 0)
+          mod_menu.PopupMenuItem(
+            child: Text(translate("Rename")),
+            height: CustomPopupMenuTheme.height,
+            onTap: () {
+              controller.renameAction(entry, isLocal);
+            },
+          )
+      ];
+      if (items.isNotEmpty) {
+        rightClickEntry.value = entry;
+        final future = mod_menu.showMenu(
+          context: context,
+          position: secondaryPosition,
+          items: items,
+        );
+        future.then((value) {
+          rightClickEntry.value = null;
+        });
+        future.onError((error, stackTrace) {
+          rightClickEntry.value = null;
+        });
+      }
+    }
+
+    onSecondaryTapDown(TapDownDetails details) {
+      secondaryPosition = RelativeRect.fromLTRB(details.globalPosition.dx,
+          details.globalPosition.dy, details.globalPosition.dx,
+          details.globalPosition.dy);
+    }
+
+    return _EntryActions(onTap, onSecondaryTap, onSecondaryTapDown);
+  }
+
+  Widget _entryLeadingIcon(BuildContext context, Entry entry, {double? size}) {
+    if (entry.isDrive) {
+      return Image(
+        image: iconHardDrive,
+        fit: BoxFit.scaleDown,
+        width: size,
+        height: size,
+        color: Theme.of(context).iconTheme.color?.withOpacity(0.7),
+      ).paddingAll(4);
+    }
+    return SvgPicture.asset(
+      entry.isFile ? "assets/file.svg" : "assets/folder.svg",
+      width: size,
+      height: size,
+      colorFilter: svgColor(Theme.of(context).tabBarTheme.labelColor),
+    );
+  }
+
+  Widget _buildListRow(BuildContext context, Entry entry,
+      List<Entry> filteredEntries, Rx<Entry?> rightClickEntry, bool compact) {
+    final actions =
+        _entryActions(context, entry, filteredEntries, rightClickEntry);
+    final sizeStr =
+        entry.isFile ? readableFileSize(entry.size.toDouble()) : "";
+    final lastModifiedStr = entry.isDrive
+        ? " "
+        : "${entry.lastModified().toString().replaceAll(".000", "")}   ";
+
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 1),
+      child: Obx(() {
+        final isSel = selectedItems.items.contains(entry);
+        final nameWidget = Row(children: [
+          _entryLeadingIcon(context, entry),
+          Expanded(
+              child: Text(entry.name.nonBreaking,
+                  style: TextStyle(color: isSel ? Colors.white : null),
+                  overflow: TextOverflow.ellipsis))
+        ]);
+        return Container(
+          decoration: BoxDecoration(
+            color: isSel ? MyTheme.button : Theme.of(context).cardColor,
+            borderRadius: BorderRadius.all(Radius.circular(5.0)),
+            border: rightClickEntry.value == entry
+                ? Border.all(color: MyTheme.button, width: 1.0)
+                : null,
+          ),
+          key: ValueKey(entry.name),
+          height: kDesktopFileTransferRowHeight,
+          child: GestureDetector(
+            onSecondaryTap: actions.onSecondaryTap,
+            onSecondaryTapDown: actions.onSecondaryTapDown,
+            child: InkWell(
+              onTap: actions.onTap,
+              child: compact
+                  ? Row(children: [
+                      Expanded(
+                          child: Tooltip(
+                              waitDuration: const Duration(milliseconds: 500),
+                              message: entry.name,
+                              child: nameWidget)),
+                      const SizedBox(width: 8),
+                      Text(sizeStr,
+                          style: TextStyle(
+                              fontSize: 11,
+                              color:
+                                  isSel ? Colors.white70 : MyTheme.darkGray)),
+                    ]).paddingSymmetric(horizontal: 4)
+                  : Row(children: [
+                      Obx(() => Container(
+                          width: _nameColWidth.value,
+                          child: Tooltip(
+                              waitDuration: const Duration(milliseconds: 500),
+                              message: entry.name,
+                              child: nameWidget))),
+                      const SizedBox(width: 2.0),
+                      Obx(() => SizedBox(
+                          width: _modifiedColWidth.value,
+                          child: Tooltip(
+                              waitDuration: const Duration(milliseconds: 500),
+                              message: lastModifiedStr,
+                              child: Text(lastModifiedStr,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: TextStyle(
+                                      fontSize: 12,
+                                      color: isSel
+                                          ? Colors.white70
+                                          : MyTheme.darkGray))))),
+                      const SizedBox(width: 2.0),
+                      Expanded(
+                          child: Text(sizeStr,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                  fontSize: 10,
+                                  color: isSel
+                                      ? Colors.white70
+                                      : MyTheme.darkGray))),
+                    ]),
+            ),
+          ),
+        );
+      }),
+    );
+  }
+
+  Widget _buildGridTile(BuildContext context, Entry entry,
+      List<Entry> filteredEntries, Rx<Entry?> rightClickEntry) {
+    final actions =
+        _entryActions(context, entry, filteredEntries, rightClickEntry);
+    return Obx(() {
+      final isSel = selectedItems.items.contains(entry);
+      return GestureDetector(
+        onSecondaryTap: actions.onSecondaryTap,
+        onSecondaryTapDown: actions.onSecondaryTapDown,
+        child: InkWell(
+          borderRadius: BorderRadius.circular(8),
+          onTap: actions.onTap,
+          child: Container(
+            decoration: BoxDecoration(
+              color: isSel ? MyTheme.button : Theme.of(context).cardColor,
+              borderRadius: BorderRadius.circular(8),
+              border: rightClickEntry.value == entry
+                  ? Border.all(color: MyTheme.button, width: 1.0)
+                  : null,
+            ),
+            padding: const EdgeInsets.all(6),
+            child: Column(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Expanded(child: Center(child: _tileThumb(context, entry))),
+                const SizedBox(height: 4),
+                Tooltip(
+                  waitDuration: const Duration(milliseconds: 500),
+                  message: entry.name,
+                  child: Text(
+                    entry.name,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                        fontSize: 11,
+                        color: isSel ? Colors.white : null),
+                  ),
+                ),
+                if (entry.isFile)
+                  Text(
+                    readableFileSize(entry.size.toDouble()),
+                    style: TextStyle(
+                        fontSize: 9,
+                        color: isSel ? Colors.white70 : MyTheme.darkGray),
+                  ),
+              ],
+            ),
+          ),
+        ),
+      );
+    });
+  }
+
+  Widget _tileThumb(BuildContext context, Entry entry) {
+    if (entry.isDrive || entry.isDirectory) {
+      return _entryLeadingIcon(context, entry, size: 44);
+    }
+    final info = fileTypeInfoOf(entry.name);
+    if (info.kind == PreviewKind.image) {
+      if (isLocal) {
+        return ClipRRect(
+          borderRadius: BorderRadius.circular(6),
+          child: Image.file(
+            File(entry.path),
+            fit: BoxFit.cover,
+            width: double.infinity,
+            cacheWidth: 200,
+            errorBuilder: (_, __, ___) =>
+                Icon(info.icon, size: 40, color: info.color),
+          ),
+        );
+      }
+      // Remote image: fetch a cached copy on demand (size-capped, throttled).
+      if (entry.size <= _remoteThumbSizeLimit) {
+        return _RemoteImageThumb(
+          key: ValueKey('thumb_${entry.path}_${entry.modifiedTime}'),
+          controller: controller,
+          entry: entry,
+          info: info,
+        );
+      }
+    }
+    return Icon(info.icon, size: 40, color: info.color);
+  }
+
+  /// Renders a flat list/grid for a given [entries] set in the current mode.
+  Widget _buildEntriesBody(
+      BuildContext context,
+      ScrollController scrollController,
+      List<Entry> entries,
+      Rx<Entry?> rightClickEntry,
+      FileViewMode mode) {
+    if (mode == FileViewMode.tiles) {
+      return GridView.builder(
+        controller: scrollController,
+        padding: const EdgeInsets.all(8),
+        gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+          maxCrossAxisExtent: 128,
+          mainAxisExtent: 124,
+          crossAxisSpacing: 8,
+          mainAxisSpacing: 8,
+        ),
+        itemCount: entries.length,
+        itemBuilder: (context, index) =>
+            _buildGridTile(context, entries[index], entries, rightClickEntry),
+      );
+    }
+    final compact = mode == FileViewMode.list;
+    return ListView.builder(
+      controller: scrollController,
+      itemExtent: kDesktopFileTransferRowHeight,
+      itemCount: entries.length,
+      itemBuilder: (context, index) =>
+          _buildListRow(context, entries[index], entries, rightClickEntry, compact),
+    );
+  }
+
+  /// Renders entries grouped into dated sections (Today / Yesterday / per-date).
+  Widget _buildGroupedBody(
+      BuildContext context,
+      ScrollController scrollController,
+      List<Entry> filteredEntries,
+      Rx<Entry?> rightClickEntry,
+      FileViewMode mode,
+      List<_DateGroup> groups) {
+    // Visual order matches the grouped rendering, so range/shift selection and
+    // keyboard navigation stay consistent with what the user sees.
+    final ordered = groups.expand((g) => g.entries).toList(growable: false);
+    if (groups.isEmpty) {
+      return const SizedBox.shrink();
+    }
+    final slivers = <Widget>[];
+    for (final g in groups) {
+      final total = g.entries.length;
+      final expanded = _expandedGroups.contains(g.label);
+      final shownCount =
+          expanded ? total : (total < _groupPreviewCount ? total : _groupPreviewCount);
+      slivers.add(SliverToBoxAdapter(child: _groupHeader(g.label, total)));
+      if (mode == FileViewMode.tiles) {
+        slivers.add(SliverPadding(
+          padding: const EdgeInsets.symmetric(vertical: 4),
+          sliver: SliverGrid(
+            gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+              maxCrossAxisExtent: 128,
+              mainAxisExtent: 124,
+              crossAxisSpacing: 8,
+              mainAxisSpacing: 8,
+            ),
+            delegate: SliverChildBuilderDelegate(
+              (context, index) => _buildGridTile(
+                  context, g.entries[index], ordered, rightClickEntry),
+              childCount: shownCount,
+            ),
+          ),
+        ));
+      } else {
+        final compact = mode == FileViewMode.list;
+        slivers.add(SliverList(
+          delegate: SliverChildBuilderDelegate(
+            (context, index) => _buildListRow(
+                context, g.entries[index], ordered, rightClickEntry, compact),
+            childCount: shownCount,
+          ),
+        ));
+      }
+      if (total > _groupPreviewCount) {
+        slivers.add(SliverToBoxAdapter(
+          child: _buildSeeAllButton(g.label, total, expanded),
+        ));
+      }
+    }
+    return CustomScrollView(controller: scrollController, slivers: slivers);
+  }
+
   Widget _buildFileList(
       BuildContext context, ScrollController scrollController) {
     final fd = controller.directory.value;
@@ -1089,214 +1905,60 @@ class _FileManagerViewState extends State<FileManagerView> {
       },
       child: Obx(() {
         final entries = controller.directory.value.entries;
-        final filteredEntries = _searchText.isNotEmpty
-            ? entries.where((element) {
-                return element.name.contains(_searchText.value);
-              }).toList(growable: false)
-            : entries;
-        final rows = filteredEntries.map((entry) {
-          final sizeStr =
-              entry.isFile ? readableFileSize(entry.size.toDouble()) : "";
-          final lastModifiedStr = entry.isDrive
-              ? " "
-              : "${entry.lastModified().toString().replaceAll(".000", "")}   ";
-          var secondaryPosition = RelativeRect.fromLTRB(0, 0, 0, 0);
-          onTap() {
-            final items = selectedItems;
-            // handle double click
-            if (_checkDoubleClick(entry)) {
-              controller.openDirectory(entry.path);
-              items.clear();
-              return;
-            }
-            _onSelectedChanged(items, filteredEntries, entry, isLocal);
+        final typeFilter = _typeFilter.value;
+        final filteredEntries = entries.where((element) {
+          if (_searchText.isNotEmpty &&
+              !element.name.contains(_searchText.value)) {
+            return false;
           }
-
-          onSecondaryTap() {
-            final items = [
-              if (!entry.isDrive &&
-                  versionCmp(_ffi.ffiModel.pi.version, "1.3.0") >= 0)
-                mod_menu.PopupMenuItem(
-                  child: Text(translate("Rename")),
-                  height: CustomPopupMenuTheme.height,
-                  onTap: () {
-                    controller.renameAction(entry, isLocal);
-                  },
-                )
-            ];
-            if (items.isNotEmpty) {
-              rightClickEntry.value = entry;
-              final future = mod_menu.showMenu(
-                context: context,
-                position: secondaryPosition,
-                items: items,
-              );
-              future.then((value) {
-                rightClickEntry.value = null;
-              });
-              future.onError((error, stackTrace) {
-                rightClickEntry.value = null;
-              });
-            }
-          }
-
-          onSecondaryTapDown(details) {
-            secondaryPosition = RelativeRect.fromLTRB(
-                details.globalPosition.dx,
-                details.globalPosition.dy,
-                details.globalPosition.dx,
-                details.globalPosition.dy);
-          }
-
-          return Padding(
-            padding: EdgeInsets.symmetric(vertical: 1),
-            child: Obx(() => Container(
-                decoration: BoxDecoration(
-                  color: selectedItems.items.contains(entry)
-                      ? MyTheme.button
-                      : Theme.of(context).cardColor,
-                  borderRadius: BorderRadius.all(
-                    Radius.circular(5.0),
-                  ),
-                  border: rightClickEntry.value == entry
-                      ? Border.all(
-                          color: MyTheme.button,
-                          width: 1.0,
-                        )
-                      : null,
-                ),
-                key: ValueKey(entry.name),
-                height: kDesktopFileTransferRowHeight,
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.spaceAround,
-                  children: [
-                    Expanded(
-                      child: InkWell(
-                        child: Row(
-                          children: [
-                            GestureDetector(
-                              child: Obx(
-                                () => Container(
-                                    width: _nameColWidth.value,
-                                    child: Tooltip(
-                                      waitDuration: Duration(milliseconds: 500),
-                                      message: entry.name,
-                                      child: Row(children: [
-                                        entry.isDrive
-                                            ? Image(
-                                                    image: iconHardDrive,
-                                                    fit: BoxFit.scaleDown,
-                                                    color: Theme.of(context)
-                                                        .iconTheme
-                                                        .color
-                                                        ?.withOpacity(0.7))
-                                                .paddingAll(4)
-                                            : SvgPicture.asset(
-                                                entry.isFile
-                                                    ? "assets/file.svg"
-                                                    : "assets/folder.svg",
-                                                colorFilter: svgColor(
-                                                    Theme.of(context)
-                                                        .tabBarTheme
-                                                        .labelColor),
-                                              ),
-                                        Expanded(
-                                            child: Text(entry.name.nonBreaking,
-                                                style: TextStyle(
-                                                    color: selectedItems.items
-                                                            .contains(entry)
-                                                        ? Colors.white
-                                                        : null),
-                                                overflow:
-                                                    TextOverflow.ellipsis))
-                                      ]),
-                                    )),
-                              ),
-                              onTap: onTap,
-                              onSecondaryTap: onSecondaryTap,
-                              onSecondaryTapDown: onSecondaryTapDown,
-                            ),
-                            SizedBox(
-                              width: 2.0,
-                            ),
-                            GestureDetector(
-                              child: Obx(
-                                () => SizedBox(
-                                  width: _modifiedColWidth.value,
-                                  child: Tooltip(
-                                      waitDuration: Duration(milliseconds: 500),
-                                      message: lastModifiedStr,
-                                      child: Text(
-                                        lastModifiedStr,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: TextStyle(
-                                          fontSize: 12,
-                                          color: selectedItems.items
-                                                  .contains(entry)
-                                              ? Colors.white70
-                                              : MyTheme.darkGray,
-                                        ),
-                                      )),
-                                ),
-                              ),
-                              onTap: onTap,
-                              onSecondaryTap: onSecondaryTap,
-                              onSecondaryTapDown: onSecondaryTapDown,
-                            ),
-                            // Divider from header.
-                            SizedBox(
-                              width: 2.0,
-                            ),
-                            Expanded(
-                              // width: 100,
-                              child: GestureDetector(
-                                child: Tooltip(
-                                  waitDuration: Duration(milliseconds: 500),
-                                  message: sizeStr,
-                                  child: Text(
-                                    sizeStr,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: TextStyle(
-                                        fontSize: 10,
-                                        color:
-                                            selectedItems.items.contains(entry)
-                                                ? Colors.white70
-                                                : MyTheme.darkGray),
-                                  ),
-                                ),
-                                onTap: onTap,
-                                onSecondaryTap: onSecondaryTap,
-                                onSecondaryTapDown: onSecondaryTapDown,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ),
-                  ],
-                ))),
-          );
+          return entryMatchesFilter(element, typeFilter);
         }).toList(growable: false);
+        final mode = _viewMode.value;
+        final grouped = _groupByDate.value;
+        late final Widget body;
+        if (grouped) {
+          final groups = _dateGroups(filteredEntries);
+          final bucket = _selectedDateBucket.value;
+          _DateGroup? selectedGroup;
+          if (bucket != null) {
+            for (final g in groups) {
+              if (g.day == bucket) {
+                selectedGroup = g;
+                break;
+              }
+            }
+          }
+          final listArea = selectedGroup != null
+              ? _buildEntriesBody(context, scrollController,
+                  selectedGroup.entries, rightClickEntry, mode)
+              : _buildGroupedBody(context, scrollController, filteredEntries,
+                  rightClickEntry, mode, groups);
+          body = Row(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              _buildDateSidebar(groups, filteredEntries.length),
+              const VerticalDivider(width: 1),
+              Expanded(child: listArea),
+            ],
+          );
+        } else {
+          body = _buildEntriesBody(
+              context, scrollController, filteredEntries, rightClickEntry, mode);
+        }
 
         return Column(
           children: [
-            // Header
-            Row(
-              children: [
-                Expanded(child: _buildFileBrowserHeader(context)),
-              ],
+            Align(
+              alignment: Alignment.centerLeft,
+              child: _buildGroupByDateToggle(),
             ),
-            // Body
-            Expanded(
-              child: ListView.builder(
-                controller: scrollController,
-                itemExtent: kDesktopFileTransferRowHeight,
-                itemBuilder: (context, index) {
-                  return rows[index];
-                },
-                itemCount: rows.length,
+            if (mode != FileViewMode.tiles && !grouped)
+              Row(
+                children: [
+                  Expanded(child: _buildFileBrowserHeader(context)),
+                ],
               ),
-            ),
+            Expanded(child: body),
           ],
         );
       }),
@@ -1363,7 +2025,22 @@ class _FileManagerViewState extends State<FileManagerView> {
       selectedItems.clear();
       selectedItems.add(entry);
     }
+    _updatePreviewTarget(selectedItems, isLocal);
     setState(() {});
+  }
+
+  void _updatePreviewTarget(SelectedItems selectedItems, bool isLocal) {
+    final files = selectedItems.items.where((e) => e.isFile).toList();
+    if (files.length == 1) {
+      _ffi.fileModel.previewTarget.value =
+          PreviewTarget(isLocal, files.first);
+    } else {
+      final current = _ffi.fileModel.previewTarget.value;
+      // Only clear if the cleared side owned the current preview.
+      if (current != null && current.isLocal == isLocal) {
+        _ffi.fileModel.previewTarget.value = null;
+      }
+    }
   }
 
   bool _checkDoubleClick(Entry entry) {
@@ -1691,4 +2368,126 @@ Widget buildWindowsThisPC(BuildContext context, [TextStyle? textStyle]) {
     SizedBox(width: 10),
     Text(translate('This PC'), style: textStyle)
   ]);
+}
+
+/// Grid thumbnail for a remote image: downloads a cached copy on demand
+/// (throttled) and shows it, falling back to the type icon while loading or on
+/// failure.
+class _RemoteImageThumb extends StatefulWidget {
+  final FileController controller;
+  final Entry entry;
+  final FileTypeInfo info;
+  const _RemoteImageThumb({
+    Key? key,
+    required this.controller,
+    required this.entry,
+    required this.info,
+  }) : super(key: key);
+
+  @override
+  State<_RemoteImageThumb> createState() => _RemoteImageThumbState();
+}
+
+class _RemoteImageThumbState extends State<_RemoteImageThumb> {
+  String? _path;
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    final path = await RemotePreviewCache.instance
+        .fetchThumbnail(widget.controller, widget.entry);
+    if (!mounted) return;
+    if (path != null) setState(() => _path = path);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final info = widget.info;
+    if (_path == null) {
+      return Icon(info.icon, size: 40, color: info.color);
+    }
+    return ClipRRect(
+      borderRadius: BorderRadius.circular(6),
+      child: Image.file(
+        File(_path!),
+        fit: BoxFit.cover,
+        width: double.infinity,
+        cacheWidth: 200,
+        errorBuilder: (_, __, ___) =>
+            Icon(info.icon, size: 40, color: info.color),
+      ),
+    );
+  }
+}
+
+/// Shows local disk usage (free / used) with a small progress bar in the
+/// status bar. Recomputes only when the watched directory path changes.
+class _DiskUsageIndicator extends StatefulWidget {
+  final FileController controller;
+  const _DiskUsageIndicator({Key? key, required this.controller})
+      : super(key: key);
+
+  @override
+  State<_DiskUsageIndicator> createState() => _DiskUsageIndicatorState();
+}
+
+class _DiskUsageIndicatorState extends State<_DiskUsageIndicator> {
+  DiskUsage? _usage;
+  String? _lastPath;
+  StreamSubscription? _sub;
+
+  @override
+  void initState() {
+    super.initState();
+    _refresh();
+    _sub = widget.controller.directory.listen((_) => _refresh());
+  }
+
+  @override
+  void dispose() {
+    _sub?.cancel();
+    super.dispose();
+  }
+
+  Future<void> _refresh() async {
+    final path = widget.controller.directory.value.path;
+    if (path.isEmpty || path == _lastPath) return;
+    _lastPath = path;
+    final usage = await getDiskUsage(path);
+    if (!mounted) return;
+    setState(() => _usage = usage);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final usage = _usage;
+    if (usage == null) return const SizedBox.shrink();
+    final labelColor = Theme.of(context).tabBarTheme.labelColor;
+    final freeStr = readableFileSize(usage.free.toDouble());
+    final usedStr = readableFileSize(usage.used.toDouble());
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text('$freeStr ${translate('free')} / $usedStr ${translate('used')}',
+            style: TextStyle(fontSize: 12, color: labelColor)),
+        const SizedBox(width: 8),
+        SizedBox(
+          width: 90,
+          child: ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: LinearProgressIndicator(
+              value: usage.usedFraction,
+              minHeight: 6,
+              backgroundColor: Theme.of(context).hoverColor,
+              valueColor: AlwaysStoppedAnimation(MyTheme.accent),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
 }

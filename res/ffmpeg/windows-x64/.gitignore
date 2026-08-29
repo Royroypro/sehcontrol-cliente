@@ -1,0 +1,4 @@
+# The bundled ffmpeg/ffprobe binaries are large and not committed; only this
+# folder's README/.gitignore are tracked. build.py copies whatever is here into
+# the packaged app at build time.
+*.exe
