@@ -78,6 +78,9 @@ class _InstallPageBodyState extends State<_InstallPageBody>
   final RxBool printer = false.obs;
   final RxBool showProgress = false.obs;
   final RxBool btnEnabled = true.obs;
+  // bind.mainGetVersion() is async (Future<String>); interpolating it directly
+  // renders "Instance of 'Future<String>'". Resolve it once and hold the value.
+  String _version = '';
 
   // todo move to theme.
   final buttonStyle = OutlinedButton.styleFrom(
@@ -97,6 +100,9 @@ class _InstallPageBodyState extends State<_InstallPageBody>
   void initState() {
     windowManager.addListener(this);
     super.initState();
+    bind.mainGetVersion().then((v) {
+      if (mounted) setState(() => _version = v);
+    });
   }
 
   @override
@@ -233,7 +239,7 @@ class _InstallPageBodyState extends State<_InstallPageBody>
                                       .headlineSmall
                                       ?.copyWith(fontWeight: FontWeight.w800)),
                               Text(
-                                '${translate('Version')} ${bind.mainGetVersion()}',
+                                '${translate('Version')} $_version',
                                 style: TextStyle(
                                     fontSize: 13,
                                     color: Theme.of(context).hintColor),
