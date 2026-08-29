@@ -1202,6 +1202,59 @@ def build_flutter_windows(version, features, skip_portable_pack):
     archive_binary(installer)
 
 
+# Known regressions that reconciling with upstream RustDesk has silently
+# re-introduced before (the auto-update panel flow, the api.rustdesk.com
+# fallback, the installer version showing "Instance of 'Future<String>'").
+# Each entry guards one fix so a future merge that reverts it fails the build
+# here with a clear message instead of shipping the bug. `kind`:
+#   'forbid'  -> the substring must NOT appear (the old bug is back)
+#   'require' -> the substring MUST appear (the fix was removed)
+REGRESSION_GUARDS = [
+    ('flutter/lib/desktop/pages/install_page.dart', 'forbid',
+     '${bind.mainGetVersion()}',
+     "install_page interpola bind.mainGetVersion() (Future<String>) sin await; "
+     "el instalador muestra \"Instance of 'Future<String>'\". Cargalo en initState "
+     "y usa $_version."),
+    ('src/updater.rs', 'require',
+     'update.download_url == url',
+     "get_update_download_file_from_url perdio la rama que acepta la URL publicada "
+     "por el panel (PANEL_UPDATE); la actualizacion desde el panel volveria a fallar "
+     "con 'Descarga fallida'."),
+    ('src/common.rs', 'forbid',
+     'VER_TYPE_RUSTDESK_CLIENT',
+     "do_check_software_update volvio a consultar api.rustdesk.com (fallback de "
+     "upstream); un fork rebrandeado solo debe ofrecer lo que publica su propio panel."),
+]
+
+
+def check_regression_guards():
+    """Fail fast if an upstream merge re-introduced a known, already-fixed bug.
+
+    Runs before every build so a regression is caught here instead of in the
+    shipped app. See REGRESSION_GUARDS."""
+    failures = []
+    for rel_path, kind, needle, message in REGRESSION_GUARDS:
+        path = REPO_ROOT / rel_path
+        if not path.is_file():
+            print(f'WARNING: regression guard skipped, missing file: {rel_path}')
+            continue
+        present = needle in path.read_text(encoding='utf-8', errors='replace')
+        if kind == 'forbid' and present:
+            failures.append(
+                f'  [{rel_path}] {message}\n'
+                f'      (patron prohibido reaparecio: {needle!r})')
+        elif kind == 'require' and not present:
+            failures.append(
+                f'  [{rel_path}] {message}\n'
+                f'      (patron requerido falta: {needle!r})')
+    if failures:
+        print('\nREGRESION DETECTADA: un cambio antiguo volvio a inyectarse '
+              '(probablemente un merge con upstream piso un fix del fork).\n'
+              + '\n'.join(failures) + '\n')
+        sys.exit(1)
+    print('Regression guards OK.')
+
+
 def main():
     global skip_cargo
     parser = make_parser()
@@ -1219,6 +1272,8 @@ def main():
             feats = ','.join(get_features(args))
         print(feats)
         return
+
+    check_regression_guards()
 
     if os.path.exists(exe_path):
         os.unlink(exe_path)
