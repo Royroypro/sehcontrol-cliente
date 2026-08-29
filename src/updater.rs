@@ -193,10 +193,10 @@ fn check_update(manually: bool) -> ResultType<()> {
     if update_url.is_empty() {
         log::debug!("No update available.");
     } else {
-        let download_url = update_url.replace("tag", "download");
-        let version = download_url.split('/').last().unwrap_or_default();
+        let composed_url = update_url.replace("tag", "download");
+        let version = composed_url.split('/').last().unwrap_or_default().to_string();
         #[cfg(target_os = "windows")]
-        let download_url = if cfg!(feature = "flutter") {
+        let composed_url = if cfg!(feature = "flutter") {
             let Some(arch) = crate::platform::windows::release_arch_suffix() else {
                 bail!(
                     "Unsupported Windows release architecture: {}",
@@ -205,14 +205,24 @@ fn check_update(manually: bool) -> ResultType<()> {
             };
             format!(
                 "{}/sehcontrol-{}-{}.{}",
-                download_url,
+                composed_url,
                 version,
                 arch,
                 if update_msi { "msi" } else { "exe" }
             )
         } else {
-            format!("{}/sehcontrol-{}-x86-sciter.exe", download_url, version)
+            format!("{}/sehcontrol-{}-x86-sciter.exe", composed_url, version)
         };
+        // The operator panel publishes an absolute URL that must be used as-is;
+        // only fall back to the composed upstream URL when no panel update is
+        // present (the legacy github flow this fork never serves).
+        let download_url = crate::common::PANEL_UPDATE
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|u| !u.download_url.is_empty())
+            .map(|u| u.download_url.clone())
+            .unwrap_or(composed_url);
         log::debug!("New version available: {}", &version);
         let client = create_http_client_with_url_strict(&download_url)?;
         let Some(file_path) = get_download_file_from_url(&download_url) else {
@@ -353,6 +363,27 @@ fn update_new_version(update_msi: bool, version: &str, file_path: &PathBuf) {
 }
 
 pub fn get_update_download_file_from_url(url: &str) -> Option<PathBuf> {
+    // The operator's panel is the authoritative update source for this
+    // rebranded client. Accept exactly the URL it published -- the same one the
+    // downloader verifies by checksum against PANEL_UPDATE -- and derive the
+    // local filename from its last path segment. Without this the panel's
+    // https://<panel-host>/api/public/client-download/... URL is rejected here
+    // (it is not a github.com/rustdesk/rustdesk URL) and every panel update
+    // fails with "Invalid download url".
+    if let Some(update) = crate::common::PANEL_UPDATE.lock().unwrap().as_ref() {
+        if !update.download_url.is_empty() && update.download_url == url {
+            let parsed = url::Url::parse(url).ok()?;
+            if parsed.scheme() != "https" {
+                return None;
+            }
+            let filename = parsed.path_segments()?.last()?;
+            if !is_plain_update_filename(filename) {
+                return None;
+            }
+            return Some(std::env::temp_dir().join(filename));
+        }
+    }
+
     let parsed = url::Url::parse(url).ok()?;
     // Check the raw prefix before Url normalizes default ports.
     if !url.starts_with("https://github.com/")

@@ -1096,50 +1096,15 @@ pub async fn do_check_software_update() -> hbb_common::ResultType<()> {
             Ok(false) => {}
         }
     }
-    let (request, url) =
-        hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_CLIENT.to_string());
-    let proxy_conf = Config::get_socks();
-    let tls_url = get_url_for_tls(&url, &proxy_conf);
-    let tls_type = get_cached_tls_type(tls_url);
-    let is_tls_not_cached = tls_type.is_none();
-    let tls_type = tls_type.unwrap_or(TlsType::Rustls);
-    let client = create_http_client_async(tls_type, false);
-    let latest_release_response = match client.post(&url).json(&request).send().await {
-        Ok(resp) => {
-            upsert_tls_cache(tls_url, tls_type, false);
-            resp
-        }
-        Err(err) => {
-            if is_tls_not_cached && err.is_request() {
-                let tls_type = TlsType::NativeTls;
-                let client = create_http_client_async(tls_type, false);
-                let resp = client.post(&url).json(&request).send().await?;
-                upsert_tls_cache(tls_url, tls_type, false);
-                resp
-            } else {
-                return Err(err.into());
-            }
-        }
-    };
-    let bytes = latest_release_response.bytes().await?;
-    let resp: hbb_common::VersionCheckResponse = serde_json::from_slice(&bytes)?;
-    let response_url = resp.url;
-    let latest_release_version = response_url.rsplit('/').next().unwrap_or_default();
-
-    if get_version_number(&latest_release_version) > get_version_number(crate::VERSION) {
-        #[cfg(feature = "flutter")]
-        {
-            let mut m = HashMap::new();
-            m.insert("name", "check_software_update_finish");
-            m.insert("url", &response_url);
-            if let Ok(data) = serde_json::to_string(&m) {
-                let _ = crate::flutter::push_global_event(crate::flutter::APP_TYPE_MAIN, data);
-            }
-        }
-        *SOFTWARE_UPDATE_URL.lock().unwrap() = response_url;
-    } else {
-        *SOFTWARE_UPDATE_URL.lock().unwrap() = "".to_string();
-    }
+    // No panel to ask (none configured, or the public server): do NOT fall back
+    // to api.rustdesk.com. This is a rebranded fork whose fleet must only ever
+    // run what its own operator published; the old upstream fallback could only
+    // produce a broken offer here anyway, composing "sehcontrol-*"-named assets
+    // against github.com/rustdesk/rustdesk that always 404. Clear any stale
+    // state so "check for updates" honestly reports nothing rather than a
+    // version that cannot be installed.
+    *PANEL_UPDATE.lock().unwrap() = None;
+    *SOFTWARE_UPDATE_URL.lock().unwrap() = "".to_owned();
     Ok(())
 }
 
