@@ -1417,6 +1417,32 @@ void _rdpDialog(String id) async {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            Container(
+              padding: const EdgeInsets.all(10),
+              margin: const EdgeInsets.only(bottom: 12),
+              decoration: BoxDecoration(
+                color: Theme.of(context)
+                    .colorScheme
+                    .primary
+                    .withOpacity(0.08),
+                borderRadius: BorderRadius.circular(6),
+              ),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Icon(Icons.info_outline,
+                      size: 18,
+                      color: Theme.of(context).colorScheme.primary),
+                  const SizedBox(width: 8),
+                  Expanded(
+                    child: Text(
+                      translate('rdp_bridge_tip'),
+                      style: const TextStyle(fontSize: 12, height: 1.35),
+                    ),
+                  ),
+                ],
+              ),
+            ),
             Row(
               children: [
                 isDesktop

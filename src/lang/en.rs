@@ -1,6 +1,10 @@
 lazy_static::lazy_static! {
 pub static ref T: std::collections::HashMap<&'static str, &'static str> =
     [
+        ("rdp_bridge_tip", "Sehcontrol works as a secure bridge: it forwards the remote PC's Windows Remote Desktop (RDP) through its encrypted tunnel. The remote Windows must have Remote Desktop enabled (Pro/Enterprise editions) for this to work."),
+        ("headless_display_not_installed_tip", "This remote PC has no monitor and Sehcontrol can't create a virtual one because it isn't installed on the remote side. Install Sehcontrol as a service on the remote PC to enable headless access."),
+        ("headless_display_plug_failed_tip", "This remote PC has no monitor and the virtual display driver could not be loaded. Make sure Sehcontrol runs as a Windows service and the virtual display driver is installed on the remote PC."),
+        ("rdp_unreachable_tip", "Could not reach Remote Desktop (RDP) on the remote Windows. Sehcontrol is only a bridge: make sure Windows Remote Desktop is enabled and listening on the configured port on the remote PC."),
         ("desk_tip", "Your desktop can be accessed with this ID and password."),
         ("connecting_status", "Connecting to the Sehcontrol network..."),
         ("not_ready_status", "Not ready. Please check your connection"),

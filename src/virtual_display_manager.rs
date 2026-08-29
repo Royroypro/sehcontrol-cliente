@@ -1,21 +1,51 @@
-use hbb_common::{bail, platform::windows::is_windows_version_or_greater, ResultType};
+use hbb_common::{
+    bail, config::Config, platform::windows::is_windows_version_or_greater, ResultType,
+};
 
 // This string is defined here.
 //  https://github.com/rustdesk-org/RustDeskIddDriver/blob/b370aad3f50028b039aad211df60c8051c4a64d6/RustDeskIddDriver/RustDeskIddDriver.inf#LL73C1-L73C40
 pub const RUSTDESK_IDD_DEVICE_STRING: &'static str = "RustDeskIddDriver Device\0";
 pub const AMYUNI_IDD_DEVICE_STRING: &'static str = "USB Mobile Monitor Virtual Display\0";
 
-const IDD_IMPL: &str = IDD_IMPL_AMYUNI;
 const IDD_IMPL_RUSTDESK: &str = "rustdesk_idd";
 const IDD_IMPL_AMYUNI: &str = "amyuni_idd";
 const IDD_PLUG_OUT_ALL_INDEX: i32 = -1;
 
+// The virtual-display driver backend. Defaults to amyuni (bundled, no reboot
+// required); can be switched to `rustdesk_idd` (supports arbitrary resolutions,
+// so the headless screen can match the operator's) via the `idd-impl` option on
+// the controlled machine. Unknown/empty values fall back to amyuni.
+pub fn idd_impl() -> &'static str {
+    if Config::get_option("idd-impl") == IDD_IMPL_RUSTDESK {
+        IDD_IMPL_RUSTDESK
+    } else {
+        IDD_IMPL_AMYUNI
+    }
+}
+
+// Resolution for the auto-created headless virtual display, configurable via the
+// `headless-resolution` option (e.g. "2560x1440") so the picture matches the
+// operator's screen instead of a low default. Falls back to 1920x1080.
+pub fn headless_resolution() -> (u32, u32) {
+    parse_resolution(&Config::get_option("headless-resolution")).unwrap_or((1920, 1080))
+}
+
+fn parse_resolution(s: &str) -> Option<(u32, u32)> {
+    let (w, h) = s.trim().split_once(|c| c == 'x' || c == 'X' || c == '*')?;
+    let w = w.trim().parse::<u32>().ok()?;
+    let h = h.trim().parse::<u32>().ok()?;
+    if w == 0 || h == 0 {
+        return None;
+    }
+    Some((w, h))
+}
+
 pub fn is_amyuni_idd() -> bool {
-    IDD_IMPL == IDD_IMPL_AMYUNI
+    idd_impl() == IDD_IMPL_AMYUNI
 }
 
 pub fn get_cur_device_string() -> &'static str {
-    match IDD_IMPL {
+    match idd_impl() {
         IDD_IMPL_RUSTDESK => RUSTDESK_IDD_DEVICE_STRING,
         IDD_IMPL_AMYUNI => AMYUNI_IDD_DEVICE_STRING,
         _ => "",
@@ -34,7 +64,7 @@ pub fn is_virtual_display_supported() -> bool {
 }
 
 pub fn plug_in_headless() -> ResultType<()> {
-    match IDD_IMPL {
+    match idd_impl() {
         IDD_IMPL_RUSTDESK => rustdesk_idd::plug_in_headless(),
         IDD_IMPL_AMYUNI => amyuni_idd::plug_in_headless(),
         _ => bail!("Unsupported virtual display implementation."),
@@ -46,8 +76,8 @@ pub fn get_platform_additions() -> serde_json::Map<String, serde_json::Value> {
     if !crate::platform::windows::is_self_service_running() {
         return map;
     }
-    map.insert("idd_impl".into(), serde_json::json!(IDD_IMPL));
-    match IDD_IMPL {
+    map.insert("idd_impl".into(), serde_json::json!(idd_impl()));
+    match idd_impl() {
         IDD_IMPL_RUSTDESK => {
             let virtual_displays = rustdesk_idd::get_virtual_displays();
             if !virtual_displays.is_empty() {
@@ -70,7 +100,7 @@ pub fn get_platform_additions() -> serde_json::Map<String, serde_json::Value> {
 
 #[inline]
 pub fn plug_in_monitor(idx: u32, modes: Vec<virtual_display::MonitorMode>) -> ResultType<()> {
-    match IDD_IMPL {
+    match idd_impl() {
         IDD_IMPL_RUSTDESK => rustdesk_idd::plug_in_index_modes(idx, modes),
         IDD_IMPL_AMYUNI => amyuni_idd::plug_in_monitor(),
         _ => bail!("Unsupported virtual display implementation."),
@@ -78,7 +108,7 @@ pub fn plug_in_monitor(idx: u32, modes: Vec<virtual_display::MonitorMode>) -> Re
 }
 
 pub fn plug_out_monitor(index: i32, force_all: bool, force_one: bool) -> ResultType<()> {
-    match IDD_IMPL {
+    match idd_impl() {
         IDD_IMPL_RUSTDESK => {
             let indices = if index == IDD_PLUG_OUT_ALL_INDEX {
                 rustdesk_idd::get_virtual_displays()
@@ -93,7 +123,7 @@ pub fn plug_out_monitor(index: i32, force_all: bool, force_one: bool) -> ResultT
 }
 
 pub fn plug_in_peer_request(modes: Vec<Vec<virtual_display::MonitorMode>>) -> ResultType<Vec<u32>> {
-    match IDD_IMPL {
+    match idd_impl() {
         IDD_IMPL_RUSTDESK => rustdesk_idd::plug_in_peer_request(modes),
         IDD_IMPL_AMYUNI => {
             amyuni_idd::plug_in_monitor()?;
@@ -108,7 +138,7 @@ pub fn plug_out_monitor_indices(
     force_all: bool,
     force_one: bool,
 ) -> ResultType<()> {
-    match IDD_IMPL {
+    match idd_impl() {
         IDD_IMPL_RUSTDESK => rustdesk_idd::plug_out_peer_request(indices),
         IDD_IMPL_AMYUNI => {
             for _idx in indices.iter() {
@@ -121,7 +151,7 @@ pub fn plug_out_monitor_indices(
 }
 
 pub fn reset_all() -> ResultType<()> {
-    match IDD_IMPL {
+    match idd_impl() {
         IDD_IMPL_RUSTDESK => rustdesk_idd::reset_all(),
         IDD_IMPL_AMYUNI => amyuni_idd::reset_all(),
         _ => bail!("Unsupported virtual display implementation."),
@@ -200,9 +230,10 @@ pub mod rustdesk_idd {
     pub fn plug_in_headless() -> ResultType<()> {
         let mut manager = VIRTUAL_DISPLAY_MANAGER.lock().unwrap();
         manager.prepare_driver()?;
+        let (width, height) = super::headless_resolution();
         let modes = [virtual_display::MonitorMode {
-            width: 1920,
-            height: 1080,
+            width,
+            height,
             sync: 60,
         }];
         let device_names = get_device_names().into_iter().collect();
@@ -596,9 +627,16 @@ pub mod amyuni_idd {
             }
         }
         // Workaround for the issue that we can't set the default the resolution.
+        // Best-effort: amyuni exposes a fixed EDID mode list, so the requested
+        // size only applies if it is among the supported modes.
         if let Ok(old_connectivity_old) = reg_connectivity_old {
+            let (width, height) = super::headless_resolution();
             std::thread::spawn(move || {
-                try_reset_resolution_on_first_plug_in(old_connectivity_old.len(), 1920, 1080);
+                try_reset_resolution_on_first_plug_in(
+                    old_connectivity_old.len(),
+                    width as usize,
+                    height as usize,
+                );
             });
         }
 

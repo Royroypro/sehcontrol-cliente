@@ -1,6 +1,10 @@
 lazy_static::lazy_static! {
 pub static ref T: std::collections::HashMap<&'static str, &'static str> =
     [
+        ("rdp_bridge_tip", "Sehcontrol funciona como un puente seguro: reenvía el Escritorio Remoto de Windows (RDP) del PC remoto a través de su túnel cifrado. El Windows remoto debe tener el Escritorio Remoto activado (ediciones Pro/Enterprise) para que funcione."),
+        ("headless_display_not_installed_tip", "Este PC remoto no tiene monitor y Sehcontrol no puede crear uno virtual porque no está instalado en el lado remoto. Instala Sehcontrol como servicio en el PC remoto para habilitar el acceso sin pantalla."),
+        ("headless_display_plug_failed_tip", "Este PC remoto no tiene monitor y no se pudo cargar el driver de pantalla virtual. Asegúrate de que Sehcontrol se ejecute como servicio de Windows y que el driver de pantalla virtual esté instalado en el PC remoto."),
+        ("rdp_unreachable_tip", "No se pudo acceder al Escritorio Remoto (RDP) en el Windows remoto. Sehcontrol solo es un puente: asegúrate de que el Escritorio Remoto de Windows esté activado y escuchando en el puerto configurado en el PC remoto."),
         ("Status", "Estado"),
         ("Your Desktop", "SEHCONTROL"),
         ("Visit", "Vistar"),

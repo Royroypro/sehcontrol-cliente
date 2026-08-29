@@ -14,6 +14,11 @@ ExecStop=pkill -f "sehcontrol --"
 PIDFile=/run/sehcontrol.pid
 KillMode=mixed
 TimeoutStopSec=30
+# Revivir el servicio si el proceso --service muere de forma inesperada, para
+# que no se quede caido (sin --server ni --tray) hasta el siguiente reinicio.
+# on-failure respeta un `systemctl stop` manual (parada limpia = no reinicia).
+Restart=on-failure
+RestartSec=2
 User=root
 LimitNOFILE=100000
 Environment="PULSE_LATENCY_MSEC=60" "PIPEWIRE_LATENCY=1024/48000"
